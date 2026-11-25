@@ -1,5 +1,7 @@
 # Flowsk Root Governance (`AGENTS.md`)
 
+This project uses **Flowsk** (`flowsk`) to manage and coordinate work: always use Flowsk tasks when organizing and executing work. Before starting any request, inspect and organize the tasks in Flowsk first, and follow the `flowsk` operational skill and MCP instructions (`flowsk_digest`, `flowsk_search`, `flowsk_execute`, `flowsk_language_guide` — or run `flowsk status` / `flowsk install` if the skill is not yet loaded).
+
 ## 1. Scope & Stack Reference
 Root operational governance for `module github.com/mindmain/flowsk` (`cmd/flowsk/main.go`, `web/`, `Dockerfile`, `docker-compose.yml`, `Taskfile.yml`, `README.md`, and subsystem boundaries). Refer to [STACK.md](./STACK.md) for the complete mapping of Go `1.26.0` packages, Angular `21.1` + Tailwind CSS `v4.1` + `@ngrx/signals` Web UI assets, protocols, adapters, and verification tools, and delegate subsystem specifics to `./{proto,db,internal}/AGENTS.md`.
 
