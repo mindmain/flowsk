@@ -1,0 +1,139 @@
+# ==============================================================================
+# Flowsk Task Runner Specification (`Taskfile.yml` - Task v3)
+# ==============================================================================
+# Canonical developer, code-generation, migration, and CI verification tasks for
+# `module github.com/mindmain/flowsk`. Run `task --list` to inspect all targets.
+# ==============================================================================
+version: '3'
+
+vars:
+  BINARY_DIR: bin
+  BINARY_NAME: flowsk
+  CMD_PKG: ./cmd/flowsk
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo "0.2.0"
+  COMMIT:
+    sh: git rev-parse --short HEAD 2>/dev/null || echo "dev"
+  BUILD_DATE:
+    sh: date -u +"%Y-%m-%dT%H:%M:%SZ"
+  LDFLAGS: '-s -w -X github.com/mindmain/flowsk/internal/version.Commit={{.COMMIT}} -X github.com/mindmain/flowsk/internal/version.BuildDate={{.BUILD_DATE}}'
+  AGAINST: '{{.AGAINST | default ".git#branch=main"}}'
+  SQLITE_DB_PATH: '{{.FLOWSK_SQLITE_PATH | default "./data/flowsk.db"}}'
+  POSTGRES_DSN: '{{.FLOWSK_POSTGRES_DSN | default "postgres://flowsk:flowsk@localhost:5432/flowsk?sslmode=disable"}}'
+
+env:
+  CGO_ENABLED: '0'
+  GOTOOLCHAIN: '{{.GOTOOLCHAIN | default "go1.26.11"}}'
+
+tasks:
+  default:
+    desc: List all available Flowsk development and verification tasks.
+    cmds:
+      - task --list
+    silent: true
+
+  # ----------------------------------------------------------------------------
+  # Protobuf & Buf Connect Contract Tasks (`proto/` -> `gen/go/`)
+  # ----------------------------------------------------------------------------
+  proto:lint:
+    desc: Lint Protobuf v3 contracts and comments with Buf (`buf.yaml`).
+    cmds:
+      - buf lint
+
+  proto:breaking:
+    desc: Detect backward-incompatible Protobuf contract changes (override target via `AGAINST=...`).
+    cmds:
+      - buf breaking --against '{{.AGAINST}}'
+
+  proto:gen:
+    desc: Generate Go Protobuf types and ConnectRPC stubs into `gen/go/` (`buf.gen.yaml`).
+    cmds:
+      - buf generate
+
+  # ----------------------------------------------------------------------------
+  # SQLC Dual-Engine Query Compilation & Code Generation (`db/` -> `internal/adapter/db/*/sqlcgen`)
+  # ----------------------------------------------------------------------------
+  sqlc:compile:
+    desc: Type-check SQLite and PostgreSQL queries against Goose DDL schemas without writing files.
+    cmds:
+      - sqlc compile
+
+  sqlc:gen:
+    desc: Generate type-safe Go SQLC repositories for both SQLite and PostgreSQL (`sqlc.yaml`).
+    cmds:
+      - sqlc generate
+
+  # ----------------------------------------------------------------------------
+  # Goose Reversible Database Migrations (`db/migrations/{sqlite,postgres}`)
+  # ----------------------------------------------------------------------------
+  db:migrate:sqlite:
+    desc: Apply Goose SQLite migrations up to latest (`FLOWSK_SQLITE_PATH`, default `./data/flowsk.db`).
+    cmds:
+      - mkdir -p "$(dirname '{{.SQLITE_DB_PATH}}')"
+      - goose -dir db/migrations/sqlite sqlite3 '{{.SQLITE_DB_PATH}}' up
+
+  db:migrate:postgres:
+    desc: Apply Goose PostgreSQL migrations up to latest (`FLOWSK_POSTGRES_DSN`).
+    cmds:
+      - goose -dir db/migrations/postgres postgres '{{.POSTGRES_DSN}}' up
+
+  # ----------------------------------------------------------------------------
+  # Embedded Web UI Build (`web/` -> `internal/adapter/webui/dist/`)
+  # ----------------------------------------------------------------------------
+  ui:install:
+    desc: Install Angular + Tailwind CSS + SignalStore frontend dependencies via pnpm.
+    dir: web
+    cmds:
+      - pnpm install --frozen-lockfile
+
+  ui:build:
+    desc: Compile the Angular 21 Web UI bundle into `internal/adapter/webui/dist/` for `go:embed`.
+    deps: [ui:install]
+    dir: web
+    cmds:
+      - pnpm run build
+      - touch ../internal/adapter/webui/dist/.gitkeep
+
+  # ----------------------------------------------------------------------------
+  # Go Build, Test, Static Analysis & Vulnerability Scanning
+  # ----------------------------------------------------------------------------
+  build:
+    desc: Compile the Web UI assets and unified static `flowsk` binary (CLI + Web UI + ConnectRPC + MCP) into `bin/flowsk`.
+    cmds:
+      - task: ui:build
+      - mkdir -p {{.BINARY_DIR}}
+      - go build -trimpath -ldflags="{{.LDFLAGS}}" -o {{.BINARY_DIR}}/{{.BINARY_NAME}} {{.CMD_PKG}}
+
+  install:
+    desc: Compile the Web UI assets and install the unified static `flowsk` binary into GOBIN / GOPATH/bin (`go install`).
+    cmds:
+      - task: ui:build
+      - go install -trimpath -ldflags="{{.LDFLAGS}}" {{.CMD_PKG}}
+
+  test:
+    desc: Run all Go unit and integration tests with the race detector enabled and caching disabled.
+    cmds:
+      - go test -race -count=1 ./...
+
+  lint:
+    desc: Run static analysis and Go style/security linters via `golangci-lint`.
+    cmds:
+      - golangci-lint run ./...
+
+  vuln:
+    desc: Scan module dependencies and call graphs for known Go vulnerabilities via `govulncheck`.
+    cmds:
+      - govulncheck ./...
+
+  # ----------------------------------------------------------------------------
+  # Full Pre-Commit / CI Verification Gate
+  # ----------------------------------------------------------------------------
+  verify:
+    desc: Run full repository verification (proto lint, SQLC compile, build, tests, linter, vuln scan).
+    cmds:
+      - task: proto:lint
+      - task: sqlc:compile
+      - task: build
+      - task: test
+      - task: lint
+      - task: vuln

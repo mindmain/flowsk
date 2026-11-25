@@ -1,0 +1,48 @@
+# SQLC v2 configuration for Flowsk dual-engine persistence (SQLite primary + PostgreSQL adapter).
+# Never manually edit generated files under internal/adapter/db/*/sqlcgen.
+version: "2"
+sql:
+  - engine: "sqlite"
+    queries: "db/queries/sqlite"
+    schema: "db/migrations/sqlite"
+    gen:
+      go:
+        package: "sqlcgen"
+        out: "internal/adapter/db/sqlite/sqlcgen"
+        emit_interface: true
+        emit_json_tags: true
+        emit_empty_slices: true
+        emit_pointers_for_null_types: true
+  - engine: "postgresql"
+    queries: "db/queries/postgres"
+    schema: "db/migrations/postgres"
+    gen:
+      go:
+        package: "sqlcgen"
+        out: "internal/adapter/db/postgres/sqlcgen"
+        sql_package: "pgx/v5"
+        emit_interface: true
+        emit_json_tags: true
+        emit_empty_slices: true
+        emit_pointers_for_null_types: true
+        overrides:
+          - db_type: "uuid"
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+          - db_type: "uuid"
+            nullable: true
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+              pointer: true
+          - db_type: "timestamptz"
+            go_type:
+              import: "time"
+              type: "Time"
+          - db_type: "timestamptz"
+            nullable: true
+            go_type:
+              import: "time"
+              type: "Time"
+              pointer: true

@@ -1,0 +1,102 @@
+# ==============================================================================
+# Flowsk Docker Compose Topology
+# ==============================================================================
+# Usage:
+#   1. Standalone / Shared-Volume SQLite Mode (default, zero external services):
+#        docker compose up -d --build
+#      Persists the SQLite WAL database, advisory lockfiles, and snapshots inside
+#      the named volume `flowsk_data` mounted at `/data/flowsk`.
+#
+#   2. Office / Multi-Replica PostgreSQL Mode (seamless adapter switch):
+#        FLOWSK_DB_DRIVER=postgres \
+#        FLOWSK_POSTGRES_DSN=postgres://flowsk:flowsk@postgres:5432/flowsk?sslmode=disable \
+#        docker compose --profile postgres up -d --build
+#      Starts `postgres:17-alpine` alongside `flowsk` using the exact same binary
+#      and domain services via `internal/adapter/db/postgres`.
+# ==============================================================================
+
+name: flowsk
+
+services:
+  # ----------------------------------------------------------------------------
+  # Primary Flowsk API & ConnectRPC Server
+  # Runs SQLite on the shared `flowsk_data` volume out-of-the-box, or connects
+  # to PostgreSQL when `FLOWSK_DB_DRIVER=postgres` is provided via `.env` / CLI.
+  # ----------------------------------------------------------------------------
+  flowsk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: flowsk:local
+    container_name: flowsk-server
+    restart: unless-stopped
+    ports:
+      - "${FLOWSK_PORT:-8080}:8080"
+    environment:
+      # Transport & observability settings
+      FLOWSK_HTTP_ADDR: ":8080"
+      FLOWSK_LOG_LEVEL: "${FLOWSK_LOG_LEVEL:-info}"
+      FLOWSK_LOG_FORMAT: "${FLOWSK_LOG_FORMAT:-json}"
+      FLOWSK_AUTH_TOKEN: "${FLOWSK_AUTH_TOKEN:-}"
+      FLOWSK_DEFAULT_WORKSPACE: "${FLOWSK_DEFAULT_WORKSPACE:-default}"
+      FLOWSK_AUTO_MIGRATE: "${FLOWSK_AUTO_MIGRATE:-true}"
+
+      # Persistence adapter selection (`sqlite` default | `postgres` office mode)
+      FLOWSK_DB_DRIVER: "${FLOWSK_DB_DRIVER:-sqlite}"
+
+      # Shared-volume SQLite configuration (`internal/adapter/db/sqlite` + `volume`)
+      FLOWSK_VOLUME_DIR: "${FLOWSK_VOLUME_DIR:-/data/flowsk}"
+      FLOWSK_SQLITE_PATH: "${FLOWSK_SQLITE_PATH:-/data/flowsk/flowsk.db}"
+      FLOWSK_SQLITE_BUSY_TIMEOUT_MS: "${FLOWSK_SQLITE_BUSY_TIMEOUT_MS:-5000}"
+      FLOWSK_VOLUME_SNAPSHOT_RETENTION: "${FLOWSK_VOLUME_SNAPSHOT_RETENTION:-10}"
+
+      # Optional PostgreSQL adapter DSN (`internal/adapter/db/postgres`)
+      FLOWSK_POSTGRES_DSN: "${FLOWSK_POSTGRES_DSN:-}"
+      FLOWSK_POSTGRES_MAX_CONNS: "${FLOWSK_POSTGRES_MAX_CONNS:-16}"
+    volumes:
+      # Named volume shared across restarts (and optionally mounted into sibling
+      # agent/CLI containers that coordinate via `/data/flowsk` advisory locks).
+      - flowsk_data:/data/flowsk
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+    security_opt:
+      - no-new-privileges:true
+
+  # ----------------------------------------------------------------------------
+  # Optional PostgreSQL 17 Database (activated only with `--profile postgres`)
+  # Demonstrates zero-code-change adapter switching from SQLite to PostgreSQL
+  # for shared office or multi-node team deployments.
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    container_name: flowsk-postgres
+    profiles:
+      - postgres
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-flowsk}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-flowsk}"
+      POSTGRES_DB: "${POSTGRES_DB:-flowsk}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-flowsk} -d ${POSTGRES_DB:-flowsk}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  # Persistent shared volume for SQLite database files, WAL journals, lockfiles,
+  # and point-in-time snapshots (`/data/flowsk`).
+  flowsk_data:
+    name: flowsk_data
+
+  # Persistent storage for the optional `--profile postgres` PostgreSQL instance.
+  postgres_data:
+    name: flowsk_postgres_data

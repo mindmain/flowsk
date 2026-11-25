@@ -1,0 +1,894 @@
+// Package flowsk.task.v1 defines tasks, issues, bugs, features, epics,
+// dependency relations, structured handoff/blocker comments, expiring agent
+// lease claims, and low-token digests over Buf Connect.
+syntax = "proto3";
+
+package flowsk.task.v1;
+
+import "buf/validate/validate.proto";
+import "flowsk/project/v1/project.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/mindmain/flowsk/gen/go/flowsk/task/v1;flowsk_task_pb";
+
+// TaskKind classifies the nature of a work item tracked inside a Project.
+enum TaskKind {
+  // Default unspecified task kind; rejected on explicit task creation.
+  TASK_KIND_UNSPECIFIED = 0;
+  // Concrete engineering, operational, or research work item.
+  TASK_KIND_TASK = 1;
+  // Defect, regression, or unexpected behavior requiring a fix.
+  TASK_KIND_BUG = 2;
+  // User-facing or platform capability addition.
+  TASK_KIND_FEATURE = 3;
+  // General issue, investigation, or triage report.
+  TASK_KIND_ISSUE = 4;
+  // Large parent initiative decomposed into child subtasks.
+  TASK_KIND_EPIC = 5;
+}
+
+// TaskPriority expresses scheduling urgency for humans and autonomous work queues.
+enum TaskPriority {
+  // Default unspecified priority.
+  TASK_PRIORITY_UNSPECIFIED = 0;
+  // Unprioritized work item.
+  TASK_PRIORITY_NONE = 1;
+  // Low urgency; opportunistic execution when higher priorities are clear.
+  TASK_PRIORITY_LOW = 2;
+  // Standard priority for planned iteration work.
+  TASK_PRIORITY_MEDIUM = 3;
+  // High-impact work that should be scheduled ahead of medium/low items.
+  TASK_PRIORITY_HIGH = 4;
+  // Critical blocker, outage, or top-priority deliverable requiring immediate claim.
+  TASK_PRIORITY_URGENT = 5;
+}
+
+// TaskRelationType defines directed semantic links between two tasks.
+enum TaskRelationType {
+  // Default unspecified relation type; rejected on creation.
+  TASK_RELATION_TYPE_UNSPECIFIED = 0;
+  // Source task blocks target task from starting or completing until source finishes.
+  TASK_RELATION_TYPE_BLOCKS = 1;
+  // Source task duplicates target task.
+  TASK_RELATION_TYPE_DUPLICATES = 2;
+  // Source task shares context with target task without hard execution blocking.
+  TASK_RELATION_TYPE_RELATES_TO = 3;
+}
+
+// TaskCommentKind structures timeline entries so agents and humans can filter
+// blocker escalations, handoffs, and completion summaries without parsing prose.
+enum TaskCommentKind {
+  // Default unspecified comment kind.
+  TASK_COMMENT_KIND_UNSPECIFIED = 0;
+  // General discussion note or progress update.
+  TASK_COMMENT_KIND_COMMENT = 1;
+  // Explicit report explaining an external or technical blocker halting progress.
+  TASK_COMMENT_KIND_BLOCKER_REPORT = 2;
+  // Structured context handoff from a releasing actor to the next actor claiming the task.
+  TASK_COMMENT_KIND_HANDOFF = 3;
+  // Verification summary and outcome notes recorded when completing or closing a task.
+  TASK_COMMENT_KIND_RESOLUTION = 4;
+}
+
+// Task represents an actionable work item (task, bug, feature, issue, or epic)
+// within a Project, supporting optimistic lease-based claiming by human or agent actors.
+message Task {
+  // Unique task identifier (UUID).
+  string id = 1 [(buf.validate.field).string.uuid = true];
+  // Owning workspace identifier (UUID) for strict multi-tenant isolation.
+  string workspace_id = 2 [(buf.validate.field).string.uuid = true];
+  // Owning project identifier (UUID).
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Immutable human- and agent-friendly key minted from project prefix (e.g., "FLW-42").
+  string identifier = 4 [(buf.validate.field).string = {
+    min_len: 4
+    max_len: 24
+    pattern: "^[A-Z][A-Z0-9]{1,9}-[1-9][0-9]*$"
+  }];
+  // Per-project 1-based sequence number corresponding to the suffix of identifier.
+  int64 sequence_number = 5 [(buf.validate.field).int64.gte = 1];
+  // Work item classification (TASK, BUG, FEATURE, ISSUE, EPIC).
+  TaskKind kind = 6 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Scheduling urgency level.
+  TaskPriority priority = 7 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Current workflow state UUID belonging to the task's project.
+  string workflow_state_id = 8 [(buf.validate.field).string.uuid = true];
+  // Denormalized canonical category of workflow_state_id for fast filtering.
+  flowsk.project.v1.WorkflowStateCategory state_category = 9 [(buf.validate.field).enum.defined_only = true];
+  // Concise task summary line.
+  string title = 10 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 300
+  }];
+  // Markdown specification, problem statement, and implementation guidance.
+  string description = 11 [(buf.validate.field).string.max_len = 32000];
+  // Explicit, testable acceptance criteria used to verify completion.
+  string acceptance_criteria = 12 [(buf.validate.field).string.max_len = 16000];
+  // Optional parent objective (milestone, cycle, or goal) UUID.
+  optional string objective_id = 13 [(buf.validate.field).string.uuid = true];
+  // Optional parent task or epic UUID for hierarchical decomposition.
+  optional string parent_task_id = 14 [(buf.validate.field).string.uuid = true];
+  // Optional designated owner/assignee actor UUID.
+  optional string assignee_actor_id = 15 [(buf.validate.field).string.uuid = true];
+  // Optional actor UUID currently holding an active execution claim lease on the task.
+  optional string claimed_by_actor_id = 16 [(buf.validate.field).string.uuid = true];
+  // UTC timestamp when the active execution claim lease expires (unset if unclaimed).
+  google.protobuf.Timestamp claim_expires_at = 17;
+  // Project label UUIDs attached to this task.
+  repeated string label_ids = 18 [(buf.validate.field).repeated.items.string.uuid = true];
+  // Optional relative complexity or story-point estimate (0 means unestimated).
+  int32 estimate_points = 19 [(buf.validate.field).int32.gte = 0];
+  // Optional UTC target due timestamp.
+  google.protobuf.Timestamp due_at = 20;
+  // UTC timestamp when the task entered a COMPLETED state category, if finished.
+  google.protobuf.Timestamp completed_at = 21;
+  // Actor UUID that created the task.
+  string created_by_actor_id = 22 [(buf.validate.field).string.uuid = true];
+  // UTC timestamp when the task was created.
+  google.protobuf.Timestamp created_at = 23;
+  // UTC timestamp when the task was last modified.
+  google.protobuf.Timestamp updated_at = 24;
+  // True when an extended Markdown resource document (`<task_id>.md`) is stored for this task.
+  bool has_markdown_doc = 25;
+  // Canonical workflow status slug (`backlog`, `ready`, `in_progress`, `in_review`, `blocked`, `done`, `cancelled`, `archived`).
+  string status = 26;
+  // Optional external tracker identifier (e.g. ClickUp, Linear, Jira, GitHub Issues), unique per (project_id, external_id).
+  string external_id = 27 [(buf.validate.field).string.max_len = 255];
+}
+
+// TaskRelation represents a directed dependency or semantic edge between two tasks
+// inside the same workspace.
+message TaskRelation {
+  // Unique relation identifier (UUID).
+  string id = 1 [(buf.validate.field).string.uuid = true];
+  // Owning workspace identifier (UUID).
+  string workspace_id = 2 [(buf.validate.field).string.uuid = true];
+  // Source task UUID (e.g., the blocking task when relation_type is BLOCKS).
+  string source_task_id = 3 [(buf.validate.field).string.uuid = true];
+  // Target task UUID (e.g., the blocked task when relation_type is BLOCKS).
+  string target_task_id = 4 [(buf.validate.field).string.uuid = true];
+  // Semantic type of the directed task relationship.
+  TaskRelationType relation_type = 5 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Actor UUID that recorded the relation.
+  string created_by_actor_id = 6 [(buf.validate.field).string.uuid = true];
+  // UTC timestamp when the relation was created.
+  google.protobuf.Timestamp created_at = 7;
+}
+
+// TaskComment records a typed timeline note, blocker escalation, handoff, or
+// resolution report authored by a human or agent actor on a Task.
+message TaskComment {
+  // Unique comment identifier (UUID).
+  string id = 1 [(buf.validate.field).string.uuid = true];
+  // Owning workspace identifier (UUID).
+  string workspace_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target task UUID to which this comment belongs.
+  string task_id = 3 [(buf.validate.field).string.uuid = true];
+  // Actor UUID that authored the comment.
+  string author_actor_id = 4 [(buf.validate.field).string.uuid = true];
+  // Semantic comment category for structured agent consumption.
+  TaskCommentKind kind = 5 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Markdown body content of the comment.
+  string body = 6 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 16000
+  }];
+  // UTC timestamp when the comment was posted.
+  google.protobuf.Timestamp created_at = 7;
+  // UTC timestamp when the comment was last edited.
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+// CompactTaskSummary provides an ultra-low-token projection of a Task tailored
+// for autonomous agent work-queue polling and project health digests without
+// shipping multi-kilobyte markdown bodies.
+message CompactTaskSummary {
+  // Unique task UUID.
+  string id = 1 [(buf.validate.field).string.uuid = true];
+  // Compact task key (e.g., "FLW-42").
+  string identifier = 2 [(buf.validate.field).string = {
+    min_len: 4
+    max_len: 24
+  }];
+  // Work item classification.
+  TaskKind kind = 3 [(buf.validate.field).enum.defined_only = true];
+  // Urgency level.
+  TaskPriority priority = 4 [(buf.validate.field).enum.defined_only = true];
+  // Canonical workflow state category.
+  flowsk.project.v1.WorkflowStateCategory state_category = 5 [(buf.validate.field).enum.defined_only = true];
+  // Human-readable workflow state column name.
+  string state_name = 6;
+  // Single-line task title.
+  string title = 7;
+  // True when at least one incomplete task holds a BLOCKS relation targeting this task.
+  bool is_blocked = 8;
+  // Actor UUID holding an unexpired claim lease, if currently claimed.
+  optional string claimed_by_actor_id = 9 [(buf.validate.field).string.uuid = true];
+  // Expiration timestamp of the active claim lease, if claimed.
+  google.protobuf.Timestamp claim_expires_at = 10;
+  // Linked objective UUID, if assigned to a milestone/cycle/goal.
+  optional string objective_id = 11 [(buf.validate.field).string.uuid = true];
+  // True when an extended Markdown resource document (`<task_id>.md`) is stored for this task.
+  bool has_markdown_doc = 12;
+  // Optional external tracker identifier (e.g., "CU-869abc" or "LIN-142").
+  string external_id = 13 [(buf.validate.field).string.max_len = 255];
+}
+
+// StateCategoryCount pairs a canonical WorkflowStateCategory with the number of
+// tasks currently residing in states of that category.
+message StateCategoryCount {
+  // Canonical workflow state category.
+  flowsk.project.v1.WorkflowStateCategory category = 1 [(buf.validate.field).enum.defined_only = true];
+  // Number of tasks in the project currently mapped to this category.
+  int32 count = 2 [(buf.validate.field).int32.gte = 0];
+}
+
+// ProjectDigest delivers a single-shot situational overview of a Project's
+// task distribution, active blockers, and unclaimed high-priority backlog for
+// rapid agent orientation with minimal context-window overhead.
+message ProjectDigest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Target project UUID summarized by this digest.
+  string project_id = 2 [(buf.validate.field).string.uuid = true];
+  // Project key prefix (e.g., "FLW").
+  string project_key_prefix = 3;
+  // Total number of tasks in the project across all categories.
+  int32 total_tasks = 4 [(buf.validate.field).int32.gte = 0];
+  // Aggregated task counts grouped by canonical workflow state category.
+  repeated StateCategoryCount counts_by_state_category = 5;
+  // Compact summaries of open tasks that currently block other tasks or have blocker reports.
+  repeated CompactTaskSummary active_blockers = 6;
+  // Compact summaries of unclaimed URGENT and HIGH priority tasks ready to be picked up.
+  repeated CompactTaskSummary unclaimed_high_priority_tasks = 7;
+  // Number of tasks in the project with currently unexpired actor claim leases.
+  int32 active_agent_claims = 8 [(buf.validate.field).int32.gte = 0];
+  // UTC timestamp when this digest snapshot was computed.
+  google.protobuf.Timestamp generated_at = 9;
+}
+
+// TaskService orchestrates work item CRUD, workflow state transitions, atomic
+// lease-based claiming, dependency graphs, comments, and token-efficient agent
+// queues over Buf Connect.
+service TaskService {
+  // CreateTask mints a new sequential identifier (e.g., "FLW-42") and creates a task.
+  rpc CreateTask(CreateTaskRequest) returns (CreateTaskResponse);
+
+  // GetTask retrieves full task details and its immediate dependency relations by UUID.
+  rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+
+  // GetTaskByIdentifier retrieves full task details using its compact key (e.g., "FLW-42").
+  rpc GetTaskByIdentifier(GetTaskByIdentifierRequest) returns (GetTaskByIdentifierResponse);
+
+  // GetTaskByExternalId retrieves full task details inside a project using its external tracker ID (e.g., "CU-869abc").
+  rpc GetTaskByExternalId(GetTaskByExternalIdRequest) returns (GetTaskByExternalIdResponse);
+
+  // ListTasks searches and filters tasks within a workspace or project with pagination.
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+
+  // UpdateTask modifies mutable task metadata, hierarchy links, assignee, or labels.
+  rpc UpdateTask(UpdateTaskRequest) returns (UpdateTaskResponse);
+
+  // TransitionTaskState moves a task to a target workflow state and optionally
+  // records a resolution note in a single atomic transaction.
+  rpc TransitionTaskState(TransitionTaskStateRequest) returns (TransitionTaskStateResponse);
+
+  // ClaimTask atomically acquires or renews a time-bounded execution lease on a task
+  // for the calling actor, preventing duplicate concurrent work by multiple agents.
+  rpc ClaimTask(ClaimTaskRequest) returns (ClaimTaskResponse);
+
+  // ReleaseTaskClaim relinquishes an active lease on a task and optionally posts
+  // a structured TASK_COMMENT_KIND_HANDOFF comment for the next actor.
+  rpc ReleaseTaskClaim(ReleaseTaskClaimRequest) returns (ReleaseTaskClaimResponse);
+
+  // AddTaskRelation creates a directed dependency link (BLOCKS, DUPLICATES, RELATES_TO)
+  // between two tasks in the workspace, rejecting self-loops.
+  rpc AddTaskRelation(AddTaskRelationRequest) returns (AddTaskRelationResponse);
+
+  // RemoveTaskRelation deletes an existing task relation edge by UUID.
+  rpc RemoveTaskRelation(RemoveTaskRelationRequest) returns (RemoveTaskRelationResponse);
+
+  // AddTaskComment appends a typed comment, blocker report, handoff, or resolution to a task.
+  rpc AddTaskComment(AddTaskCommentRequest) returns (AddTaskCommentResponse);
+
+  // ListTaskComments lists timeline comments on a task ordered chronologically.
+  rpc ListTaskComments(ListTaskCommentsRequest) returns (ListTaskCommentsResponse);
+
+  // GetAgentWorkQueue returns prioritized, unblocked, unclaimed tasks ready for
+  // immediate autonomous execution alongside tasks already leased by the caller.
+  rpc GetAgentWorkQueue(GetAgentWorkQueueRequest) returns (GetAgentWorkQueueResponse);
+
+  // GetProjectDigest computes a compact health and priority digest for a single project.
+  rpc GetProjectDigest(GetProjectDigestRequest) returns (GetProjectDigestResponse);
+
+  // DeleteTask permanently deletes a task and its attached relations and comments.
+  rpc DeleteTask(DeleteTaskRequest) returns (DeleteTaskResponse);
+
+  // GetTaskMarkdown retrieves the optional extended Markdown document (`<task_id>.md`)
+  // associated with a task in Flowsk's global storage directory.
+  rpc GetTaskMarkdown(GetTaskMarkdownRequest) returns (GetTaskMarkdownResponse);
+
+  // PutTaskMarkdown creates or updates the extended Markdown document (`<task_id>.md`)
+  // associated with a task and marks has_markdown_doc true.
+  rpc PutTaskMarkdown(PutTaskMarkdownRequest) returns (PutTaskMarkdownResponse);
+
+  // DeleteTaskMarkdown deletes the extended Markdown document (`<task_id>.md`)
+  // associated with a task and marks has_markdown_doc false.
+  rpc DeleteTaskMarkdown(DeleteTaskMarkdownRequest) returns (DeleteTaskMarkdownResponse);
+
+  // PurgeArchivedTasks permanently deletes all tasks in the ARCHIVED state across
+  // the workspace and removes their associated `.md` resource files.
+  rpc PurgeArchivedTasks(PurgeArchivedTasksRequest) returns (PurgeArchivedTasksResponse);
+
+  // InspectOrphanResources scans the workspace for `.md` files without an active
+  // DB record and DB records marked has_markdown_doc whose `.md` file is missing.
+  rpc InspectOrphanResources(InspectOrphanResourcesRequest) returns (InspectOrphanResourcesResponse);
+
+  // PruneOrphanResources cleans up orphan `.md` files and clears broken DB
+  // has_markdown_doc flags across the workspace (supporting dry_run previews).
+  rpc PruneOrphanResources(PruneOrphanResourcesRequest) returns (PruneOrphanResourcesResponse);
+}
+
+// CreateTaskRequest carries fields required to create a new Task in a Project.
+message CreateTaskRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID creating the task.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target project UUID under which the task and its sequence number are allocated.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Classification of the task (defaults to TASK_KIND_TASK if UNSPECIFIED).
+  TaskKind kind = 4 [(buf.validate.field).enum.defined_only = true];
+  // Scheduling urgency (defaults to TASK_PRIORITY_NONE if UNSPECIFIED).
+  TaskPriority priority = 5 [(buf.validate.field).enum.defined_only = true];
+  // Optional initial workflow state UUID; uses the project's default state when omitted.
+  optional string workflow_state_id = 6 [(buf.validate.field).string.uuid = true];
+  // Single-line task summary.
+  string title = 7 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 300
+  }];
+  // Optional detailed markdown specification.
+  string description = 8 [(buf.validate.field).string.max_len = 32000];
+  // Optional explicit acceptance criteria checklist.
+  string acceptance_criteria = 9 [(buf.validate.field).string.max_len = 16000];
+  // Optional objective UUID linking this task to a milestone, cycle, or goal.
+  optional string objective_id = 10 [(buf.validate.field).string.uuid = true];
+  // Optional parent task or epic UUID.
+  optional string parent_task_id = 11 [(buf.validate.field).string.uuid = true];
+  // Optional initial assignee actor UUID.
+  optional string assignee_actor_id = 12 [(buf.validate.field).string.uuid = true];
+  // Optional initial project label UUIDs to attach.
+  repeated string label_ids = 13 [(buf.validate.field).repeated.items.string.uuid = true];
+  // Optional complexity estimate in points (0 when unestimated).
+  int32 estimate_points = 14 [(buf.validate.field).int32.gte = 0];
+  // Optional target due timestamp.
+  google.protobuf.Timestamp due_at = 15;
+  // Optional external tracker ID (e.g. ClickUp, Linear, Jira), enforced unique per (project_id, external_id).
+  string external_id = 16 [(buf.validate.field).string.max_len = 255];
+}
+
+// CreateTaskResponse wraps the newly created Task.
+message CreateTaskResponse {
+  // Created task with its allocated identifier (e.g., "FLW-42").
+  Task task = 1;
+}
+
+// GetTaskRequest looks up a task by UUID within a workspace.
+message GetTaskRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target task UUID.
+  string task_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// GetTaskResponse returns the task and its incoming/outgoing dependency relations.
+message GetTaskResponse {
+  // Matched task entity.
+  Task task = 1;
+  // Directed task relations where this task is either source or target.
+  repeated TaskRelation relations = 2;
+}
+
+// GetTaskByIdentifierRequest looks up a task by its human-readable key (e.g., "FLW-42").
+message GetTaskByIdentifierRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Workspace-unique task identifier in '<PREFIX>-<NUMBER>' format.
+  string identifier = 3 [(buf.validate.field).string = {
+    min_len: 4
+    max_len: 24
+    pattern: "^[A-Z][A-Z0-9]{1,9}-[1-9][0-9]*$"
+  }];
+}
+
+// GetTaskByIdentifierResponse returns the matched task and its relations.
+message GetTaskByIdentifierResponse {
+  // Matched task entity.
+  Task task = 1;
+  // Directed task relations involving this task.
+  repeated TaskRelation relations = 2;
+}
+
+// ListTasksRequest specifies rich filtering and pagination options for tasks.
+message ListTasksRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Optional project UUID filter.
+  optional string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Optional objective UUID filter.
+  optional string objective_id = 4 [(buf.validate.field).string.uuid = true];
+  // Optional parent task UUID filter for listing subtasks of an epic.
+  optional string parent_task_id = 5 [(buf.validate.field).string.uuid = true];
+  // Optional specific workflow state UUID filter.
+  optional string workflow_state_id = 6 [(buf.validate.field).string.uuid = true];
+  // Optional canonical workflow state category filter.
+  flowsk.project.v1.WorkflowStateCategory state_category_filter = 7 [(buf.validate.field).enum.defined_only = true];
+  // Optional task kind filter.
+  TaskKind kind_filter = 8 [(buf.validate.field).enum.defined_only = true];
+  // Optional priority filter.
+  TaskPriority priority_filter = 9 [(buf.validate.field).enum.defined_only = true];
+  // Optional assignee actor UUID filter.
+  optional string assignee_actor_id = 10 [(buf.validate.field).string.uuid = true];
+  // Optional active lease holder actor UUID filter.
+  optional string claimed_by_actor_id = 11 [(buf.validate.field).string.uuid = true];
+  // Optional label UUID filter matching tasks carrying the given label.
+  optional string label_id = 12 [(buf.validate.field).string.uuid = true];
+  // Optional case-insensitive substring/FTS query across identifier, title, and description.
+  string search_query = 13 [(buf.validate.field).string.max_len = 256];
+  // When true, restricts results to tasks without an unexpired claim lease.
+  bool unclaimed_only = 14;
+  // Maximum number of tasks to return (0 uses server default, max 200).
+  int32 page_size = 15 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 200
+  }];
+  // Opaque pagination cursor from a prior ListTasksResponse.
+  string page_token = 16 [(buf.validate.field).string.max_len = 512];
+  // Optional exact filter matching tasks carrying the given external_id.
+  optional string external_id_filter = 17 [(buf.validate.field).string.max_len = 255];
+}
+
+// ListTasksResponse contains a paginated list of matching tasks.
+message ListTasksResponse {
+  // Tasks matching the filter predicates.
+  repeated Task tasks = 1;
+  // Opaque pagination cursor for the next page, or empty when exhausted.
+  string next_page_token = 2;
+}
+
+// UpdateTaskRequest applies partial modifications to an existing Task.
+message UpdateTaskRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID performing the update.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target task UUID to update.
+  string task_id = 3 [(buf.validate.field).string.uuid = true];
+  // Optional updated task kind (UNSPECIFIED leaves kind unchanged).
+  TaskKind kind = 4 [(buf.validate.field).enum.defined_only = true];
+  // Optional updated priority (UNSPECIFIED leaves priority unchanged).
+  TaskPriority priority = 5 [(buf.validate.field).enum.defined_only = true];
+  // Optional updated title.
+  optional string title = 6 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 300
+  }];
+  // Optional updated markdown description.
+  optional string description = 7 [(buf.validate.field).string.max_len = 32000];
+  // Optional updated acceptance criteria.
+  optional string acceptance_criteria = 8 [(buf.validate.field).string.max_len = 16000];
+  // Optional updated objective UUID.
+  optional string objective_id = 9 [(buf.validate.field).string.uuid = true];
+  // When true, detaches the task from its current objective.
+  bool clear_objective = 10;
+  // Optional updated parent task UUID.
+  optional string parent_task_id = 11 [(buf.validate.field).string.uuid = true];
+  // When true, promotes a subtask back to a top-level task.
+  bool clear_parent_task = 12;
+  // Optional updated assignee actor UUID.
+  optional string assignee_actor_id = 13 [(buf.validate.field).string.uuid = true];
+  // When true, clears assignee_actor_id.
+  bool clear_assignee = 14;
+  // Replacement set of project label UUIDs when replace_labels is true.
+  repeated string label_ids = 15 [(buf.validate.field).repeated.items.string.uuid = true];
+  // When true, replaces the task's attached label_ids with the supplied list.
+  bool replace_labels = 16;
+  // Optional updated complexity point estimate.
+  optional int32 estimate_points = 17 [(buf.validate.field).int32.gte = 0];
+  // Optional updated due timestamp.
+  google.protobuf.Timestamp due_at = 18;
+  // When true, clears due_at.
+  bool clear_due_at = 19;
+  // Optional updated external tracker identifier (unique per project_id).
+  optional string external_id = 20 [(buf.validate.field).string.max_len = 255];
+  // When true, clears external_id back to empty/unset.
+  bool clear_external_id = 21;
+}
+
+// UpdateTaskResponse wraps the updated Task entity.
+message UpdateTaskResponse {
+  // Task entity after applying updates.
+  Task task = 1;
+}
+
+// TransitionTaskStateRequest moves a task into a target workflow state column.
+message TransitionTaskStateRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID performing the state transition.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target task UUID to transition.
+  string task_id = 3 [(buf.validate.field).string.uuid = true];
+  // Destination workflow state UUID (must belong to the task's project).
+  string workflow_state_id = 4 [(buf.validate.field).string.uuid = true];
+  // Optional resolution or transition note; when non-empty and transitioning to
+  // COMPLETED/CANCELED, automatically recorded as a TASK_COMMENT_KIND_RESOLUTION comment.
+  string resolution_note = 5 [(buf.validate.field).string.max_len = 16000];
+  // When true, automatically releases any active claim lease held by actor_id upon transition.
+  bool release_claim = 6;
+}
+
+// TransitionTaskStateResponse returns the transitioned Task.
+message TransitionTaskStateResponse {
+  // Updated task reflecting the new workflow_state_id and state_category.
+  Task task = 1;
+}
+
+// ClaimTaskRequest acquires or extends a time-limited execution lease on a Task.
+// Returns FAILED_PRECONDITION / ALREADY_EXISTS if another actor holds an unexpired
+// lease and force_takeover is false.
+message ClaimTaskRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Actor UUID acquiring or renewing the claim lease.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target task UUID to claim.
+  string task_id = 3 [(buf.validate.field).string.uuid = true];
+  // Lease duration in seconds (0 uses server default e.g. 1800s; max 86400s / 24h).
+  int32 lease_ttl_seconds = 4 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 86400
+  }];
+  // When true, overrides an active lease held by another actor and audits the takeover.
+  bool force_takeover = 5;
+}
+
+// ClaimTaskResponse wraps the claimed Task with updated lease metadata.
+message ClaimTaskResponse {
+  // Task reflecting claimed_by_actor_id and claim_expires_at.
+  Task task = 1;
+}
+
+// ReleaseTaskClaimRequest releases an active execution lease on a Task.
+message ReleaseTaskClaimRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Actor UUID releasing the lease.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target task UUID whose claim lease is being released.
+  string task_id = 3 [(buf.validate.field).string.uuid = true];
+  // Optional structured handoff note saved as a TASK_COMMENT_KIND_HANDOFF comment.
+  string handoff_note = 4 [(buf.validate.field).string.max_len = 16000];
+}
+
+// ReleaseTaskClaimResponse returns the Task with cleared claim lease fields.
+message ReleaseTaskClaimResponse {
+  // Task entity after releasing the claim lease.
+  Task task = 1;
+}
+
+// AddTaskRelationRequest creates a directed dependency link between two tasks.
+message AddTaskRelationRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID creating the relation.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Source task UUID (for BLOCKS, the upstream task that blocks target_task_id).
+  string source_task_id = 3 [(buf.validate.field).string.uuid = true];
+  // Target task UUID (for BLOCKS, the downstream task blocked by source_task_id).
+  string target_task_id = 4 [(buf.validate.field).string.uuid = true];
+  // Type of directed relationship.
+  TaskRelationType relation_type = 5 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+}
+
+// AddTaskRelationResponse wraps the newly created TaskRelation.
+message AddTaskRelationResponse {
+  // Created task relation edge.
+  TaskRelation relation = 1;
+}
+
+// RemoveTaskRelationRequest deletes a task relation edge by UUID.
+message RemoveTaskRelationRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID removing the relation.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target relation UUID to remove.
+  string relation_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// RemoveTaskRelationResponse confirms removal of the task relation.
+message RemoveTaskRelationResponse {
+  // UUID of the removed task relation.
+  string removed_relation_id = 1 [(buf.validate.field).string.uuid = true];
+}
+
+// AddTaskCommentRequest appends a typed comment to a Task's timeline.
+message AddTaskCommentRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authoring actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target task UUID receiving the comment.
+  string task_id = 3 [(buf.validate.field).string.uuid = true];
+  // Comment classification (defaults to TASK_COMMENT_KIND_COMMENT if UNSPECIFIED).
+  TaskCommentKind kind = 4 [(buf.validate.field).enum.defined_only = true];
+  // Non-empty markdown body of the comment.
+  string body = 5 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 16000
+  }];
+}
+
+// AddTaskCommentResponse returns the newly created TaskComment.
+message AddTaskCommentResponse {
+  // Newly recorded task comment.
+  TaskComment comment = 1;
+}
+
+// ListTaskCommentsRequest fetches timeline comments for a Task.
+message ListTaskCommentsRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target task UUID whose comments are requested.
+  string task_id = 3 [(buf.validate.field).string.uuid = true];
+  // Optional filter by comment kind (UNSPECIFIED returns all comment kinds).
+  TaskCommentKind kind_filter = 4 [(buf.validate.field).enum.defined_only = true];
+  // Maximum number of comments to return (0 uses server default, max 200).
+  int32 page_size = 5 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 200
+  }];
+  // Opaque pagination cursor from a previous ListTaskCommentsResponse.
+  string page_token = 6 [(buf.validate.field).string.max_len = 512];
+}
+
+// ListTaskCommentsResponse contains a page of comments for a Task.
+message ListTaskCommentsResponse {
+  // Chronologically ordered comments matching the filter.
+  repeated TaskComment comments = 1;
+  // Opaque pagination cursor for fetching additional comments.
+  string next_page_token = 2;
+}
+
+// GetAgentWorkQueueRequest queries actionable, unblocked tasks ranked by priority
+// for an autonomous agent or human operator.
+message GetAgentWorkQueueRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Calling actor UUID polling for work.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Optional project UUID restricting the work queue to one project.
+  optional string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Optional objective UUID restricting the work queue to one milestone/cycle/goal.
+  optional string objective_id = 4 [(buf.validate.field).string.uuid = true];
+  // Maximum number of unclaimed ready tasks to return (0 uses default e.g. 20, max 100).
+  int32 max_items = 5 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 100
+  }];
+  // When true, also returns compact summaries of tasks currently claimed by actor_id.
+  bool include_claimed_by_caller = 6;
+}
+
+// GetAgentWorkQueueResponse delivers compact task summaries ready for execution.
+message GetAgentWorkQueueResponse {
+  // Unclaimed, unblocked tasks in UNSTARTED/BACKLOG/STARTED categories ranked by priority.
+  repeated CompactTaskSummary ready_tasks = 1;
+  // Tasks currently holding an active lease by the calling actor_id.
+  repeated CompactTaskSummary claimed_by_caller = 2;
+}
+
+// GetProjectDigestRequest requests a token-minimal status digest for a project.
+message GetProjectDigestRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target project UUID to summarize.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// GetProjectDigestResponse wraps the computed ProjectDigest.
+message GetProjectDigestResponse {
+  // Aggregated project status digest.
+  ProjectDigest digest = 1;
+}
+
+// DeleteTaskRequest permanently deletes a task within a workspace.
+message DeleteTaskRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID authorizing deletion.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target task UUID to delete.
+  string task_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// DeleteTaskResponse confirms deletion of the task.
+message DeleteTaskResponse {
+  // UUID of the deleted task.
+  string deleted_task_id = 1 [(buf.validate.field).string.uuid = true];
+  // UTC timestamp when the task was deleted.
+  google.protobuf.Timestamp deleted_at = 2;
+}
+
+// GetTaskMarkdownRequest retrieves the optional Markdown document for a task.
+message GetTaskMarkdownRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target task UUID.
+  string task_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// GetTaskMarkdownResponse returns the Markdown document contents for a task.
+message GetTaskMarkdownResponse {
+  // UTF-8 Markdown content stored for the task (empty when has_markdown_doc is false).
+  string markdown = 1;
+  // True when an extended Markdown document exists for this task.
+  bool has_markdown_doc = 2;
+}
+
+// PutTaskMarkdownRequest creates or overwrites the Markdown document for a task.
+message PutTaskMarkdownRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID authoring the update.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target task UUID.
+  string task_id = 3 [(buf.validate.field).string.uuid = true];
+  // UTF-8 Markdown content to persist (up to 256 KiB).
+  string markdown = 4 [(buf.validate.field).string.max_len = 262144];
+}
+
+// PutTaskMarkdownResponse returns the updated task reflecting has_markdown_doc = true.
+message PutTaskMarkdownResponse {
+  // Updated task entity.
+  Task task = 1;
+}
+
+// DeleteTaskMarkdownRequest deletes the Markdown document associated with a task.
+message DeleteTaskMarkdownRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID removing the document.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target task UUID.
+  string task_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// DeleteTaskMarkdownResponse returns the updated task reflecting has_markdown_doc = false.
+message DeleteTaskMarkdownResponse {
+  // Updated task entity.
+  Task task = 1;
+}
+
+// PurgeArchivedTasksRequest permanently deletes all archived tasks across a workspace.
+message PurgeArchivedTasksRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID authorizing the purge.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+}
+
+// PurgeArchivedTasksResponse reports the count and identifiers of purged archived tasks.
+message PurgeArchivedTasksResponse {
+  // Number of archived tasks permanently deleted from the database.
+  int32 deleted_task_count = 1 [(buf.validate.field).int32.gte = 0];
+  // Number of associated `.md` task files deleted from global storage.
+  int32 deleted_markdown_count = 2 [(buf.validate.field).int32.gte = 0];
+  // Compact identifiers (e.g., "FLW-12") of purged tasks.
+  repeated string deleted_task_keys = 3;
+}
+
+// InspectOrphanResourcesRequest scans a workspace for orphan `.md` files and broken DB references.
+message InspectOrphanResourcesRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+}
+
+// InspectOrphanResourcesResponse summarizes orphan Markdown files and missing Markdown references.
+message InspectOrphanResourcesResponse {
+  // Count of `.md` files in `tasks/<workspace_id>/` without an active task in the database.
+  int32 orphan_task_files_count = 1 [(buf.validate.field).int32.gte = 0];
+  // Count of active DB tasks marked `has_markdown_doc = true` whose `.md` file is missing.
+  int32 missing_task_files_count = 2 [(buf.validate.field).int32.gte = 0];
+  // Count of `.md` files in `projects/<workspace_id>/` without an active project in the database.
+  int32 orphan_project_files_count = 3 [(buf.validate.field).int32.gte = 0];
+  // Count of active DB projects marked `has_markdown_doc = true` whose `.md` file is missing.
+  int32 missing_project_files_count = 4 [(buf.validate.field).int32.gte = 0];
+  // Total number of detected resource integrity issues across tasks and projects.
+  int32 total_issues = 5 [(buf.validate.field).int32.gte = 0];
+  // Human-readable diagnostic lines describing each detected orphan or missing reference (never host paths).
+  repeated string issue_summaries = 6;
+}
+
+// PruneOrphanResourcesRequest reconciles orphan `.md` files and broken DB Markdown flags in a workspace.
+message PruneOrphanResourcesRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID executing the prune operation.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // When true, computes and reports all actions that would be taken without mutating disk or database.
+  bool dry_run = 3;
+}
+
+// PruneOrphanResourcesResponse reports all reconciled orphan files and cleared DB references.
+message PruneOrphanResourcesResponse {
+  // Number of orphan task `.md` files removed (or matched in dry_run).
+  int32 removed_task_files_count = 1 [(buf.validate.field).int32.gte = 0];
+  // Number of broken task `has_markdown_doc` flags cleared (or matched in dry_run).
+  int32 cleared_task_refs_count = 2 [(buf.validate.field).int32.gte = 0];
+  // Number of orphan project `.md` files removed (or matched in dry_run).
+  int32 removed_project_files_count = 3 [(buf.validate.field).int32.gte = 0];
+  // Number of broken project `has_markdown_doc` flags cleared (or matched in dry_run).
+  int32 cleared_project_refs_count = 4 [(buf.validate.field).int32.gte = 0];
+  // Total number of orphan files and broken flags reconciled.
+  int32 total_cleaned = 5 [(buf.validate.field).int32.gte = 0];
+  // Echoes whether dry_run mode was active.
+  bool dry_run = 6;
+  // Human-readable summary lines for each cleaned (or dry-run matched) item (never host paths).
+  repeated string cleaned_summaries = 7;
+}
+
+// GetTaskByExternalIdRequest looks up an active task inside a project using its
+// external tracker identifier (e.g., ClickUp, Linear, Jira, GitHub Issues).
+message GetTaskByExternalIdRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target project UUID in which external_id is scoped.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // External tracker identifier (unique per project_id).
+  string external_id = 4 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 255
+  }];
+}
+
+// GetTaskByExternalIdResponse returns the matched task and its dependency relations.
+message GetTaskByExternalIdResponse {
+  // Matched task entity.
+  Task task = 1;
+  // Directed task relations involving this task.
+  repeated TaskRelation relations = 2;
+}

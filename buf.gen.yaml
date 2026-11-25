@@ -1,0 +1,17 @@
+# Buf v2 code generation configuration for Flowsk.
+# Generates Go Protobuf types and ConnectRPC client/server interfaces under gen/go.
+version: v2
+clean: true
+managed:
+  enabled: true
+  disable:
+    - module: buf.build/bufbuild/protovalidate
+plugins:
+  - local: protoc-gen-go
+    out: gen/go
+    opt:
+      - paths=source_relative
+  - local: protoc-gen-connect-go
+    out: gen/go
+    opt:
+      - paths=source_relative

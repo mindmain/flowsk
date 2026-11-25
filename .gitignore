@@ -1,0 +1,45 @@
+# Local binaries and build artifacts
+/bin/
+/dist/
+/flowsk
+*.exe
+*.out
+*.test
+
+# Frontend package cache and compiled embedded SPA bundle (rebuilt via task build / task install)
+/web/node_modules/
+/web/.angular/
+!/internal/adapter/webui/dist/
+/internal/adapter/webui/dist/*
+!/internal/adapter/webui/dist/.gitkeep
+
+# Coverage and profiling
+*.cov
+coverage.txt
+*.prof
+
+# Local SQLite databases, WAL, and shared-volume runtime state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+/data/
+
+# Environment and local overrides
+.env
+.env.*
+!.env.example
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Project explanations, plans, and Italian architecture prompts (strictly untracked)
+.prompts/
+**/.prompts/
+
+# Always track repository governance AGENTS.md files (overrides global gitignore rules)
+!AGENTS.md
+!**/AGENTS.md

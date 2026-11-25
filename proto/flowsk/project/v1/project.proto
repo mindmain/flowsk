@@ -1,0 +1,672 @@
+// Package flowsk.project.v1 defines workspace-scoped projects, customizable
+// Kanban workflow states, and issue classification labels over Buf Connect.
+//
+// ARCHITECTURAL INVARIANT — ZERO LOCAL FILESYSTEM PATHS:
+// Server-side Project schemas and RPC payloads MUST NEVER contain local
+// filesystem paths, host-specific working directories, or git worktree mounts
+// (for example, Mario's "/Users/mario/Desktop/app" vs Paolo's
+// "/Users/paolo/Downloads/app" vs a container volume path). Local directory
+// bindings live exclusively in each client's private local machine registry,
+// ensuring Flowsk leaves zero footprint inside target git repositories and
+// works seamlessly across distributed machines and shared Docker volumes.
+syntax = "proto3";
+
+package flowsk.project.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/mindmain/flowsk/gen/go/flowsk/project/v1;flowsk_project_pb";
+
+// ProjectStatus tracks the high-level lifecycle stage of a Flowsk project.
+enum ProjectStatus {
+  // Default unspecified status; rejected when creating a project explicitly with an invalid enum.
+  PROJECT_STATUS_UNSPECIFIED = 0;
+  // Project is being scoped and planned prior to active execution.
+  PROJECT_STATUS_PLANNED = 1;
+  // Project is actively worked on by human and/or agent actors.
+  PROJECT_STATUS_ACTIVE = 2;
+  // Project execution is temporarily on hold.
+  PROJECT_STATUS_PAUSED = 3;
+  // Project deliverables have been finished.
+  PROJECT_STATUS_COMPLETED = 4;
+  // Project is archived and hidden from default active boards while preserving history.
+  PROJECT_STATUS_ARCHIVED = 5;
+}
+
+// WorkflowStateCategory maps custom per-project workflow columns onto canonical
+// Linear-style lifecycle semantics so agents and digests can reason uniformly
+// across projects regardless of custom column names.
+enum WorkflowStateCategory {
+  // Default unspecified state category.
+  WORKFLOW_STATE_CATEGORY_UNSPECIFIED = 0;
+  // Incoming intake queue awaiting triage before entering the backlog.
+  WORKFLOW_STATE_CATEGORY_TRIAGE = 1;
+  // Accepted work items parked for future cycles or milestones.
+  WORKFLOW_STATE_CATEGORY_BACKLOG = 2;
+  // Ready-to-pick work items scheduled for execution but not yet started.
+  WORKFLOW_STATE_CATEGORY_UNSTARTED = 3;
+  // Work items actively in progress, in review, or undergoing verification.
+  WORKFLOW_STATE_CATEGORY_STARTED = 4;
+  // Work items that have met acceptance criteria and are done.
+  WORKFLOW_STATE_CATEGORY_COMPLETED = 5;
+  // Work items closed without implementation (duplicate, won't fix, superseded).
+  WORKFLOW_STATE_CATEGORY_CANCELED = 6;
+  // Work items parked in the project archive and eligible for workspace archive purging.
+  WORKFLOW_STATE_CATEGORY_ARCHIVED = 7;
+}
+
+// Project represents a logical product, repository stream, or initiative within
+// a Workspace.
+//
+// INVARIANT: Project intentionally omits any local filesystem directory path.
+// Client-specific folder mappings (e.g., Mario's Desktop vs Paolo's Downloads)
+// remain strictly inside each client's local machine registry and are never
+// stored on the Flowsk server or inside target git repositories.
+message Project {
+  // Unique project identifier (UUID).
+  string id = 1 [(buf.validate.field).string.uuid = true];
+  // Owning workspace identifier (UUID) for multi-tenant isolation.
+  string workspace_id = 2 [(buf.validate.field).string.uuid = true];
+  // Short uppercase key prefix used to mint sequential task identifiers (e.g., "FLW" -> "FLW-42").
+  string key_prefix = 3 [(buf.validate.field).string = {
+    min_len: 2
+    max_len: 10
+    pattern: "^[A-Z][A-Z0-9]{1,9}$"
+  }];
+  // Workspace-unique URL-safe project slug (e.g., "flowsk-core").
+  string slug = 4 [(buf.validate.field).string = {
+    min_len: 2
+    max_len: 64
+    pattern: "^[a-z0-9]+(-[a-z0-9]+)*$"
+  }];
+  // Human-readable project name.
+  string name = 5 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 120
+  }];
+  // Markdown overview describing project scope, conventions, and architecture notes.
+  string description = 6 [(buf.validate.field).string.max_len = 4000];
+  // Current lifecycle status of the project.
+  ProjectStatus status = 7 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Monotonically increasing per-project counter used to allocate task sequence numbers.
+  int64 issue_counter = 8 [(buf.validate.field).int64.gte = 0];
+  // Actor UUID that originally created the project.
+  string created_by_actor_id = 9 [(buf.validate.field).string.uuid = true];
+  // UTC timestamp when the project was created.
+  google.protobuf.Timestamp created_at = 10;
+  // UTC timestamp when the project was last updated.
+  google.protobuf.Timestamp updated_at = 11;
+  // True when an extended Markdown resource document (`<project_id>.md`) is stored for this project.
+  bool has_markdown_doc = 12;
+}
+
+// WorkflowState defines an ordered Kanban status column belonging to a Project,
+// paired with a canonical WorkflowStateCategory.
+message WorkflowState {
+  // Unique workflow state identifier (UUID).
+  string id = 1 [(buf.validate.field).string.uuid = true];
+  // Owning workspace identifier (UUID).
+  string workspace_id = 2 [(buf.validate.field).string.uuid = true];
+  // Owning project identifier (UUID).
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Project-unique state display name (e.g., "Todo", "In Progress", "In Review", "Done").
+  string name = 4 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+  }];
+  // Optional guidance explaining entry/exit criteria for this state.
+  string description = 5 [(buf.validate.field).string.max_len = 500];
+  // Canonical category governing task completion and agent queue eligibility.
+  WorkflowStateCategory category = 6 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Optional 6-digit hex color code prefixed with '#' (e.g., "#3B82F6").
+  string color_hex = 7 [(buf.validate.field).string.pattern = "^$|^#[0-9A-Fa-f]{6}$"];
+  // Zero-based display ordering index within the project's workflow board.
+  int32 position = 8 [(buf.validate.field).int32.gte = 0];
+  // Whether newly created tasks in this project default to this workflow state.
+  bool is_default = 9;
+  // UTC timestamp when the workflow state was created.
+  google.protobuf.Timestamp created_at = 10;
+  // UTC timestamp when the workflow state was last updated.
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+// Label represents a color-coded tag scoped to a Project for categorizing tasks.
+message Label {
+  // Unique label identifier (UUID).
+  string id = 1 [(buf.validate.field).string.uuid = true];
+  // Owning workspace identifier (UUID).
+  string workspace_id = 2 [(buf.validate.field).string.uuid = true];
+  // Owning project identifier (UUID).
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Project-unique label name (e.g., "security", "performance", "tech-debt").
+  string name = 4 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+  }];
+  // Optional description clarifying when to apply this label.
+  string description = 5 [(buf.validate.field).string.max_len = 500];
+  // Optional 6-digit hex color code prefixed with '#' (e.g., "#EF4444").
+  string color_hex = 6 [(buf.validate.field).string.pattern = "^$|^#[0-9A-Fa-f]{6}$"];
+  // UTC timestamp when the label was created.
+  google.protobuf.Timestamp created_at = 7;
+  // UTC timestamp when the label was last modified.
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+// ProjectService manages workspace-scoped projects, workflow state pipelines,
+// and task classification labels over Buf Connect.
+service ProjectService {
+  // CreateProject creates a new project inside a workspace and optionally seeds
+  // standard Linear-style workflow states (Triage, Backlog, Todo, In Progress, Done, Canceled).
+  rpc CreateProject(CreateProjectRequest) returns (CreateProjectResponse);
+
+  // GetProject fetches a project by UUID within the caller's workspace.
+  rpc GetProject(GetProjectRequest) returns (GetProjectResponse);
+
+  // GetProjectBySlug fetches a project by its workspace-unique slug.
+  rpc GetProjectBySlug(GetProjectBySlugRequest) returns (GetProjectBySlugResponse);
+
+  // ListProjects lists projects in a workspace with optional status filtering and pagination.
+  rpc ListProjects(ListProjectsRequest) returns (ListProjectsResponse);
+
+  // UpdateProject modifies mutable project metadata (slug, name, description, status).
+  rpc UpdateProject(UpdateProjectRequest) returns (UpdateProjectResponse);
+
+  // ArchiveProject transitions a project to PROJECT_STATUS_ARCHIVED without losing task history.
+  rpc ArchiveProject(ArchiveProjectRequest) returns (ArchiveProjectResponse);
+
+  // DeleteProject permanently deletes a project and its dependent workflow states,
+  // labels, objectives, and tasks within the workspace.
+  rpc DeleteProject(DeleteProjectRequest) returns (DeleteProjectResponse);
+
+  // CreateWorkflowState adds a custom workflow state column to a project.
+  rpc CreateWorkflowState(CreateWorkflowStateRequest) returns (CreateWorkflowStateResponse);
+
+  // ListWorkflowStates returns all workflow states configured for a project ordered by position.
+  rpc ListWorkflowStates(ListWorkflowStatesRequest) returns (ListWorkflowStatesResponse);
+
+  // UpdateWorkflowState updates the name, category, color, ordering, or default flag of a state.
+  rpc UpdateWorkflowState(UpdateWorkflowStateRequest) returns (UpdateWorkflowStateResponse);
+
+  // CreateLabel creates a new classification label within a project.
+  rpc CreateLabel(CreateLabelRequest) returns (CreateLabelResponse);
+
+  // ListLabels lists all classification labels defined for a project.
+  rpc ListLabels(ListLabelsRequest) returns (ListLabelsResponse);
+
+  // DeleteLabel removes a label from a project and detaches it from associated tasks.
+  rpc DeleteLabel(DeleteLabelRequest) returns (DeleteLabelResponse);
+
+  // BindSubproject links a child sub-project under a macro/parent project within
+  // the multi-binding project DAG (rejecting cycles and host filesystem paths).
+  rpc BindSubproject(BindSubprojectRequest) returns (BindSubprojectResponse);
+
+  // UnbindSubproject removes only the parent->child binding edge without deleting
+  // either project or its tasks.
+  rpc UnbindSubproject(UnbindSubprojectRequest) returns (UnbindSubprojectResponse);
+
+  // ListProjectBindings lists parent->child sub-project bindings in a workspace,
+  // optionally filtered by parent_project_id or child_project_id.
+  rpc ListProjectBindings(ListProjectBindingsRequest) returns (ListProjectBindingsResponse);
+
+  // GetProjectMarkdown retrieves the optional extended Markdown document (`<project_id>.md`)
+  // associated with a project in Flowsk's global storage directory.
+  rpc GetProjectMarkdown(GetProjectMarkdownRequest) returns (GetProjectMarkdownResponse);
+
+  // PutProjectMarkdown creates or updates the extended Markdown document (`<project_id>.md`)
+  // associated with a project and marks has_markdown_doc true.
+  rpc PutProjectMarkdown(PutProjectMarkdownRequest) returns (PutProjectMarkdownResponse);
+
+  // DeleteProjectMarkdown deletes the extended Markdown document (`<project_id>.md`)
+  // associated with a project and marks has_markdown_doc false.
+  rpc DeleteProjectMarkdown(DeleteProjectMarkdownRequest) returns (DeleteProjectMarkdownResponse);
+}
+
+// CreateProjectRequest defines parameters to create a workspace-scoped project.
+// Local filesystem paths must never be supplied in any field.
+message CreateProjectRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID creating the project.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Uppercase key prefix (2-10 chars, e.g., "FLW") unique within the workspace.
+  string key_prefix = 3 [(buf.validate.field).string = {
+    min_len: 2
+    max_len: 10
+    pattern: "^[A-Z][A-Z0-9]{1,9}$"
+  }];
+  // URL-safe slug unique within the workspace.
+  string slug = 4 [(buf.validate.field).string = {
+    min_len: 2
+    max_len: 64
+    pattern: "^[a-z0-9]+(-[a-z0-9]+)*$"
+  }];
+  // Human-readable project name.
+  string name = 5 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 120
+  }];
+  // Optional markdown project description (must not embed host-local paths).
+  string description = 6 [(buf.validate.field).string.max_len = 4000];
+  // Initial project status (defaults to PROJECT_STATUS_ACTIVE when UNSPECIFIED).
+  ProjectStatus status = 7 [(buf.validate.field).enum.defined_only = true];
+  // When true, automatically provisions default workflow states for immediate use.
+  bool seed_default_workflow_states = 8;
+}
+
+// CreateProjectResponse returns the created project and any seeded workflow states.
+message CreateProjectResponse {
+  // Newly created project entity.
+  Project project = 1;
+  // Seeded workflow states ordered by position (empty if seed_default_workflow_states was false).
+  repeated WorkflowState workflow_states = 2;
+}
+
+// GetProjectRequest identifies a project by UUID within a workspace.
+message GetProjectRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target project UUID.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// GetProjectResponse wraps the retrieved project.
+message GetProjectResponse {
+  // Matched project entity.
+  Project project = 1;
+}
+
+// GetProjectBySlugRequest looks up a project by its workspace-unique slug.
+message GetProjectBySlugRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target project slug within the workspace.
+  string slug = 3 [(buf.validate.field).string = {
+    min_len: 2
+    max_len: 64
+    pattern: "^[a-z0-9]+(-[a-z0-9]+)*$"
+  }];
+}
+
+// GetProjectBySlugResponse wraps the matched project.
+message GetProjectBySlugResponse {
+  // Matched project entity.
+  Project project = 1;
+}
+
+// ListProjectsRequest specifies filters and pagination for workspace projects.
+message ListProjectsRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Optional filter for a specific ProjectStatus (UNSPECIFIED returns non-archived by default).
+  ProjectStatus status_filter = 3 [(buf.validate.field).enum.defined_only = true];
+  // When true, includes archived projects even if status_filter is UNSPECIFIED.
+  bool include_archived = 4;
+  // Maximum number of projects to return (0 uses server default, max 200).
+  int32 page_size = 5 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 200
+  }];
+  // Opaque pagination cursor from a previous ListProjectsResponse.
+  string page_token = 6 [(buf.validate.field).string.max_len = 512];
+}
+
+// ListProjectsResponse contains a paginated slice of workspace projects.
+message ListProjectsResponse {
+  // Projects matching the filter criteria.
+  repeated Project projects = 1;
+  // Opaque cursor for fetching the next page, or empty if exhausted.
+  string next_page_token = 2;
+}
+
+// UpdateProjectRequest updates mutable fields of an existing project.
+message UpdateProjectRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID performing the update.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target project UUID to update.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Optional updated workspace-unique slug.
+  optional string slug = 4 [(buf.validate.field).string = {
+    min_len: 2
+    max_len: 64
+    pattern: "^[a-z0-9]+(-[a-z0-9]+)*$"
+  }];
+  // Optional updated display name.
+  optional string name = 5 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 120
+  }];
+  // Optional updated markdown description (must never store local filesystem paths).
+  optional string description = 6 [(buf.validate.field).string.max_len = 4000];
+  // Optional updated lifecycle status (PROJECT_STATUS_UNSPECIFIED leaves status unchanged).
+  ProjectStatus status = 7 [(buf.validate.field).enum.defined_only = true];
+}
+
+// UpdateProjectResponse returns the updated project entity.
+message UpdateProjectResponse {
+  // Project entity after applying updates.
+  Project project = 1;
+}
+
+// ArchiveProjectRequest marks a project as archived while retaining historical records.
+message ArchiveProjectRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID archiving the project.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target project UUID to archive.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// ArchiveProjectResponse wraps the archived project entity.
+message ArchiveProjectResponse {
+  // Archived project with status set to PROJECT_STATUS_ARCHIVED.
+  Project project = 1;
+}
+
+// DeleteProjectRequest permanently removes a project from a workspace.
+message DeleteProjectRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID authorizing deletion.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target project UUID to delete.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// DeleteProjectResponse confirms permanent removal of the project.
+message DeleteProjectResponse {
+  // UUID of the deleted project.
+  string deleted_project_id = 1 [(buf.validate.field).string.uuid = true];
+  // UTC timestamp when the deletion occurred.
+  google.protobuf.Timestamp deleted_at = 2;
+}
+
+// CreateWorkflowStateRequest adds a workflow state column to a project.
+message CreateWorkflowStateRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID creating the workflow state.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target project UUID that owns this workflow state.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Display name of the state (unique within the project).
+  string name = 4 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+  }];
+  // Optional state description or transition policy note.
+  string description = 5 [(buf.validate.field).string.max_len = 500];
+  // Canonical category of the workflow state.
+  WorkflowStateCategory category = 6 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Optional '#RRGGBB' hex color string.
+  string color_hex = 7 [(buf.validate.field).string.pattern = "^$|^#[0-9A-Fa-f]{6}$"];
+  // Zero-based display ordering index within the project board.
+  int32 position = 8 [(buf.validate.field).int32.gte = 0];
+  // When true, promotes this state to be the project's default state for new tasks.
+  bool is_default = 9;
+}
+
+// CreateWorkflowStateResponse wraps the newly created workflow state.
+message CreateWorkflowStateResponse {
+  // Created workflow state entity.
+  WorkflowState workflow_state = 1;
+}
+
+// ListWorkflowStatesRequest queries workflow states belonging to a project.
+message ListWorkflowStatesRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target project UUID whose workflow states are listed.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Optional category filter (WORKFLOW_STATE_CATEGORY_UNSPECIFIED returns all categories).
+  WorkflowStateCategory category_filter = 4 [(buf.validate.field).enum.defined_only = true];
+}
+
+// ListWorkflowStatesResponse contains the ordered workflow states of a project.
+message ListWorkflowStatesResponse {
+  // Workflow states ordered ascending by position.
+  repeated WorkflowState workflow_states = 1;
+}
+
+// UpdateWorkflowStateRequest modifies an existing project workflow state.
+message UpdateWorkflowStateRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID performing the update.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target project UUID owning the workflow state.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Target workflow state UUID to modify.
+  string workflow_state_id = 4 [(buf.validate.field).string.uuid = true];
+  // Optional updated state name.
+  optional string name = 5 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+  }];
+  // Optional updated description.
+  optional string description = 6 [(buf.validate.field).string.max_len = 500];
+  // Optional updated category (UNSPECIFIED leaves category unchanged).
+  WorkflowStateCategory category = 7 [(buf.validate.field).enum.defined_only = true];
+  // Optional updated '#RRGGBB' color hex string.
+  optional string color_hex = 8 [(buf.validate.field).string.pattern = "^$|^#[0-9A-Fa-f]{6}$"];
+  // Optional updated display ordering position.
+  optional int32 position = 9 [(buf.validate.field).int32.gte = 0];
+  // Optional flag promoting this state to be the project's default intake state.
+  optional bool is_default = 10;
+}
+
+// UpdateWorkflowStateResponse wraps the updated workflow state.
+message UpdateWorkflowStateResponse {
+  // Updated workflow state entity.
+  WorkflowState workflow_state = 1;
+}
+
+// CreateLabelRequest defines a new task label within a project.
+message CreateLabelRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID creating the label.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Owning project UUID.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Project-unique label name.
+  string name = 4 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+  }];
+  // Optional description explaining label usage.
+  string description = 5 [(buf.validate.field).string.max_len = 500];
+  // Optional '#RRGGBB' hex color string.
+  string color_hex = 6 [(buf.validate.field).string.pattern = "^$|^#[0-9A-Fa-f]{6}$"];
+}
+
+// CreateLabelResponse returns the newly created label.
+message CreateLabelResponse {
+  // Created label entity.
+  Label label = 1;
+}
+
+// ListLabelsRequest retrieves all labels configured on a project.
+message ListLabelsRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target project UUID.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// ListLabelsResponse contains the project's labels.
+message ListLabelsResponse {
+  // Labels configured on the target project ordered alphabetically by name.
+  repeated Label labels = 1;
+}
+
+// DeleteLabelRequest removes a label from a project.
+message DeleteLabelRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID deleting the label.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Owning project UUID.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Target label UUID to delete.
+  string label_id = 4 [(buf.validate.field).string.uuid = true];
+}
+
+// DeleteLabelResponse confirms deletion of the label.
+message DeleteLabelResponse {
+  // UUID of the deleted label.
+  string deleted_label_id = 1 [(buf.validate.field).string.uuid = true];
+}
+
+// ProjectBinding represents a non-destructive directed parent->child link in the
+// workspace multi-binding project graph (enabling macro repositories and umbrella
+// projects to group sub-projects for CLI and Web UI navigation).
+message ProjectBinding {
+  // Unique binding edge identifier (UUID).
+  string id = 1 [(buf.validate.field).string.uuid = true];
+  // Owning workspace identifier (UUID).
+  string workspace_id = 2 [(buf.validate.field).string.uuid = true];
+  // Macro / parent project identifier (UUID).
+  string parent_project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Nested / child sub-project identifier (UUID).
+  string child_project_id = 4 [(buf.validate.field).string.uuid = true];
+  // Optional relative subpath inside the parent repository (e.g., "apps/web"); never an absolute host path.
+  string scope_subpath = 5 [(buf.validate.field).string.max_len = 256];
+  // Optional actor UUID that created the binding.
+  string created_by_actor_id = 6;
+  // UTC timestamp when the binding was created.
+  google.protobuf.Timestamp created_at = 7;
+  // UTC timestamp when the binding was last updated.
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+// BindSubprojectRequest links a child project under a macro/parent project.
+message BindSubprojectRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID performing the binding.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Macro / parent project UUID.
+  string parent_project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Child sub-project UUID.
+  string child_project_id = 4 [(buf.validate.field).string.uuid = true];
+  // Optional relative subpath inside the parent repository (e.g., "services/auth"); never a host path.
+  string scope_subpath = 5 [(buf.validate.field).string.max_len = 256];
+}
+
+// BindSubprojectResponse returns the persisted parent->child project binding.
+message BindSubprojectResponse {
+  // Persisted project binding edge.
+  ProjectBinding binding = 1;
+}
+
+// UnbindSubprojectRequest detaches a child sub-project from a parent project without deleting either project.
+message UnbindSubprojectRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID removing the binding.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Macro / parent project UUID.
+  string parent_project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Child sub-project UUID.
+  string child_project_id = 4 [(buf.validate.field).string.uuid = true];
+}
+
+// UnbindSubprojectResponse confirms removal of the binding edge.
+message UnbindSubprojectResponse {
+  // True if an active binding existed and was removed.
+  bool unbound = 1;
+}
+
+// ListProjectBindingsRequest queries parent->child project bindings within a workspace.
+message ListProjectBindingsRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Optional filter restricting results to children of a specific parent project UUID.
+  optional string parent_project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Optional filter restricting results to parents of a specific child project UUID.
+  optional string child_project_id = 4 [(buf.validate.field).string.uuid = true];
+}
+
+// ListProjectBindingsResponse returns matching parent->child project bindings.
+message ListProjectBindingsResponse {
+  // Active project bindings ordered by scope_subpath, then creation time.
+  repeated ProjectBinding bindings = 1;
+}
+
+// GetProjectMarkdownRequest retrieves the optional Markdown document for a project.
+message GetProjectMarkdownRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target project UUID.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// GetProjectMarkdownResponse returns the Markdown document contents for a project.
+message GetProjectMarkdownResponse {
+  // UTF-8 Markdown content stored for the project (empty when has_markdown_doc is false).
+  string markdown = 1;
+  // True when an extended Markdown document exists for this project.
+  bool has_markdown_doc = 2;
+}
+
+// PutProjectMarkdownRequest creates or overwrites the Markdown document for a project.
+message PutProjectMarkdownRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID authoring the update.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target project UUID.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // UTF-8 Markdown content to persist (up to 256 KiB; must never embed host paths as schema metadata).
+  string markdown = 4 [(buf.validate.field).string.max_len = 262144];
+}
+
+// PutProjectMarkdownResponse returns the updated project metadata reflecting has_markdown_doc = true.
+message PutProjectMarkdownResponse {
+  // Updated project entity.
+  Project project = 1;
+}
+
+// DeleteProjectMarkdownRequest deletes the Markdown document associated with a project.
+message DeleteProjectMarkdownRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID removing the document.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target project UUID.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// DeleteProjectMarkdownResponse returns the updated project metadata reflecting has_markdown_doc = false.
+message DeleteProjectMarkdownResponse {
+  // Updated project entity.
+  Project project = 1;
+}

@@ -1,0 +1,238 @@
+// Package flowsk.language.v1 defines the Cloudflare Code Mode JavaScript
+// execution, syntax validation, and self-describing TypeScript SDK discovery
+// contracts. Agents use sandboxed ES6 JavaScript against `flowsk.*` to perform
+// multi-step graph mutations and queries atomically in a single round-trip.
+syntax = "proto3";
+
+package flowsk.language.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/mindmain/flowsk/gen/go/flowsk/language/v1;flowsk_language_pb";
+
+// ExecutionMode controls transactional persistence semantics when evaluating a
+// Code Mode JavaScript snippet.
+enum ExecutionMode {
+  // Default unspecified execution mode (treated as EXECUTION_MODE_ATOMIC_COMMIT).
+  EXECUTION_MODE_UNSPECIFIED = 0;
+  // Evaluates the entire JavaScript snippet inside a single ACID database
+  // transaction and commits only if execution completes without error.
+  EXECUTION_MODE_ATOMIC_COMMIT = 1;
+  // Evaluates the entire JavaScript snippet inside a rolled-back transaction
+  // so callers can preview return values safely without persisting changes.
+  EXECUTION_MODE_DRY_RUN = 2;
+}
+
+// OutputDensity tunes the verbosity of textual summaries returned to agents
+// so callers can minimize context-window token consumption.
+enum OutputDensity {
+  // Default unspecified density (treated as OUTPUT_DENSITY_MINIMAL_TOKENS).
+  OUTPUT_DENSITY_UNSPECIFIED = 0;
+  // Ultra-compact summaries optimized for LLM agents.
+  OUTPUT_DENSITY_MINIMAL_TOKENS = 1;
+  // Balanced human- and agent-readable execution summaries.
+  OUTPUT_DENSITY_STANDARD = 2;
+  // Detailed multi-line output including console logs and structured return values.
+  OUTPUT_DENSITY_VERBOSE = 3;
+}
+
+// DiagnosticSeverity classifies syntax or validation diagnostics emitted
+// during Code Mode JavaScript checking or execution.
+enum DiagnosticSeverity {
+  // Default unspecified diagnostic severity.
+  DIAGNOSTIC_SEVERITY_UNSPECIFIED = 0;
+  // Informational hint or optimization suggestion; does not abort execution.
+  DIAGNOSTIC_SEVERITY_INFO = 1;
+  // Non-fatal warning; does not abort execution.
+  DIAGNOSTIC_SEVERITY_WARNING = 2;
+  // Fatal JavaScript syntax, validation, permission, or state conflict error causing rollback.
+  DIAGNOSTIC_SEVERITY_ERROR = 3;
+}
+
+// ScriptDiagnostic pinpoints a line/column diagnostic generated while compiling,
+// validating, or executing a Code Mode JavaScript snippet.
+message ScriptDiagnostic {
+  // Severity level of this diagnostic.
+  DiagnosticSeverity severity = 1 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // 1-based source line number in the submitted JavaScript snippet.
+  int32 line = 2 [(buf.validate.field).int32.gte = 1];
+  // 1-based column number on the source line.
+  int32 column = 3 [(buf.validate.field).int32.gte = 1];
+  // Stable machine-readable diagnostic code (e.g., "FLW_SYNTAX", "FLW_VALIDATION").
+  string code = 4 [(buf.validate.field).string.max_len = 64];
+  // Clear human- and agent-actionable error or warning explanation.
+  string message = 5 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 1024
+  }];
+  // Optional remediation hint showing valid `flowsk.*` JavaScript usage.
+  string hint = 6 [(buf.validate.field).string.max_len = 1024];
+}
+
+// StatementResult captures a structured operation outcome inside a Code Mode
+// JavaScript execution when per-operation details are recorded.
+message StatementResult {
+  // 0-based ordinal index of the recorded operation.
+  int32 statement_index = 1 [(buf.validate.field).int32.gte = 0];
+  // 1-based source line where the operation originated.
+  int32 line = 2 [(buf.validate.field).int32.gte = 1];
+  // Canonical operation verb (e.g., "CODEMODE_EXEC", "CREATE_TASK", "CLAIM").
+  string operation = 3 [(buf.validate.field).string.max_len = 64];
+  // Optional variable or result label associated with the operation.
+  string bound_symbol = 4 [(buf.validate.field).string.max_len = 64];
+  // Primary affected or queried entity UUID, when applicable.
+  optional string entity_id = 5 [(buf.validate.field).string.uuid = true];
+  // Compact identifier of the affected entity (e.g., "FLW-42" or project slug), when applicable.
+  string entity_identifier = 6 [(buf.validate.field).string.max_len = 64];
+  // Formatted output summary shaped according to the requested OutputDensity.
+  string summary = 7 [(buf.validate.field).string.max_len = 4096];
+}
+
+// LanguageExample provides an idiomatic, copy-pastable Code Mode JavaScript
+// recipe demonstrating multi-step workflows for agents and humans.
+message LanguageExample {
+  // Unique slug identifier for the example (e.g., "epic-dag-decomposition").
+  string slug = 1 [(buf.validate.field).string = {
+    min_len: 2
+    max_len: 64
+  }];
+  // Short descriptive title of the workflow pattern.
+  string title = 2 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 160
+  }];
+  // Functional category (e.g., "planning", "claiming", "sync").
+  string category = 3 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+  }];
+  // Explanation of when an agent or user should apply this JavaScript pattern.
+  string description = 4 [(buf.validate.field).string.max_len = 2000];
+  // Valid ES6 JavaScript source snippet targeting the `flowsk` SDK.
+  string script = 5 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 32000
+  }];
+}
+
+// LanguageService executes and validates Cloudflare Code Mode ES6 JavaScript
+// scripts in a hermetic pure-Go sandbox and serves TypeScript SDK documentation
+// over Buf Connect.
+service LanguageService {
+  // ExecuteScript evaluates a sandboxed ES6 JavaScript snippet against `flowsk.*`
+  // atomically in a single ACID transaction (or simulates it in DRY_RUN mode).
+  rpc ExecuteScript(ExecuteScriptRequest) returns (ExecuteScriptResponse);
+
+  // ValidateScript performs static ECMAScript 6 syntax validation without
+  // executing database reads or mutations.
+  rpc ValidateScript(ValidateScriptRequest) returns (ValidateScriptResponse);
+
+  // GetLanguageGuide returns the Markdown specification and TypeScript `.d.ts`
+  // SDK declarations teaching any LLM agent or human how to script `flowsk.*`.
+  rpc GetLanguageGuide(GetLanguageGuideRequest) returns (GetLanguageGuideResponse);
+
+  // ListLanguageExamples returns curated, runnable Code Mode JavaScript examples.
+  rpc ListLanguageExamples(ListLanguageExamplesRequest) returns (ListLanguageExamplesResponse);
+}
+
+// ExecuteScriptRequest submits an ES6 JavaScript snippet for atomic execution or dry-run.
+message ExecuteScriptRequest {
+  // Target workspace UUID in which all SDK operations execute.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID executing the script (recorded in single BATCH_EXEC audit).
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Optional default project UUID used when JS calls omit an explicit project argument.
+  optional string default_project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Non-empty ES6 JavaScript source text (UTF-8, max 128 KiB).
+  string script = 4 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 131072
+  }];
+  // Transactional execution mode (defaults to EXECUTION_MODE_ATOMIC_COMMIT when UNSPECIFIED).
+  ExecutionMode mode = 5 [(buf.validate.field).enum.defined_only = true];
+  // Desired verbosity of returned summaries (defaults to OUTPUT_DENSITY_MINIMAL_TOKENS).
+  OutputDensity output_density = 6 [(buf.validate.field).enum.defined_only = true];
+}
+
+// ExecuteScriptResponse reports the transactional result of a Code Mode JavaScript run.
+message ExecuteScriptResponse {
+  // True if execution succeeded with zero errors and changes were committed to storage.
+  bool committed = 1;
+  // Effective execution mode applied by the engine.
+  ExecutionMode effective_mode = 2;
+  // Count of domain mutations performed (or 1 for read-only evaluations).
+  int32 statements_executed = 3 [(buf.validate.field).int32.gte = 0];
+  // Consolidated token-efficient text summary (console output + serialized return value).
+  string compact_output = 4;
+  // Optional structured per-operation outcomes.
+  repeated StatementResult results = 5;
+  // Syntax or runtime diagnostics emitted during evaluation.
+  repeated ScriptDiagnostic diagnostics = 6;
+  // UTC timestamp when script evaluation completed.
+  google.protobuf.Timestamp executed_at = 7;
+}
+
+// ValidateScriptRequest submits an ES6 JavaScript snippet for static syntax checking.
+message ValidateScriptRequest {
+  // Target workspace UUID context for validating workspace ownership.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // ES6 JavaScript source text to validate.
+  string script = 3 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 131072
+  }];
+}
+
+// ValidateScriptResponse reports static JavaScript syntax check diagnostics.
+message ValidateScriptResponse {
+  // True when diagnostics contains zero DIAGNOSTIC_SEVERITY_ERROR entries.
+  bool valid = 1;
+  // Count of validated script units (1 when valid).
+  int32 statement_count = 2 [(buf.validate.field).int32.gte = 0];
+  // Any syntax errors or warnings discovered.
+  repeated ScriptDiagnostic diagnostics = 3;
+}
+
+// GetLanguageGuideRequest requests the Code Mode JavaScript SDK Markdown specification.
+message GetLanguageGuideRequest {
+  // Optional output density controlling compact quick-reference vs full guide.
+  OutputDensity density = 1 [(buf.validate.field).enum.defined_only = true];
+  // Optional workspace UUID when requested within an active workspace context.
+  optional string workspace_id = 2 [(buf.validate.field).string.uuid = true];
+  // Optional caller actor UUID when requested by a registered workspace actor.
+  optional string actor_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// GetLanguageGuideResponse delivers the downloadable Code Mode Markdown guide and TypeScript `.d.ts` spec.
+message GetLanguageGuideResponse {
+  // Semantic version of the Code Mode SDK specification (e.g., "2.0.0").
+  string version = 1;
+  // Suggested filename when saving locally or exposing as an MCP resource (e.g., "FLOWSK_CODEMODE.md").
+  string filename = 2;
+  // Complete self-contained Markdown specification and JavaScript SDK reference.
+  string markdown_spec = 3;
+  // Compact TypeScript `.d.ts` declaration summary of the global `flowsk` SDK.
+  string ebnf_grammar = 4;
+}
+
+// ListLanguageExamplesRequest queries runnable Code Mode JavaScript examples.
+message ListLanguageExamplesRequest {
+  // Optional category filter (empty returns examples across all categories).
+  string category_filter = 1 [(buf.validate.field).string.max_len = 64];
+  // Optional workspace UUID context.
+  optional string workspace_id = 2 [(buf.validate.field).string.uuid = true];
+  // Optional caller actor UUID context.
+  optional string actor_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// ListLanguageExamplesResponse wraps the list of curated Code Mode JavaScript examples.
+message ListLanguageExamplesResponse {
+  // Curated Code Mode ES6 JavaScript examples.
+  repeated LanguageExample examples = 1;
+}

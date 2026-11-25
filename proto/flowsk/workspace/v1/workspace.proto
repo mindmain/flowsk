@@ -1,0 +1,289 @@
+// Package flowsk.workspace.v1 defines multi-tenant workspace boundaries and
+// human or autonomous agent actor identities for Flowsk over Buf Connect.
+syntax = "proto3";
+
+package flowsk.workspace.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/mindmain/flowsk/gen/go/flowsk/workspace/v1;flowsk_workspace_pb";
+
+// ActorKind classifies the principal operating inside a Flowsk workspace.
+// Flowsk is strictly agent-agnostic and treats both human collaborators and
+// autonomous software agents as first-class audited actors.
+enum ActorKind {
+  // Default unspecified actor kind; rejected on write operations.
+  ACTOR_KIND_UNSPECIFIED = 0;
+  // Interactive human user collaborating through CLI, web UI, or desktop tools.
+  ACTOR_KIND_HUMAN = 1;
+  // Autonomous or semi-autonomous software agent connecting via MCP, CLI, or RPC.
+  ACTOR_KIND_AGENT = 2;
+}
+
+// Workspace represents the top-level multi-tenant collaboration boundary in Flowsk.
+// All projects, objectives, tasks, actors, and audit trails are strictly isolated
+// by workspace_id.
+message Workspace {
+  // Unique workspace identifier (UUIDv4/UUIDv7).
+  string id = 1 [(buf.validate.field).string.uuid = true];
+  // URL-safe, unique workspace slug used in human-readable references.
+  string slug = 2 [(buf.validate.field).string = {
+    min_len: 2
+    max_len: 64
+    pattern: "^[a-z0-9]+(-[a-z0-9]+)*$"
+  }];
+  // Human-readable display name of the workspace.
+  string name = 3 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 120
+  }];
+  // Optional markdown description summarizing the workspace purpose.
+  string description = 4 [(buf.validate.field).string.max_len = 2000];
+  // UTC timestamp when the workspace was created.
+  google.protobuf.Timestamp created_at = 5;
+  // UTC timestamp when the workspace metadata was last updated.
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+// Actor represents an identified human user or software agent registered within
+// a specific workspace. Every mutating action and task lease references an Actor.
+message Actor {
+  // Unique actor identifier (UUID).
+  string id = 1 [(buf.validate.field).string.uuid = true];
+  // Owning workspace identifier (UUID) for strict tenant isolation.
+  string workspace_id = 2 [(buf.validate.field).string.uuid = true];
+  // Classification indicating whether the actor is human or an agent.
+  ActorKind kind = 3 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Workspace-unique handle used for mentions and scripts (e.g., "mario", "planner-agent").
+  string handle = 4 [(buf.validate.field).string = {
+    min_len: 2
+    max_len: 64
+    pattern: "^[a-z0-9_]+(-[a-z0-9_]+)*$"
+  }];
+  // Human-readable name displayed in timelines, boards, and digests.
+  string display_name = 5 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 120
+  }];
+  // Optional role or specialty label (e.g., "Tech Lead", "Security Auditor").
+  string role_title = 6 [(buf.validate.field).string.max_len = 120];
+  // Optional agent-agnostic client/runtime descriptor (e.g., "mcp-client/1.0", "flowsk-cli").
+  string client_metadata = 7 [(buf.validate.field).string.max_len = 512];
+  // Whether this actor is currently active and permitted to claim or mutate resources.
+  bool is_active = 8;
+  // UTC timestamp when the actor was registered in the workspace.
+  google.protobuf.Timestamp created_at = 9;
+  // UTC timestamp when the actor profile was last updated.
+  google.protobuf.Timestamp updated_at = 10;
+}
+
+// WorkspaceService manages multi-tenant workspaces and workspace-scoped human
+// or agent actor identities over Buf Connect.
+service WorkspaceService {
+  // CreateWorkspace provisions a new isolated workspace tenant.
+  // Returns ALREADY_EXISTS if the requested slug is already taken.
+  rpc CreateWorkspace(CreateWorkspaceRequest) returns (CreateWorkspaceResponse);
+
+  // GetWorkspace retrieves a single workspace by its UUID.
+  // Returns NOT_FOUND if the workspace does not exist.
+  rpc GetWorkspace(GetWorkspaceRequest) returns (GetWorkspaceResponse);
+
+  // ListWorkspaces enumerates workspaces available on this Flowsk instance
+  // using cursor-based pagination.
+  rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
+
+  // UpdateWorkspace modifies mutable metadata (name, description) of an existing
+  // workspace after verifying the caller actor belongs to the workspace.
+  rpc UpdateWorkspace(UpdateWorkspaceRequest) returns (UpdateWorkspaceResponse);
+
+  // DeleteWorkspace permanently removes a workspace and its tenant-scoped data
+  // after verifying caller authorization within the workspace.
+  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
+
+  // RegisterActor enrolls a human collaborator or software agent inside a workspace,
+  // or returns/updates the registration if idempotently invoked by handle.
+  rpc RegisterActor(RegisterActorRequest) returns (RegisterActorResponse);
+
+  // GetActor retrieves a single actor profile scoped to the given workspace.
+  // Returns NOT_FOUND if the actor does not exist in the specified workspace.
+  rpc GetActor(GetActorRequest) returns (GetActorResponse);
+
+  // ListActors enumerates actors registered in a workspace with optional filtering
+  // by actor kind and active state.
+  rpc ListActors(ListActorsRequest) returns (ListActorsResponse);
+}
+
+// CreateWorkspaceRequest contains parameters to provision a new workspace.
+message CreateWorkspaceRequest {
+  // Unique URL-safe workspace slug (lowercase alphanumeric and hyphens).
+  string slug = 1 [(buf.validate.field).string = {
+    min_len: 2
+    max_len: 64
+    pattern: "^[a-z0-9]+(-[a-z0-9]+)*$"
+  }];
+  // Human-readable display name of the workspace.
+  string name = 2 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 120
+  }];
+  // Optional markdown summary describing the workspace.
+  string description = 3 [(buf.validate.field).string.max_len = 2000];
+}
+
+// CreateWorkspaceResponse returns the newly provisioned workspace.
+message CreateWorkspaceResponse {
+  // Newly created workspace entity.
+  Workspace workspace = 1;
+}
+
+// GetWorkspaceRequest identifies the workspace to retrieve.
+message GetWorkspaceRequest {
+  // Target workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Optional caller actor UUID when invoked by an already-registered workspace actor.
+  optional string actor_id = 2 [(buf.validate.field).string.uuid = true];
+}
+
+// GetWorkspaceResponse wraps the requested workspace entity.
+message GetWorkspaceResponse {
+  // Retrieved workspace entity.
+  Workspace workspace = 1;
+}
+
+// ListWorkspacesRequest specifies pagination parameters for listing workspaces.
+message ListWorkspacesRequest {
+  // Maximum number of workspaces to return (0 uses server default, max 200).
+  int32 page_size = 1 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 200
+  }];
+  // Opaque pagination cursor from a previous ListWorkspacesResponse.
+  string page_token = 2 [(buf.validate.field).string.max_len = 512];
+}
+
+// ListWorkspacesResponse contains a page of workspaces.
+message ListWorkspacesResponse {
+  // Page of workspace entities ordered deterministically.
+  repeated Workspace workspaces = 1;
+  // Opaque cursor for fetching the next page, or empty when exhausted.
+  string next_page_token = 2;
+}
+
+// UpdateWorkspaceRequest modifies mutable fields on an existing workspace.
+message UpdateWorkspaceRequest {
+  // Target workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID performing the update (must belong to workspace_id).
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Optional updated workspace display name.
+  optional string name = 3 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 120
+  }];
+  // Optional updated workspace markdown description.
+  optional string description = 4 [(buf.validate.field).string.max_len = 2000];
+}
+
+// UpdateWorkspaceResponse wraps the updated workspace entity.
+message UpdateWorkspaceResponse {
+  // Workspace entity reflecting the applied updates.
+  Workspace workspace = 1;
+}
+
+// DeleteWorkspaceRequest authorizes deletion of an entire workspace tenant.
+message DeleteWorkspaceRequest {
+  // Target workspace UUID to delete.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Actor UUID authorizing the workspace deletion (must belong to workspace_id).
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+}
+
+// DeleteWorkspaceResponse confirms deletion of the workspace.
+message DeleteWorkspaceResponse {
+  // UUID of the deleted workspace.
+  string deleted_workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // UTC timestamp when the deletion completed.
+  google.protobuf.Timestamp deleted_at = 2;
+}
+
+// RegisterActorRequest enrolls a human or agent actor inside a target workspace.
+message RegisterActorRequest {
+  // Target workspace UUID in which the actor is being registered.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Optional initiating actor UUID if an existing workspace actor registers a peer;
+  // omitted when bootstrapping the initial actor in a newly created workspace.
+  optional string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Principal classification (HUMAN or AGENT).
+  ActorKind kind = 3 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Workspace-unique handle (lowercase alphanumeric, underscores, hyphens).
+  string handle = 4 [(buf.validate.field).string = {
+    min_len: 2
+    max_len: 64
+    pattern: "^[a-z0-9_]+(-[a-z0-9_]+)*$"
+  }];
+  // Human-readable display name for UI boards and activity logs.
+  string display_name = 5 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 120
+  }];
+  // Optional functional title or agent role summary.
+  string role_title = 6 [(buf.validate.field).string.max_len = 120];
+  // Optional client/harness descriptor (kept strictly vendor-neutral).
+  string client_metadata = 7 [(buf.validate.field).string.max_len = 512];
+}
+
+// RegisterActorResponse wraps the registered actor identity.
+message RegisterActorResponse {
+  // Registered actor entity.
+  Actor actor = 1;
+}
+
+// GetActorRequest retrieves a single actor within a workspace.
+message GetActorRequest {
+  // Owning workspace UUID for tenant verification.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Target actor UUID to look up.
+  string target_actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Optional caller actor UUID performing the lookup.
+  optional string actor_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// GetActorResponse returns the requested actor profile.
+message GetActorResponse {
+  // Matched actor entity.
+  Actor actor = 1;
+}
+
+// ListActorsRequest queries actors belonging to a workspace.
+message ListActorsRequest {
+  // Owning workspace UUID for strict tenant scoping.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Optional caller actor UUID performing the listing.
+  optional string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Optional filter by actor kind (ACTOR_KIND_UNSPECIFIED returns all kinds).
+  ActorKind kind_filter = 3 [(buf.validate.field).enum.defined_only = true];
+  // When true, returns only currently active actors.
+  bool active_only = 4;
+  // Maximum number of actors to return (0 uses server default, max 200).
+  int32 page_size = 5 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 200
+  }];
+  // Opaque pagination token from a prior ListActorsResponse.
+  string page_token = 6 [(buf.validate.field).string.max_len = 512];
+}
+
+// ListActorsResponse returns a paginated list of workspace actors.
+message ListActorsResponse {
+  // Actors matching the workspace and filter criteria.
+  repeated Actor actors = 1;
+  // Opaque cursor for retrieving the next page, or empty if complete.
+  string next_page_token = 2;
+}

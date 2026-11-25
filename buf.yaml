@@ -1,0 +1,15 @@
+# Buf v2 workspace configuration for Flowsk RPC contracts.
+# All services expose Buf Connect (ConnectRPC) endpoints and enforce
+# declarative input validation via buf.build/bufbuild/protovalidate.
+version: v2
+modules:
+  - path: proto
+deps:
+  - buf.build/bufbuild/protovalidate
+lint:
+  use:
+    - STANDARD
+    - COMMENTS
+breaking:
+  use:
+    - FILE

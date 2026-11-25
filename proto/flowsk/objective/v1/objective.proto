@@ -1,0 +1,273 @@
+// Package flowsk.objective.v1 defines outcome-oriented milestones, timeboxed
+// cycles, and strategic goals grouping tasks within Flowsk projects.
+syntax = "proto3";
+
+package flowsk.objective.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/mindmain/flowsk/gen/go/flowsk/objective/v1;flowsk_objective_pb";
+
+// ObjectiveKind distinguishes the planning horizon and semantics of an Objective.
+enum ObjectiveKind {
+  // Default unspecified objective kind; rejected on creation.
+  OBJECTIVE_KIND_UNSPECIFIED = 0;
+  // Release or deliverable checkpoint grouping tasks toward a concrete ship target.
+  OBJECTIVE_KIND_MILESTONE = 1;
+  // Timeboxed iteration or sprint window with explicit start and target dates.
+  OBJECTIVE_KIND_CYCLE = 2;
+  // Outcome-oriented strategic goal or OKR measured by explicit success criteria.
+  OBJECTIVE_KIND_GOAL = 3;
+}
+
+// ObjectiveStatus represents the execution health and lifecycle state of an Objective.
+enum ObjectiveStatus {
+  // Default unspecified objective status.
+  OBJECTIVE_STATUS_UNSPECIFIED = 0;
+  // Objective is drafted and scheduled for future execution.
+  OBJECTIVE_STATUS_PLANNED = 1;
+  // Objective is actively being pursued and on track.
+  OBJECTIVE_STATUS_ACTIVE = 2;
+  // Objective is active but flagged at risk due to blockers or schedule slip.
+  OBJECTIVE_STATUS_AT_RISK = 3;
+  // Objective has met its success criteria and closed successfully.
+  OBJECTIVE_STATUS_ACHIEVED = 4;
+  // Objective was descoped, canceled, or closed without achievement.
+  OBJECTIVE_STATUS_DROPPED = 5;
+}
+
+// Objective models a milestone, cycle, or strategic goal inside a Project that
+// aggregates tasks and tracks completion progress.
+message Objective {
+  // Unique objective identifier (UUID).
+  string id = 1 [(buf.validate.field).string.uuid = true];
+  // Owning workspace identifier (UUID) for tenant isolation.
+  string workspace_id = 2 [(buf.validate.field).string.uuid = true];
+  // Owning project identifier (UUID).
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Structural classification (MILESTONE, CYCLE, or GOAL).
+  ObjectiveKind kind = 4 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Current lifecycle and health status of the objective.
+  ObjectiveStatus status = 5 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Concise objective title.
+  string title = 6 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 200
+  }];
+  // Detailed markdown context describing scope and deliverables.
+  string description = 7 [(buf.validate.field).string.max_len = 8000];
+  // Verifiable definition of done or measurable outcome criteria.
+  string success_criteria = 8 [(buf.validate.field).string.max_len = 4000];
+  // Optional actor UUID accountable for driving the objective.
+  optional string owner_actor_id = 9 [(buf.validate.field).string.uuid = true];
+  // Optional UTC start timestamp (commonly set on cycles and milestones).
+  google.protobuf.Timestamp start_date = 10;
+  // Optional UTC target completion timestamp.
+  google.protobuf.Timestamp target_date = 11;
+  // UTC timestamp when the objective reached ACHIEVED or DROPPED, if closed.
+  google.protobuf.Timestamp closed_at = 12;
+  // Total number of tasks currently linked to this objective.
+  int32 total_task_count = 13 [(buf.validate.field).int32.gte = 0];
+  // Number of linked tasks currently in a COMPLETED workflow state category.
+  int32 completed_task_count = 14 [(buf.validate.field).int32.gte = 0];
+  // Actor UUID that created the objective.
+  string created_by_actor_id = 15 [(buf.validate.field).string.uuid = true];
+  // UTC timestamp when the objective was created.
+  google.protobuf.Timestamp created_at = 16;
+  // UTC timestamp when the objective was last updated.
+  google.protobuf.Timestamp updated_at = 17;
+}
+
+// ObjectiveService manages project milestones, timeboxed cycles, and goals
+// over Buf Connect.
+service ObjectiveService {
+  // CreateObjective defines a new milestone, cycle, or goal within a project.
+  rpc CreateObjective(CreateObjectiveRequest) returns (CreateObjectiveResponse);
+
+  // GetObjective retrieves an objective and its live task completion counts by UUID.
+  rpc GetObjective(GetObjectiveRequest) returns (GetObjectiveResponse);
+
+  // ListObjectives enumerates objectives in a workspace with optional filtering
+  // by project, kind, and status.
+  rpc ListObjectives(ListObjectivesRequest) returns (ListObjectivesResponse);
+
+  // UpdateObjective updates mutable metadata, dates, owner, or health status of an objective.
+  rpc UpdateObjective(UpdateObjectiveRequest) returns (UpdateObjectiveResponse);
+
+  // CloseObjective transitions an objective into a terminal status (ACHIEVED or DROPPED)
+  // and records its closing timestamp and resolution summary.
+  rpc CloseObjective(CloseObjectiveRequest) returns (CloseObjectiveResponse);
+
+  // DeleteObjective removes an objective and unlinks any tasks referencing it
+  // without deleting the tasks themselves.
+  rpc DeleteObjective(DeleteObjectiveRequest) returns (DeleteObjectiveResponse);
+}
+
+// CreateObjectiveRequest contains fields to create a new Objective.
+message CreateObjectiveRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID creating the objective.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target project UUID owning the objective.
+  string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Objective classification (MILESTONE, CYCLE, or GOAL).
+  ObjectiveKind kind = 4 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Initial status (defaults to OBJECTIVE_STATUS_PLANNED when UNSPECIFIED).
+  ObjectiveStatus status = 5 [(buf.validate.field).enum.defined_only = true];
+  // Concise objective title.
+  string title = 6 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 200
+  }];
+  // Optional detailed markdown description.
+  string description = 7 [(buf.validate.field).string.max_len = 8000];
+  // Optional verifiable success criteria.
+  string success_criteria = 8 [(buf.validate.field).string.max_len = 4000];
+  // Optional accountable owner actor UUID.
+  optional string owner_actor_id = 9 [(buf.validate.field).string.uuid = true];
+  // Optional planned start timestamp.
+  google.protobuf.Timestamp start_date = 10;
+  // Optional target completion timestamp.
+  google.protobuf.Timestamp target_date = 11;
+}
+
+// CreateObjectiveResponse wraps the newly created objective.
+message CreateObjectiveResponse {
+  // Created objective entity.
+  Objective objective = 1;
+}
+
+// GetObjectiveRequest identifies an objective by UUID within a workspace.
+message GetObjectiveRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target objective UUID.
+  string objective_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// GetObjectiveResponse returns the requested objective.
+message GetObjectiveResponse {
+  // Retrieved objective entity including current task rollups.
+  Objective objective = 1;
+}
+
+// ListObjectivesRequest specifies filter criteria and pagination for objectives.
+message ListObjectivesRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Optional project UUID filter; when omitted, lists across all workspace projects.
+  optional string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Optional objective kind filter (UNSPECIFIED returns all kinds).
+  ObjectiveKind kind_filter = 4 [(buf.validate.field).enum.defined_only = true];
+  // Optional objective status filter (UNSPECIFIED returns all statuses).
+  ObjectiveStatus status_filter = 5 [(buf.validate.field).enum.defined_only = true];
+  // Maximum number of objectives to return (0 uses server default, max 200).
+  int32 page_size = 6 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 200
+  }];
+  // Opaque pagination cursor from a previous ListObjectivesResponse.
+  string page_token = 7 [(buf.validate.field).string.max_len = 512];
+}
+
+// ListObjectivesResponse returns a page of matching objectives.
+message ListObjectivesResponse {
+  // Objectives matching the query filters.
+  repeated Objective objectives = 1;
+  // Opaque pagination cursor for the next page, or empty when complete.
+  string next_page_token = 2;
+}
+
+// UpdateObjectiveRequest modifies mutable attributes of an objective.
+message UpdateObjectiveRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID performing the update.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target objective UUID to update.
+  string objective_id = 3 [(buf.validate.field).string.uuid = true];
+  // Optional updated title.
+  optional string title = 4 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 200
+  }];
+  // Optional updated markdown description.
+  optional string description = 5 [(buf.validate.field).string.max_len = 8000];
+  // Optional updated success criteria.
+  optional string success_criteria = 6 [(buf.validate.field).string.max_len = 4000];
+  // Optional updated status (UNSPECIFIED leaves status unchanged).
+  ObjectiveStatus status = 7 [(buf.validate.field).enum.defined_only = true];
+  // Optional updated owner actor UUID.
+  optional string owner_actor_id = 8 [(buf.validate.field).string.uuid = true];
+  // When true, clears owner_actor_id back to unassigned.
+  bool clear_owner_actor = 9;
+  // Optional updated start timestamp.
+  google.protobuf.Timestamp start_date = 10;
+  // Optional updated target completion timestamp.
+  google.protobuf.Timestamp target_date = 11;
+}
+
+// UpdateObjectiveResponse wraps the updated objective entity.
+message UpdateObjectiveResponse {
+  // Objective entity reflecting the applied changes.
+  Objective objective = 1;
+}
+
+// CloseObjectiveRequest finalizes an objective as ACHIEVED or DROPPED.
+message CloseObjectiveRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID closing the objective.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target objective UUID to close.
+  string objective_id = 3 [(buf.validate.field).string.uuid = true];
+  // Terminal status: must be OBJECTIVE_STATUS_ACHIEVED (4) or OBJECTIVE_STATUS_DROPPED (5).
+  ObjectiveStatus terminal_status = 4 [(buf.validate.field).enum = {
+    defined_only: true
+    in: [
+      4,
+      5
+    ]
+  }];
+  // Optional closing retrospective or outcome summary appended to audit metadata.
+  string resolution_summary = 5 [(buf.validate.field).string.max_len = 4000];
+}
+
+// CloseObjectiveResponse returns the closed objective entity.
+message CloseObjectiveResponse {
+  // Closed objective with closed_at populated.
+  Objective objective = 1;
+}
+
+// DeleteObjectiveRequest deletes an objective within a workspace.
+message DeleteObjectiveRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated actor UUID authorizing deletion.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target objective UUID to delete.
+  string objective_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// DeleteObjectiveResponse confirms permanent deletion of the objective.
+message DeleteObjectiveResponse {
+  // UUID of the deleted objective.
+  string deleted_objective_id = 1 [(buf.validate.field).string.uuid = true];
+  // UTC timestamp when the deletion completed.
+  google.protobuf.Timestamp deleted_at = 2;
+}

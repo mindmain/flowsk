@@ -1,0 +1,127 @@
+// Package flowsk.audit.v1 defines immutable, append-only audit trail events
+// capturing every human and agent mutation across a Flowsk workspace.
+syntax = "proto3";
+
+package flowsk.audit.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/mindmain/flowsk/gen/go/flowsk/audit/v1;flowsk_audit_pb";
+
+// AuditAction classifies the state-changing operation recorded in an AuditEvent.
+enum AuditAction {
+  // Default unspecified audit action.
+  AUDIT_ACTION_UNSPECIFIED = 0;
+  // Creation of a new domain entity (workspace, actor, project, objective, task, etc.).
+  AUDIT_ACTION_CREATE = 1;
+  // Modification of mutable fields on an existing entity.
+  AUDIT_ACTION_UPDATE = 2;
+  // Permanent deletion or removal of an entity or relation.
+  AUDIT_ACTION_DELETE = 3;
+  // Lifecycle or workflow state transition on a task, objective, or project.
+  AUDIT_ACTION_TRANSITION = 4;
+  // Acquisition, renewal, or forced takeover of a task execution lease.
+  AUDIT_ACTION_CLAIM = 5;
+  // Voluntary or automatic release of a task execution lease.
+  AUDIT_ACTION_RELEASE = 6;
+  // Atomic execution of a sandboxed Code Mode JavaScript script.
+  AUDIT_ACTION_BATCH_EXEC = 7;
+}
+
+// AuditEvent represents a single immutable audit log entry persisted atomically
+// alongside the domain transaction that produced it.
+message AuditEvent {
+  // Unique audit event identifier (UUID).
+  string id = 1 [(buf.validate.field).string.uuid = true];
+  // Owning workspace identifier (UUID) for strict tenant isolation.
+  string workspace_id = 2 [(buf.validate.field).string.uuid = true];
+  // Optional project UUID when the audited operation pertains to a specific project.
+  optional string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Actor UUID (human or agent) responsible for initiating the audited action.
+  string actor_id = 4 [(buf.validate.field).string.uuid = true];
+  // Canonical classification of the audited mutation.
+  AuditAction action = 5 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  // Domain entity type name (e.g., "workspace", "actor", "project", "objective", "task", "script").
+  string entity_type = 6 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+  }];
+  // UUID of the primary target entity affected by the action.
+  string entity_id = 7 [(buf.validate.field).string.uuid = true];
+  // Optional human-readable identifier of the target entity (e.g., "FLW-42" or slug).
+  string entity_identifier = 8 [(buf.validate.field).string.max_len = 64];
+  // Concise human-readable description of what changed.
+  string summary = 9 [(buf.validate.field).string.max_len = 1024];
+  // Structured JSON object capturing relevant before/after attributes or script metrics.
+  string payload_json = 10 [(buf.validate.field).string.max_len = 65536];
+  // UTC timestamp when the audited transaction committed.
+  google.protobuf.Timestamp occurred_at = 11;
+}
+
+// AuditService provides read-only query access to the immutable workspace
+// audit log over Buf Connect.
+service AuditService {
+  // ListAuditEvents queries workspace audit events ordered newest-first with
+  // filtering by project, actor, entity, action, and time window.
+  rpc ListAuditEvents(ListAuditEventsRequest) returns (ListAuditEventsResponse);
+
+  // GetAuditEvent retrieves a single immutable audit event by UUID within the workspace.
+  rpc GetAuditEvent(GetAuditEventRequest) returns (GetAuditEventResponse);
+}
+
+// ListAuditEventsRequest specifies filter predicates and pagination for audit logs.
+message ListAuditEventsRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID requesting the audit trail.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Optional filter restricting events to a specific project UUID.
+  optional string project_id = 3 [(buf.validate.field).string.uuid = true];
+  // Optional filter restricting events to mutations performed by a specific actor UUID.
+  optional string target_actor_id = 4 [(buf.validate.field).string.uuid = true];
+  // Optional filter restricting events to a single target entity UUID.
+  optional string entity_id = 5 [(buf.validate.field).string.uuid = true];
+  // Optional filter by entity_type (e.g., "task", "objective", "script").
+  string entity_type_filter = 6 [(buf.validate.field).string.max_len = 64];
+  // Optional filter by AuditAction (AUDIT_ACTION_UNSPECIFIED returns all actions).
+  AuditAction action_filter = 7 [(buf.validate.field).enum.defined_only = true];
+  // Optional inclusive lower bound UTC timestamp for occurred_at.
+  google.protobuf.Timestamp since = 8;
+  // Optional inclusive upper bound UTC timestamp for occurred_at.
+  google.protobuf.Timestamp until = 9;
+  // Maximum number of audit events to return (0 uses server default, max 200).
+  int32 page_size = 10 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 200
+  }];
+  // Opaque pagination cursor from a previous ListAuditEventsResponse.
+  string page_token = 11 [(buf.validate.field).string.max_len = 512];
+}
+
+// ListAuditEventsResponse returns a paginated slice of audit trail events.
+message ListAuditEventsResponse {
+  // Audit events matching the filter criteria ordered by occurred_at descending.
+  repeated AuditEvent events = 1;
+  // Opaque cursor for fetching the next page, or empty when complete.
+  string next_page_token = 2;
+}
+
+// GetAuditEventRequest identifies a single audit event by UUID within a workspace.
+message GetAuditEventRequest {
+  // Owning workspace UUID.
+  string workspace_id = 1 [(buf.validate.field).string.uuid = true];
+  // Authenticated caller actor UUID.
+  string actor_id = 2 [(buf.validate.field).string.uuid = true];
+  // Target audit event UUID.
+  string audit_event_id = 3 [(buf.validate.field).string.uuid = true];
+}
+
+// GetAuditEventResponse wraps the retrieved AuditEvent.
+message GetAuditEventResponse {
+  // Matched immutable audit event.
+  AuditEvent event = 1;
+}
