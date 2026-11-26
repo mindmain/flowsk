@@ -16,9 +16,11 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/google/uuid"
 	"github.com/mindmain/flowsk/gen/go/flowsk/audit/v1/flowsk_audit_pbconnect"
 	"github.com/mindmain/flowsk/gen/go/flowsk/language/v1/flowsk_language_pbconnect"
 	"github.com/mindmain/flowsk/gen/go/flowsk/objective/v1/flowsk_objective_pbconnect"
@@ -131,6 +133,8 @@ func (s *appServerRunner) RunServer(ctx context.Context, cfg cli.ServeConfig) er
 		Audit:     audithandler.New(eng.adapter, eng),
 	}
 
+	broker := connectrpc.NewEventBroker(connectrpc.DefaultSubscriberBuffer)
+
 	srv, err := connectrpc.NewServer(
 		connectrpc.Config{
 			ListenAddr: cfg.ListenAddr,
@@ -138,11 +142,69 @@ func (s *appServerRunner) RunServer(ctx context.Context, cfg cli.ServeConfig) er
 			OnListen:   cfg.OnListen,
 		},
 		handlers,
-		connect.WithInterceptors(connectrpc.NewAuthContextInterceptor(resolver)),
+		connect.WithInterceptors(
+			connectrpc.NewAuthContextInterceptor(resolver),
+			connectrpc.NewEventBroadcastInterceptor(broker),
+		),
 	)
 	if err != nil {
 		return err
 	}
+
+	relayCtx, stopRelay := context.WithCancel(ctx)
+	var relayWG sync.WaitGroup
+	relayWG.Add(1)
+	go func() {
+		defer relayWG.Done()
+		broker.RunAuditRelay(
+			relayCtx,
+			eng.AuditService(),
+			func(pCtx context.Context, wsID uuid.UUID) (authctx.Identity, bool) {
+				_, _, ident := eng.ensureWorkspaceAndActor(pCtx, wsID.String(), "stream-relay", "human")
+				if ident.WorkspaceID != wsID {
+					return authctx.Identity{}, false
+				}
+				return ident, true
+			},
+			connectrpc.DefaultAuditPollInterval,
+		)
+	}()
+	defer func() {
+		stopRelay()
+		relayWG.Wait()
+	}()
+
+	streamAuth := func(rCtx context.Context, r *http.Request) (authctx.Identity, uuid.UUID, error) {
+		if expectedToken != "" {
+			got := strings.TrimSpace(r.Header.Get("Authorization"))
+			got = strings.TrimSpace(strings.TrimPrefix(got, "Bearer"))
+			got = strings.TrimSpace(strings.TrimPrefix(got, "bearer"))
+			if subtle.ConstantTimeCompare([]byte(got), []byte(expectedToken)) != 1 {
+				return authctx.Identity{}, uuid.Nil, errs.New(errs.ErrUnauthenticated, "app.StreamAuth", "invalid or missing bearer token")
+			}
+		}
+
+		headerWS := strings.TrimSpace(r.Header.Get(connectrpc.HeaderWorkspaceID))
+		queryWS := strings.TrimSpace(r.URL.Query().Get("workspaceId"))
+		if headerWS != "" && queryWS != "" && !strings.EqualFold(headerWS, queryWS) {
+			return authctx.Identity{}, uuid.Nil, errs.New(errs.ErrPermissionDenied, "app.StreamAuth", "workspace header does not match requested stream workspace")
+		}
+
+		targetRef := firstNonEmpty(queryWS, headerWS, os.Getenv("FLOWSK_DEFAULT_WORKSPACE"), "default")
+		handle := firstNonEmpty(
+			strings.TrimSpace(r.Header.Get(connectrpc.HeaderActorHandle)),
+			strings.TrimSpace(r.URL.Query().Get("actorHandle")),
+			"web-operator",
+		)
+		kind := firstNonEmpty(strings.TrimSpace(r.Header.Get(connectrpc.HeaderActorKind)), "human")
+
+		_, ws, ident := eng.ensureWorkspaceAndActor(rCtx, targetRef, handle, kind)
+		if ws.ID == uuid.Nil || ident.WorkspaceID == uuid.Nil {
+			return authctx.Identity{}, uuid.Nil, errs.New(errs.ErrUnauthenticated, "app.StreamAuth", "workspace could not be resolved")
+		}
+		return ident, ws.ID, nil
+	}
+	srv.Mux().Handle(connectrpc.EventsPath, connectrpc.NewSSEHandler(broker, streamAuth, connectrpc.DefaultStreamHeartbeat))
 
 	if cfg.EnableUI {
 		wsRef := firstNonEmpty(cfg.UIWorkspace, opts.Workspace, "default")
@@ -184,6 +246,7 @@ func (s *appServerRunner) runRemoteUIProxy(ctx context.Context, cfg cli.ServeCon
 	}
 
 	proxy := &httputil.ReverseProxy{
+		FlushInterval: -1,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(targetURL)
 			pr.Out.Host = targetURL.Host
@@ -204,6 +267,7 @@ func (s *appServerRunner) runRemoteUIProxy(ctx context.Context, cfg cli.ServeCon
 	} {
 		mux.Handle("/"+svcName+"/", proxy)
 	}
+	mux.Handle(connectrpc.EventsPath, proxy)
 	mux.HandleFunc(connectrpc.HealthzPath, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)

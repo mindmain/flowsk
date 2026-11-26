@@ -1,7 +1,7 @@
 # Upper Transport Layer Governance (`internal/transport/AGENTS.md`)
 
 ## 1. Scope & Stack Reference
-Owns upper network and agent transport adapters in `internal/transport/connectrpc/` (Buf Connect HTTP/1.1 & `h2c` HTTP/2 handlers + interceptors enabling remote/network server connections) and `internal/transport/mcp/` (pure-Go JSON-RPC 2.0 `stdio` and Streamable `http` MCP servers). Refer to [STACK.md](../../STACK.md) for `connectrpc.com/connect`, `protovalidate`, and handler mappings.
+Owns upper network and agent transport adapters in `internal/transport/connectrpc/` (Buf Connect HTTP/1.1 & `h2c` HTTP/2 handlers, interceptors, and the Go-channel `EventBroker` + cross-process audit relay `GET /api/events` SSE stream) and `internal/transport/mcp/` (pure-Go JSON-RPC 2.0 `stdio` and Streamable `http` MCP servers). Refer to [STACK.md](../../STACK.md) for `connectrpc.com/connect`, `protovalidate`, and handler mappings.
 
 ## 2. Architecture & Style Invariants
 - **Thin Protocol Translation Only**: Transport packages perform auth extraction (`internal/domain/authctx`), `protovalidate` input validation, DTO-to-domain translation, `ToProto()` / `formatter` serialization, and canonical error mapping (`internal/domain/errs` -> `connect.Code` or structured MCP tool errors) — zero business logic or direct SQL driver imports.
