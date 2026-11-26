@@ -13,7 +13,7 @@
 # Build the unified binary (embeds the Angular 21 Web UI + Goose SQL migrations + AI SKILL.md)
 task build
 
-# Install the Flowsk operational skill across detected AI agents (Claude, Codex, Antigravity, Gemini, Cursor)
+# Install both SKILL.md (default: Universal ~/.agents) and Flowsk MCP server (default: Universal detected clients)
 ./bin/flowsk install
 
 # Bind the current Git repository/worktree to a logical project in ~/.flowsk
@@ -33,7 +33,7 @@ task build
 
 ### 1. Register the MCP Server
 
-Run `flowsk mcp guide` to print ready-to-paste client configs, or add `flowsk` directly to your MCP client configuration (`.mcp.json`, `~/.claude.json`, `~/.gemini/settings.json`, Antigravity, or `~/.codex/config.toml`):
+Run `flowsk install` to interactively register `flowsk` across your AI clients (or `flowsk mcp guide` to print copy-paste snippets for `.mcp.json`, `~/.claude.json`, `~/.gemini/settings.json`, `~/.gemini/antigravity/mcp_config.json`, or `~/.codex/config.toml`):
 
 ```json
 {

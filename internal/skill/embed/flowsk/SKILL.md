@@ -33,7 +33,7 @@ Always use the **`flowsk` MCP server** tools instead of shelling out to the CLI 
    ```
 4. `flowsk_language_guide` — Retrieve exact `flowsk.*` TypeScript signatures on demand.
 
-If the `flowsk` MCP server is not available in your tool list, register stdio MCP (`flowsk mcp serve --transport stdio`; inspect client config via `flowsk mcp guide`) before falling back to the CLI.
+If the `flowsk` MCP server is not available in your tool list, run `flowsk install --yes` (or inspect snippets via `flowsk mcp guide`) to register `flowsk mcp serve --transport stdio` before falling back to the CLI.
 
 ## 3. Mandatory Agent Workflow
 1. **Orient**: Call `flowsk_digest` at session start to inspect active peer leases, blockers, and highest-priority ready tasks.

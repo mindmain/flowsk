@@ -2014,7 +2014,30 @@ type SkillInstallItemView struct {
 	MCPConfigPath string `json:"mcp_config_path,omitempty"`
 }
 
-// InstallSkillView summarizes the execution of `flowsk install`.
+// MCPInstallItemView records the result of registering or updating the Flowsk MCP
+// server inside one AI client configuration file during `flowsk install`.
+type MCPInstallItemView struct {
+	// ProviderID is the canonical provider slug (claude, codex, antigravity, gemini, cursor).
+	ProviderID string `json:"provider_id"`
+
+	// ProviderName is the human-readable AI client name.
+	ProviderName string `json:"provider_name"`
+
+	// ConfigPath is the configured MCP file path.
+	ConfigPath string `json:"config_path"`
+
+	// Command is the executable configured for `flowsk`.
+	Command string `json:"command"`
+
+	// Args lists the CLI arguments configured for `flowsk`.
+	Args []string `json:"args"`
+
+	// Action reports "installed", "updated", or "unchanged".
+	Action string `json:"action"`
+}
+
+// InstallSkillView summarizes the execution of `flowsk install` across both
+// global `SKILL.md` directories and client MCP server configuration files.
 type InstallSkillView struct {
 	// EmbeddedSHA256 is the canonical SHA-256 digest embedded in the running `flowsk` binary.
 	EmbeddedSHA256 string `json:"embedded_sha256"`
@@ -2028,8 +2051,20 @@ type InstallSkillView struct {
 	// UnchangedCount counts `SKILL.md` files already matching EmbeddedSHA256.
 	UnchangedCount int `json:"unchanged_count"`
 
-	// Items lists per-provider installation outcomes.
+	// Items lists per-provider `SKILL.md` installation outcomes.
 	Items []SkillInstallItemView `json:"items"`
+
+	// MCPInstalledCount counts newly registered `flowsk` MCP server entries.
+	MCPInstalledCount int `json:"mcp_installed_count"`
+
+	// MCPUpdatedCount counts refreshed `flowsk` MCP server entries.
+	MCPUpdatedCount int `json:"mcp_updated_count"`
+
+	// MCPUnchangedCount counts `flowsk` MCP server entries already up to date.
+	MCPUnchangedCount int `json:"mcp_unchanged_count"`
+
+	// MCPItems lists per-provider MCP configuration outcomes.
+	MCPItems []MCPInstallItemView `json:"mcp_items,omitempty"`
 }
 
 // DoctorCheckView represents one diagnostic subsystem check inside `flowsk doctor`.

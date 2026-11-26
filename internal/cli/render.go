@@ -459,11 +459,15 @@ func renderCompact(w io.Writer, payload any) error {
 			v.DryRun, v.TotalCleaned, v.RemovedTaskFilesCount, v.ClearedTaskRefsCount, v.RemovedProjectFilesCount, v.ClearedProjectRefsCount)
 		return err
 	case InstallSkillView:
-		_, _ = fmt.Fprintf(w, "install skill_sha256=%s installed=%d updated=%d unchanged=%d\n",
-			v.EmbeddedSHA256, v.InstalledCount, v.UpdatedCount, v.UnchangedCount)
+		_, _ = fmt.Fprintf(w, "install skill_sha256=%s skill_installed=%d skill_updated=%d skill_unchanged=%d mcp_installed=%d mcp_updated=%d mcp_unchanged=%d\n",
+			v.EmbeddedSHA256, v.InstalledCount, v.UpdatedCount, v.UnchangedCount, v.MCPInstalledCount, v.MCPUpdatedCount, v.MCPUnchangedCount)
 		for _, it := range v.Items {
-			_, _ = fmt.Fprintf(w, "  %s action=%s sha256=%s mcp=%t path=%s\n",
-				it.ProviderID, it.Action, it.SHA256[:min(len(it.SHA256), 12)], it.MCPConfigured, it.SkillPath)
+			_, _ = fmt.Fprintf(w, "  skill %s action=%s sha256=%s path=%s\n",
+				it.ProviderID, it.Action, it.SHA256[:min(len(it.SHA256), 12)], it.SkillPath)
+		}
+		for _, m := range v.MCPItems {
+			_, _ = fmt.Fprintf(w, "  mcp   %s action=%s cmd=%s path=%s\n",
+				m.ProviderID, m.Action, m.Command, m.ConfigPath)
 		}
 		return nil
 	case DoctorReportView:

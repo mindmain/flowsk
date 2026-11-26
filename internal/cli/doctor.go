@@ -343,7 +343,7 @@ func newDoctorCommand(v *viper.Viper, opts *GlobalOptions, deps doctorCommandDep
 						Name:    "mcp",
 						Status:  "warn",
 						Summary: "No detected AI provider config mentions the 'flowsk' MCP server",
-						Hint:    "Run 'flowsk mcp guide' to register 'flowsk mcp serve --transport stdio' in your AI harness",
+						Hint:    "Run 'flowsk install' to install SKILL.md and register the 'flowsk' MCP server",
 					})
 				} else if mcpConfiguredCnt > 0 {
 					addCheck(DoctorCheckView{

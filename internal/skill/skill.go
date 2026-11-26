@@ -36,6 +36,10 @@ const (
 
 	// ProviderCursor identifies Cursor global skills (`~/.cursor/skills`).
 	ProviderCursor = "cursor"
+
+	// MCPUniversalID is the virtual selector slug representing all detected MCP-capable
+	// AI clients on the current workstation (default MCP selection in `flowsk install`).
+	MCPUniversalID = "universal"
 )
 
 //go:embed embed/flowsk/SKILL.md
@@ -103,6 +107,15 @@ type ProviderTarget struct {
 
 	// MCPConfigPath is the primary user-level MCP configuration file for this provider, if applicable.
 	MCPConfigPath string `json:"mcp_config_path,omitempty"`
+
+	// MCPFormat identifies the configuration file syntax ("json" or "toml") when MCPConfigPath is non-empty.
+	MCPFormat string `json:"mcp_format,omitempty"`
+}
+
+// SupportsMCP reports whether this provider exposes a global client MCP configuration file
+// managed by `flowsk install`.
+func (p ProviderTarget) SupportsMCP() bool {
+	return strings.TrimSpace(p.MCPConfigPath) != "" && strings.TrimSpace(p.MCPFormat) != ""
 }
 
 // ProviderStatus reports the live installation, SHA-256 integrity, and MCP registration
@@ -158,7 +171,7 @@ func SupportedProviders(homeDir string) ([]ProviderTarget, error) {
 	}
 	home = filepath.Clean(home)
 
-	mk := func(id, name, desc, markerRel, skillsRel, mcpRel string) ProviderTarget {
+	mk := func(id, name, desc, markerRel, skillsRel, mcpRel, mcpFmt string) ProviderTarget {
 		skillsDir := filepath.Join(home, skillsRel)
 		mcpPath := ""
 		if mcpRel != "" {
@@ -172,16 +185,17 @@ func SupportedProviders(homeDir string) ([]ProviderTarget, error) {
 			SkillsDir:     skillsDir,
 			SkillFilePath: filepath.Join(skillsDir, SkillName, "SKILL.md"),
 			MCPConfigPath: mcpPath,
+			MCPFormat:     mcpFmt,
 		}
 	}
 
 	return []ProviderTarget{
-		mk(ProviderClaude, "Claude Code", "~/.claude/skills/flowsk/SKILL.md", ".claude", filepath.Join(".claude", "skills"), ".claude.json"),
-		mk(ProviderCodex, "OpenAI Codex", "~/.codex/skills/flowsk/SKILL.md", ".codex", filepath.Join(".codex", "skills"), filepath.Join(".codex", "config.toml")),
-		mk(ProviderAntigravity, "Google Antigravity", "~/.gemini/antigravity/skills/flowsk/SKILL.md", filepath.Join(".gemini", "antigravity"), filepath.Join(".gemini", "antigravity", "skills"), filepath.Join(".gemini", "antigravity", "mcp_config.json")),
-		mk(ProviderGemini, "Gemini CLI", "~/.gemini/skills/flowsk/SKILL.md", filepath.Join(".gemini", "skills"), filepath.Join(".gemini", "skills"), filepath.Join(".gemini", "settings.json")),
-		mk(ProviderAgents, "Universal Agents (~/.agents)", "~/.agents/skills/flowsk/SKILL.md", ".agents", filepath.Join(".agents", "skills"), ""),
-		mk(ProviderCursor, "Cursor", "~/.cursor/skills/flowsk/SKILL.md", ".cursor", filepath.Join(".cursor", "skills"), filepath.Join(".cursor", "mcp.json")),
+		mk(ProviderAgents, "Universal Agents (~/.agents)", "~/.agents/skills/flowsk/SKILL.md", ".agents", filepath.Join(".agents", "skills"), "", ""),
+		mk(ProviderClaude, "Claude Code", "~/.claude/skills/flowsk/SKILL.md", ".claude", filepath.Join(".claude", "skills"), ".claude.json", MCPFormatJSON),
+		mk(ProviderCodex, "OpenAI Codex", "~/.codex/skills/flowsk/SKILL.md", ".codex", filepath.Join(".codex", "skills"), filepath.Join(".codex", "config.toml"), MCPFormatTOML),
+		mk(ProviderAntigravity, "Google Antigravity", "~/.gemini/antigravity/skills/flowsk/SKILL.md", filepath.Join(".gemini", "antigravity"), filepath.Join(".gemini", "antigravity", "skills"), filepath.Join(".gemini", "antigravity", "mcp_config.json"), MCPFormatJSON),
+		mk(ProviderGemini, "Gemini CLI", "~/.gemini/skills/flowsk/SKILL.md", filepath.Join(".gemini", "skills"), filepath.Join(".gemini", "skills"), filepath.Join(".gemini", "settings.json"), MCPFormatJSON),
+		mk(ProviderCursor, "Cursor", "~/.cursor/skills/flowsk/SKILL.md", ".cursor", filepath.Join(".cursor", "skills"), filepath.Join(".cursor", "mcp.json"), MCPFormatJSON),
 	}, nil
 }
 
