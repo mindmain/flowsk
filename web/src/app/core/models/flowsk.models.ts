@@ -1,5 +1,6 @@
 /**
- * Canonical domain models, view projections, and ConnectRPC wire DTOs for Flowsk Web.
+ * Canonical domain models, view projections, real-time stream contracts, and
+ * ConnectRPC wire DTOs for Flowsk Web.
  * Zero host filesystem paths are modeled or transmitted.
  */
 
@@ -22,9 +23,27 @@ export type TaskPriority =
   | 'TASK_PRIORITY_LOW'
   | 'TASK_PRIORITY_NONE';
 
+export type ObjectiveKind = 'goal' | 'milestone' | 'cycle';
+
+export type ObjectiveStatus = 'planned' | 'active' | 'at_risk' | 'achieved' | 'dropped';
+
 export type ViewMode = 'kanban' | 'grid';
 
-export type ScopeTab = 'board' | 'backlog' | 'all' | 'archived';
+export type ScopeTab = 'board' | 'goals' | 'backlog' | 'all' | 'archived';
+
+export type StreamConnectionState = 'connecting' | 'live' | 'reconnecting' | 'paused';
+
+export interface LiveStreamEventModel {
+  readonly id: string;
+  readonly workspaceId: string;
+  readonly actorId: string;
+  readonly actorHandle?: string;
+  readonly actorKind?: string;
+  readonly action: string;
+  readonly resourceType: string;
+  readonly resourceId: string;
+  readonly occurredAt: string;
+}
 
 export interface RuntimeBootstrapConfig {
   readonly workspaceId?: string;
@@ -107,11 +126,31 @@ export interface ObjectiveModel {
   readonly id: string;
   readonly workspaceId: string;
   readonly projectId: string;
-  readonly kind: 'goal' | 'milestone' | 'cycle';
-  readonly status: string;
+  readonly kind: ObjectiveKind;
+  readonly status: ObjectiveStatus;
   readonly title: string;
   readonly description: string;
+  readonly successCriteria: readonly string[];
   readonly targetDate?: string;
+  readonly closedAt?: string;
+  readonly updatedAt?: string;
+}
+
+export interface ObjectiveProgressView extends ObjectiveModel {
+  readonly projectKeyPrefix: string;
+  readonly projectName: string;
+  readonly tasks: readonly TaskModel[];
+  readonly totalCount: number;
+  readonly doneCount: number;
+  readonly inProgressCount: number;
+  readonly inReviewCount: number;
+  readonly blockedCount: number;
+  readonly todoCount: number;
+  readonly backlogCount: number;
+  readonly activeClaimsCount: number;
+  readonly progressPct: number;
+  readonly activeWorkPct: number;
+  readonly blockedPct: number;
 }
 
 export interface TaskModel {
@@ -119,6 +158,7 @@ export interface TaskModel {
   readonly workspaceId: string;
   readonly projectId: string;
   readonly identifier: string;
+  readonly externalId: string;
   readonly sequenceNumber: number;
   readonly kind: TaskKind;
   readonly priority: TaskPriority;
@@ -247,4 +287,32 @@ export function formatKindLabel(kind: TaskKind): string {
 export function formatStatusLabel(status: TaskStatus): string {
   const found = CANONICAL_STATUS_COLUMNS.find((c) => c.status === status);
   return found ? found.label : status;
+}
+
+export function formatObjectiveKindLabel(kind: ObjectiveKind): string {
+  switch (kind) {
+    case 'milestone':
+      return 'Milestone';
+    case 'cycle':
+      return 'Cycle';
+    default:
+      return 'Goal';
+  }
+}
+
+export function formatObjectiveStatusLabel(status: ObjectiveStatus): string {
+  switch (status) {
+    case 'planned':
+      return 'Planned';
+    case 'active':
+      return 'Active';
+    case 'at_risk':
+      return 'At Risk';
+    case 'achieved':
+      return 'Achieved';
+    case 'dropped':
+      return 'Dropped';
+    default:
+      return 'Active';
+  }
 }

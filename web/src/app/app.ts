@@ -1,4 +1,5 @@
 import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
+import { GoalsViewComponent } from './components/goals-view/goals-view.component';
 import { KanbanBoardComponent } from './components/kanban-board/kanban-board.component';
 import { ActiveDialogType, DialogsComponent } from './components/modals/dialogs.component';
 import { ObjectivesStripComponent } from './components/objectives-strip/objectives-strip.component';
@@ -7,7 +8,7 @@ import { SidebarComponent } from './components/sidebar/sidebar.component';
 import { TaskDrawerComponent } from './components/task-drawer/task-drawer.component';
 import { TaskGridComponent } from './components/task-grid/task-grid.component';
 import { TopbarComponent } from './components/topbar/topbar.component';
-import { TaskStatus } from './core/models/flowsk.models';
+import { ObjectiveModel, TaskStatus } from './core/models/flowsk.models';
 import { FlowskStore } from './core/store/flowsk.store';
 
 @Component({
@@ -18,6 +19,7 @@ import { FlowskStore } from './core/store/flowsk.store';
     TopbarComponent,
     ObjectivesStripComponent,
     ProjectsOverviewComponent,
+    GoalsViewComponent,
     KanbanBoardComponent,
     TaskGridComponent,
     TaskDrawerComponent,
@@ -49,7 +51,7 @@ import { FlowskStore } from './core/store/flowsk.store';
         }
 
         @if (store.activeProjectId() !== null) {
-          <app-objectives-strip (openNewObjective)="activeDialog.set('new-objective')" />
+          <app-objectives-strip (openNewObjective)="openNewObjectiveModal()" />
         }
 
         <main class="flex-1 min-h-0 overflow-hidden bg-zinc-50/40 dark:bg-zinc-950">
@@ -71,6 +73,12 @@ import { FlowskStore } from './core/store/flowsk.store';
                 + Create First Project
               </button>
             </div>
+          } @else if (store.scopeTab() === 'goals') {
+            <app-goals-view
+              (openNewObjective)="openNewObjectiveModal()"
+              (openEditObjective)="openEditObjectiveModal($event)"
+              (openNewTaskForObjective)="openCreateTaskForObjective($event)"
+            />
           } @else if (store.activeProjectId() === null && store.scopeTab() === 'board') {
             <app-projects-overview (openNewProject)="activeDialog.set('new-project')" />
           } @else if (store.viewMode() === 'kanban') {
@@ -86,7 +94,10 @@ import { FlowskStore } from './core/store/flowsk.store';
       <app-dialogs
         [dialog]="activeDialog()"
         [defaultTaskStatus]="newTaskStatus()"
-        (close)="activeDialog.set(null)"
+        [presetObjectiveId]="presetObjectiveId()"
+        [presetProjectId]="presetProjectId()"
+        [editingObjective]="editingObjective()"
+        (close)="closeDialog()"
       />
 
       @if (store.toastMessage(); as toast) {
@@ -104,10 +115,33 @@ export class App {
   readonly store = inject(FlowskStore);
   readonly activeDialog = signal<ActiveDialogType>(null);
   readonly newTaskStatus = signal<TaskStatus>('ready');
+  readonly presetObjectiveId = signal<string>('');
+  readonly presetProjectId = signal<string>('');
+  readonly editingObjective = signal<ObjectiveModel | null>(null);
 
   openCreateTask(status: TaskStatus): void {
     this.newTaskStatus.set(status);
+    const activeGoalFilter = this.store.objectiveFilterId();
+    this.presetObjectiveId.set(activeGoalFilter !== 'all' ? activeGoalFilter : '');
+    this.presetProjectId.set(this.store.activeProjectId() ?? '');
     this.activeDialog.set('new-task');
+  }
+
+  openCreateTaskForObjective(obj: ObjectiveModel): void {
+    this.newTaskStatus.set('ready');
+    this.presetObjectiveId.set(obj.id);
+    this.presetProjectId.set(obj.projectId);
+    this.activeDialog.set('new-task');
+  }
+
+  openNewObjectiveModal(): void {
+    this.editingObjective.set(null);
+    this.activeDialog.set('new-objective');
+  }
+
+  openEditObjectiveModal(obj: ObjectiveModel): void {
+    this.editingObjective.set(obj);
+    this.activeDialog.set('edit-objective');
   }
 
   openProjectCharter(): void {
@@ -120,5 +154,10 @@ export class App {
   openPruneDialog(): void {
     this.store.inspectOrphans();
     this.activeDialog.set('prune-orphans');
+  }
+
+  closeDialog(): void {
+    this.activeDialog.set(null);
+    this.editingObjective.set(null);
   }
 }

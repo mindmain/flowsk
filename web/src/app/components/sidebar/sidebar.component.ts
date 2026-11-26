@@ -62,6 +62,19 @@ import { FlowskStore } from '../../core/store/flowsk.store';
 
         <button
           type="button"
+          (click)="selectTab('goals')"
+          class="w-full px-2.5 py-1.5 rounded-md text-xs flex items-center justify-between transition-colors"
+          [class]="tabClass('goals')"
+        >
+          <span class="flex items-center gap-2">
+            <span class="w-1.5 h-1.5 rounded-full bg-violet-400"></span>
+            <span>Goals & Roadmap</span>
+          </span>
+          <span class="text-[11px] tabular-nums opacity-70">{{ store.activeObjectivesCount() }}</span>
+        </button>
+
+        <button
+          type="button"
           (click)="selectTab('backlog')"
           class="w-full px-2.5 py-1.5 rounded-md text-xs flex items-center justify-between transition-colors"
           [class]="tabClass('backlog')"

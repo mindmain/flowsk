@@ -3,7 +3,9 @@ import { Injectable, inject } from '@angular/core';
 import { Observable, map } from 'rxjs';
 import {
   ActorModel,
+  ObjectiveKind,
   ObjectiveModel,
+  ObjectiveStatus,
   OrphanResourcesReport,
   ProjectBindingModel,
   ProjectModel,
@@ -74,7 +76,10 @@ interface RawObjectiveDto {
   status?: string;
   title?: string;
   description?: string;
+  successCriteria?: string;
   targetDate?: string;
+  closedAt?: string;
+  updatedAt?: string;
 }
 
 interface RawTaskDto {
@@ -82,6 +87,7 @@ interface RawTaskDto {
   workspaceId?: string;
   projectId?: string;
   identifier?: string;
+  externalId?: string;
   sequenceNumber?: string | number;
   kind?: TaskKind;
   priority?: TaskPriority;
@@ -286,14 +292,17 @@ export class FlowskRpcService {
       .pipe(map((res) => mapProject(res.project)));
   }
 
-  listObjectives(workspaceId: string, actorId: string, projectId: string): Observable<ObjectiveModel[]> {
+  listObjectives(workspaceId: string, actorId: string, projectId?: string | null): Observable<ObjectiveModel[]> {
+    const body: Record<string, unknown> = {
+      workspaceId,
+      actorId,
+      pageSize: 200,
+    };
+    if (projectId) {
+      body['projectId'] = projectId;
+    }
     return this.http
-      .post<{ objectives?: RawObjectiveDto[] }>('/flowsk.objective.v1.ObjectiveService/ListObjectives', {
-        workspaceId,
-        actorId,
-        projectId,
-        pageSize: 200,
-      })
+      .post<{ objectives?: RawObjectiveDto[] }>('/flowsk.objective.v1.ObjectiveService/ListObjectives', body)
       .pipe(map((res) => (res.objectives ?? []).map(mapObjective)));
   }
 
@@ -301,28 +310,78 @@ export class FlowskRpcService {
     workspaceId: string;
     actorId: string;
     projectId: string;
-    kind: 'goal' | 'milestone' | 'cycle';
+    kind: ObjectiveKind;
+    status?: ObjectiveStatus;
     title: string;
     description: string;
+    successCriteria?: string;
+    targetDate?: string;
   }): Observable<ObjectiveModel> {
-    const kindEnum =
-      params.kind === 'milestone'
-        ? 'OBJECTIVE_KIND_MILESTONE'
-        : params.kind === 'cycle'
-          ? 'OBJECTIVE_KIND_CYCLE'
-          : 'OBJECTIVE_KIND_GOAL';
+    const kindEnum = toObjectiveKindEnum(params.kind);
+    const statusEnum = toObjectiveStatusEnum(params.status ?? 'active');
+    const body: Record<string, unknown> = {
+      workspaceId: params.workspaceId,
+      actorId: params.actorId,
+      projectId: params.projectId,
+      kind: kindEnum,
+      status: statusEnum,
+      title: params.title,
+      description: params.description,
+      successCriteria: params.successCriteria?.trim() || params.description || params.title,
+    };
+    const isoTarget = toProtoTimestampIso(params.targetDate);
+    if (isoTarget) {
+      body['targetDate'] = isoTarget;
+    }
     return this.http
-      .post<{ objective?: RawObjectiveDto }>('/flowsk.objective.v1.ObjectiveService/CreateObjective', {
-        workspaceId: params.workspaceId,
-        actorId: params.actorId,
-        projectId: params.projectId,
-        kind: kindEnum,
-        status: 'OBJECTIVE_STATUS_ACTIVE',
-        title: params.title,
-        description: params.description,
-        successCriteria: params.description,
-      })
+      .post<{ objective?: RawObjectiveDto }>('/flowsk.objective.v1.ObjectiveService/CreateObjective', body)
       .pipe(map((res) => mapObjective(res.objective)));
+  }
+
+  updateObjective(params: {
+    workspaceId: string;
+    actorId: string;
+    objectiveId: string;
+    title?: string;
+    description?: string;
+    successCriteria?: string;
+    status?: ObjectiveStatus;
+    targetDate?: string;
+  }): Observable<ObjectiveModel> {
+    const body: Record<string, unknown> = {
+      workspaceId: params.workspaceId,
+      actorId: params.actorId,
+      objectiveId: params.objectiveId,
+    };
+    if (params.title !== undefined) {
+      body['title'] = params.title;
+    }
+    if (params.description !== undefined) {
+      body['description'] = params.description;
+    }
+    if (params.successCriteria !== undefined) {
+      body['successCriteria'] = params.successCriteria;
+    }
+    if (params.status !== undefined) {
+      body['status'] = toObjectiveStatusEnum(params.status);
+    }
+    const isoTarget = toProtoTimestampIso(params.targetDate);
+    if (isoTarget) {
+      body['targetDate'] = isoTarget;
+    }
+    return this.http
+      .post<{ objective?: RawObjectiveDto }>('/flowsk.objective.v1.ObjectiveService/UpdateObjective', body)
+      .pipe(map((res) => mapObjective(res.objective)));
+  }
+
+  deleteObjective(workspaceId: string, actorId: string, objectiveId: string): Observable<string> {
+    return this.http
+      .post<{ deletedObjectiveId?: string }>('/flowsk.objective.v1.ObjectiveService/DeleteObjective', {
+        workspaceId,
+        actorId,
+        objectiveId,
+      })
+      .pipe(map((res) => res.deletedObjectiveId ?? objectiveId));
   }
 
   closeObjective(
@@ -716,23 +775,87 @@ function mapWorkflowState(raw?: RawWorkflowStateDto): WorkflowStateModel {
   };
 }
 
+function toObjectiveKindEnum(kind: ObjectiveKind): string {
+  switch (kind) {
+    case 'milestone':
+      return 'OBJECTIVE_KIND_MILESTONE';
+    case 'cycle':
+      return 'OBJECTIVE_KIND_CYCLE';
+    default:
+      return 'OBJECTIVE_KIND_GOAL';
+  }
+}
+
+function toObjectiveStatusEnum(status: ObjectiveStatus): string {
+  switch (status) {
+    case 'planned':
+      return 'OBJECTIVE_STATUS_PLANNED';
+    case 'at_risk':
+      return 'OBJECTIVE_STATUS_AT_RISK';
+    case 'achieved':
+      return 'OBJECTIVE_STATUS_ACHIEVED';
+    case 'dropped':
+      return 'OBJECTIVE_STATUS_DROPPED';
+    default:
+      return 'OBJECTIVE_STATUS_ACTIVE';
+  }
+}
+
+function toProtoTimestampIso(dateInput?: string): string | undefined {
+  const trimmed = (dateInput ?? '').trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    return `${trimmed}T00:00:00Z`;
+  }
+  const parsed = new Date(trimmed);
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed.toISOString();
+}
+
 function mapObjective(raw?: RawObjectiveDto): ObjectiveModel {
   const kindRaw = (raw?.kind ?? '').toUpperCase();
-  const kind: 'goal' | 'milestone' | 'cycle' = kindRaw.includes('MILESTONE')
+  const kind: ObjectiveKind = kindRaw.includes('MILESTONE')
     ? 'milestone'
     : kindRaw.includes('CYCLE')
       ? 'cycle'
       : 'goal';
-  const status = (raw?.status ?? 'OBJECTIVE_STATUS_ACTIVE').replace('OBJECTIVE_STATUS_', '').toLowerCase();
+  const statusNorm = (raw?.status ?? 'OBJECTIVE_STATUS_ACTIVE').replace('OBJECTIVE_STATUS_', '').toLowerCase();
+  let status: ObjectiveStatus = 'active';
+  switch (statusNorm) {
+    case 'planned':
+    case 'draft':
+      status = 'planned';
+      break;
+    case 'at_risk':
+      status = 'at_risk';
+      break;
+    case 'achieved':
+      status = 'achieved';
+      break;
+    case 'dropped':
+      status = 'dropped';
+      break;
+    default:
+      status = 'active';
+      break;
+  }
+  const criteria = (raw?.successCriteria ?? '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
   return {
     id: raw?.id ?? '',
     workspaceId: raw?.workspaceId ?? '',
     projectId: raw?.projectId ?? '',
     kind,
-    status: status || 'active',
+    status,
     title: raw?.title ?? '',
     description: raw?.description ?? '',
+    successCriteria: criteria,
     targetDate: raw?.targetDate,
+    closedAt: raw?.closedAt,
+    updatedAt: raw?.updatedAt,
   };
 }
 
@@ -744,6 +867,7 @@ function mapTask(raw?: RawTaskDto): TaskModel {
     workspaceId: raw?.workspaceId ?? '',
     projectId: raw?.projectId ?? '',
     identifier: raw?.identifier ?? 'TSK-0',
+    externalId: raw?.externalId ?? '',
     sequenceNumber: Number(raw?.sequenceNumber ?? 0),
     kind: raw?.kind ?? 'TASK_KIND_TASK',
     priority,

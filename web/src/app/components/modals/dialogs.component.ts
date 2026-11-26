@@ -2,6 +2,9 @@ import { ChangeDetectionStrategy, Component, effect, inject, input, output } fro
 import { FormsModule } from '@angular/forms';
 import {
   CANONICAL_STATUS_COLUMNS,
+  ObjectiveKind,
+  ObjectiveModel,
+  ObjectiveStatus,
   TaskKind,
   TaskPriority,
   TaskStatus,
@@ -14,6 +17,7 @@ export type ActiveDialogType =
   | 'new-project'
   | 'project-charter'
   | 'new-objective'
+  | 'edit-objective'
   | 'purge-archive'
   | 'prune-orphans';
 
@@ -40,6 +44,18 @@ export type ActiveDialogType =
             </div>
 
             <div class="space-y-3">
+              @if (!store.activeProjectId() && store.visibleProjects().length > 1) {
+                <select
+                  [(ngModel)]="taskProjectId"
+                  (ngModelChange)="onTaskProjectChange($event)"
+                  class="w-full px-2.5 py-1.5 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
+                >
+                  @for (p of store.visibleProjects(); track p.id) {
+                    <option [value]="p.id">{{ p.keyPrefix }} — {{ p.name }}</option>
+                  }
+                </select>
+              }
+
               <input
                 type="text"
                 [(ngModel)]="taskTitle"
@@ -79,13 +95,13 @@ export type ActiveDialogType =
                 </select>
               </div>
 
-              @if (store.objectives().length > 0) {
+              @if (objectivesForTaskForm().length > 0) {
                 <select
                   [(ngModel)]="taskObjectiveId"
                   class="w-full px-2.5 py-1.5 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
                 >
                   <option value="">No linked objective</option>
-                  @for (obj of store.objectives(); track obj.id) {
+                  @for (obj of objectivesForTaskForm(); track obj.id) {
                     <option [value]="obj.id">{{ obj.title }}</option>
                   }
                 </select>
@@ -222,7 +238,7 @@ export type ActiveDialogType =
             </div>
           }
 
-          <!-- 4. New Objective -->
+          <!-- 4. New Objective (Goal / Milestone / Cycle) -->
           @if (dialog() === 'new-objective') {
             <div class="flex items-center justify-between">
               <h2 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">New Strategic Goal / Milestone</h2>
@@ -230,6 +246,17 @@ export type ActiveDialogType =
             </div>
 
             <div class="space-y-3">
+              @if (!store.activeProjectId() && store.visibleProjects().length > 1) {
+                <select
+                  [(ngModel)]="objProjectId"
+                  class="w-full px-2.5 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
+                >
+                  @for (p of store.visibleProjects(); track p.id) {
+                    <option [value]="p.id">{{ p.keyPrefix }} — {{ p.name }}</option>
+                  }
+                </select>
+              }
+
               <div class="grid grid-cols-3 gap-2">
                 <select
                   [(ngModel)]="objKind"
@@ -239,18 +266,42 @@ export type ActiveDialogType =
                   <option value="milestone">Milestone</option>
                   <option value="cycle">Cycle</option>
                 </select>
+
+                <select
+                  [(ngModel)]="objStatus"
+                  class="px-2.5 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
+                >
+                  <option value="active">Active</option>
+                  <option value="planned">Planned</option>
+                  <option value="at_risk">At Risk</option>
+                </select>
+
                 <input
-                  type="text"
-                  [(ngModel)]="objTitle"
-                  placeholder="Objective headline"
-                  class="col-span-2 px-3 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
+                  type="date"
+                  [(ngModel)]="objTargetDate"
+                  class="px-2.5 py-1.5 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
                 />
               </div>
+
+              <input
+                type="text"
+                [(ngModel)]="objTitle"
+                placeholder="Objective headline (e.g. Ship Real-Time Streaming & Structured Goals)"
+                class="w-full px-3 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
+              />
+
+              <textarea
+                rows="2"
+                [(ngModel)]="objSummary"
+                placeholder="Strategic context & scope..."
+                class="w-full px-3 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
+              ></textarea>
+
               <textarea
                 rows="3"
-                [(ngModel)]="objSummary"
-                placeholder="Measurable outcome criteria..."
-                class="w-full px-3 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
+                [(ngModel)]="objCriteria"
+                placeholder="Verifiable success criteria (one per line)..."
+                class="w-full px-3 py-2 rounded-md text-xs font-mono bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
               ></textarea>
             </div>
 
@@ -265,6 +316,72 @@ export type ActiveDialogType =
                 class="px-4 py-1.5 rounded-md bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-950 text-xs font-medium disabled:opacity-50"
               >
                 Create Goal
+              </button>
+            </div>
+          }
+
+          <!-- 4b. Edit Objective -->
+          @if (dialog() === 'edit-objective' && editingObjective(); as editObj) {
+            <div class="flex items-center justify-between">
+              <h2 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                Edit {{ editObj.kind }} — {{ editObj.title }}
+              </h2>
+              <button type="button" (click)="close.emit()" class="text-xs text-zinc-400">✕</button>
+            </div>
+
+            <div class="space-y-3">
+              <input
+                type="text"
+                [(ngModel)]="objTitle"
+                placeholder="Objective headline"
+                class="w-full px-3 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
+              />
+
+              <div class="grid grid-cols-2 gap-2">
+                <select
+                  [(ngModel)]="objStatus"
+                  class="px-2.5 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
+                >
+                  <option value="planned">Planned</option>
+                  <option value="active">Active</option>
+                  <option value="at_risk">At Risk</option>
+                  <option value="achieved">Achieved</option>
+                  <option value="dropped">Dropped</option>
+                </select>
+
+                <input
+                  type="date"
+                  [(ngModel)]="objTargetDate"
+                  class="px-2.5 py-1.5 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
+                />
+              </div>
+
+              <textarea
+                rows="3"
+                [(ngModel)]="objSummary"
+                placeholder="Strategic context & scope..."
+                class="w-full px-3 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
+              ></textarea>
+
+              <textarea
+                rows="4"
+                [(ngModel)]="objCriteria"
+                placeholder="Verifiable success criteria (one per line)..."
+                class="w-full px-3 py-2 rounded-md text-xs font-mono bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
+              ></textarea>
+            </div>
+
+            <div class="flex justify-end gap-2">
+              <button type="button" (click)="close.emit()" class="px-3 py-1.5 rounded text-xs text-zinc-500">
+                Cancel
+              </button>
+              <button
+                type="button"
+                (click)="submitEditObjective(editObj.id)"
+                [disabled]="!objTitle.trim() || store.saving()"
+                class="px-4 py-1.5 rounded-md bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-950 text-xs font-medium disabled:opacity-50"
+              >
+                Save Changes
               </button>
             </div>
           }
@@ -383,10 +500,14 @@ export class DialogsComponent {
   readonly store = inject(FlowskStore);
   readonly dialog = input.required<ActiveDialogType>();
   readonly defaultTaskStatus = input<TaskStatus>('ready');
+  readonly presetObjectiveId = input<string>('');
+  readonly presetProjectId = input<string>('');
+  readonly editingObjective = input<ObjectiveModel | null>(null);
   readonly close = output<void>();
 
   readonly statusColumns = CANONICAL_STATUS_COLUMNS;
 
+  taskProjectId = '';
   taskTitle = '';
   taskDescription = '';
   taskMarkdownDoc = '';
@@ -402,16 +523,45 @@ export class DialogsComponent {
   projScopeSubpath = '';
   projectCharterMd = '';
 
-  objKind: 'goal' | 'milestone' | 'cycle' = 'goal';
+  objProjectId = '';
+  objKind: ObjectiveKind = 'goal';
+  objStatus: ObjectiveStatus = 'active';
+  objTargetDate = '';
   objTitle = '';
   objSummary = '';
+  objCriteria = '';
 
   constructor() {
     effect(() => {
       const current = this.dialog();
       const presetStatus = this.defaultTaskStatus();
+      const presetObj = this.presetObjectiveId();
+      const presetProj = this.presetProjectId();
+      const editObj = this.editingObjective();
+
       if (current === 'new-task') {
         this.taskStatus = presetStatus;
+        this.taskProjectId =
+          presetProj || this.store.activeProjectId() || this.store.visibleProjects()[0]?.id || '';
+        this.taskObjectiveId = presetObj;
+      }
+      if (current === 'new-objective') {
+        this.objProjectId = this.store.activeProjectId() || this.store.visibleProjects()[0]?.id || '';
+        this.objKind = 'goal';
+        this.objStatus = 'active';
+        this.objTargetDate = '';
+        this.objTitle = '';
+        this.objSummary = '';
+        this.objCriteria = '';
+      }
+      if (current === 'edit-objective' && editObj) {
+        this.objProjectId = editObj.projectId;
+        this.objKind = editObj.kind;
+        this.objStatus = editObj.status;
+        this.objTargetDate = editObj.targetDate ? editObj.targetDate.slice(0, 10) : '';
+        this.objTitle = editObj.title;
+        this.objSummary = editObj.description;
+        this.objCriteria = editObj.successCriteria.join('\n');
       }
       if (current === 'project-charter') {
         this.projectCharterMd = this.store.activeProjectMarkdown();
@@ -419,9 +569,28 @@ export class DialogsComponent {
     });
   }
 
+  objectivesForTaskForm(): ObjectiveModel[] {
+    const pid = this.store.activeProjectId() || this.taskProjectId;
+    if (!pid) return [...this.store.scopedObjectives()];
+    return this.store.objectives().filter((o) => o.projectId === pid);
+  }
+
+  onTaskProjectChange(projectId: string): void {
+    this.taskProjectId = projectId;
+    if (this.taskObjectiveId) {
+      const stillMatches = this.store
+        .objectives()
+        .some((o) => o.id === this.taskObjectiveId && o.projectId === projectId);
+      if (!stillMatches) {
+        this.taskObjectiveId = '';
+      }
+    }
+  }
+
   submitNewTask(): void {
     this.store.createTask({
       payload: {
+        projectId: this.store.activeProjectId() || this.taskProjectId || undefined,
         title: this.taskTitle,
         description: this.taskDescription,
         acceptanceCriteria: '',
@@ -470,13 +639,35 @@ export class DialogsComponent {
   submitObjective(): void {
     this.store.createObjective({
       payload: {
+        projectId: this.store.activeProjectId() || this.objProjectId || undefined,
         kind: this.objKind,
+        status: this.objStatus,
         title: this.objTitle,
         description: this.objSummary,
+        successCriteria: this.objCriteria || this.objSummary,
+        targetDate: this.objTargetDate || undefined,
       },
       onSuccess: () => {
         this.objTitle = '';
         this.objSummary = '';
+        this.objCriteria = '';
+        this.objTargetDate = '';
+        this.close.emit();
+      },
+    });
+  }
+
+  submitEditObjective(objectiveId: string): void {
+    this.store.updateObjective({
+      payload: {
+        objectiveId,
+        title: this.objTitle,
+        description: this.objSummary,
+        successCriteria: this.objCriteria,
+        status: this.objStatus,
+        targetDate: this.objTargetDate || undefined,
+      },
+      onSuccess: () => {
         this.close.emit();
       },
     });

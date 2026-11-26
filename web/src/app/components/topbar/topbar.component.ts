@@ -1,7 +1,8 @@
-import { ChangeDetectionStrategy, Component, inject, output } from '@angular/core';
+import { ChangeDetectionStrategy, Component, inject, output, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import {
   CANONICAL_STATUS_COLUMNS,
+  LiveStreamEventModel,
   ProjectHierarchyNode,
   TaskPriority,
   TaskStatus,
@@ -15,9 +16,9 @@ import { FlowskStore } from '../../core/store/flowsk.store';
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <header
-      class="border-b border-zinc-200 dark:border-zinc-800/90 bg-white/80 dark:bg-zinc-950/90 backdrop-blur px-5 py-2.5 flex flex-col gap-2.5"
+      class="border-b border-zinc-200 dark:border-zinc-800/90 bg-white/80 dark:bg-zinc-950/90 backdrop-blur px-5 py-2.5 flex flex-col gap-2.5 relative z-20"
     >
-      <!-- Top Row: Project Selector, Subproject Breadcrumbs, Orphan Warning, View Switcher & Primary Actions -->
+      <!-- Top Row: Project Selector, Subproject Breadcrumbs, Live Stream Pill, View Switcher & Primary Actions -->
       <div class="flex flex-wrap items-center justify-between gap-3">
         <div class="flex flex-wrap items-center gap-2 min-w-0">
           <!-- Global Project & Subproject Selector -->
@@ -48,7 +49,6 @@ import { FlowskStore } from '../../core/store/flowsk.store';
               Workspace Archive ({{ store.workspaceArchivedCount() }})
             </h1>
           } @else if (store.activeProject(); as proj) {
-            <!-- Parent Breadcrumb when viewing a Subproject -->
             @if (store.activeProjectParentInfo(); as parentInfo) {
               <button
                 type="button"
@@ -60,7 +60,6 @@ import { FlowskStore } from '../../core/store/flowsk.store';
               </button>
             }
 
-            <!-- Child Subproject Quick Chips when viewing a Parent Project -->
             @for (sub of store.activeProjectChildren(); track sub.child.id) {
               <button
                 type="button"
@@ -93,6 +92,80 @@ import { FlowskStore } from '../../core/store/flowsk.store';
         </div>
 
         <div class="flex items-center gap-2">
+          <!-- Real-Time Go Channel SSE Stream Status & Activity Feed Popover -->
+          <div class="relative">
+            <button
+              type="button"
+              (click)="activityOpen.set(!activityOpen())"
+              class="px-2.5 py-1 rounded-md border text-[11px] font-medium flex items-center gap-1.5 transition-colors"
+              [class]="streamPillClass()"
+              title="Real-time Go channel event stream (click to inspect live agent activity)"
+            >
+              <span class="w-1.5 h-1.5 rounded-full" [class]="streamDotClass()"></span>
+              <span>{{ streamLabel() }}</span>
+              @if (store.liveEvents().length > 0) {
+                <span class="font-mono text-[10px] opacity-80">· {{ store.liveEvents().length }}</span>
+              }
+            </button>
+
+            @if (activityOpen()) {
+              <div
+                class="absolute right-0 mt-1.5 w-84 rounded-xl bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 shadow-2xl p-3 space-y-2.5 z-50"
+              >
+                <div class="flex items-center justify-between gap-2 pb-1.5 border-b border-zinc-200 dark:border-zinc-800">
+                  <div class="text-xs font-semibold text-zinc-900 dark:text-zinc-100">
+                    Real-Time Agent & UI Stream
+                  </div>
+                  <div class="flex items-center gap-1.5">
+                    @if (store.liveEvents().length > 0) {
+                      <button
+                        type="button"
+                        (click)="store.clearLiveEvents()"
+                        class="text-[10px] px-1.5 py-0.5 rounded text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
+                      >
+                        Clear
+                      </button>
+                    }
+                    <button
+                      type="button"
+                      (click)="store.toggleLiveStream()"
+                      class="text-[10px] px-2 py-0.5 rounded border border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-900"
+                    >
+                      {{ store.liveStreamEnabled() ? 'Pause' : 'Resume' }}
+                    </button>
+                  </div>
+                </div>
+
+                @if (store.liveEvents().length === 0) {
+                  <div class="py-5 text-center text-[11px] text-zinc-400 dark:text-zinc-500">
+                    Listening on Go channel SSE stream. Agent claims, task updates, and goal changes appear here automatically.
+                  </div>
+                } @else {
+                  <div class="max-h-64 overflow-y-auto space-y-1.5">
+                    @for (ev of store.liveEvents(); track ev.id + ev.occurredAt) {
+                      <div
+                        class="p-2 rounded-lg bg-zinc-50 dark:bg-zinc-900/70 border border-zinc-200/70 dark:border-zinc-800/80 text-[11px] space-y-0.5"
+                      >
+                        <div class="flex items-center justify-between gap-2">
+                          <span class="font-mono font-medium text-zinc-800 dark:text-zinc-200">
+                            @{{ ev.actorHandle || 'actor' }}
+                          </span>
+                          <span class="font-mono text-[10px] text-zinc-400">
+                            {{ formatEventTime(ev.occurredAt) }}
+                          </span>
+                        </div>
+                        <div class="text-zinc-600 dark:text-zinc-400 truncate">
+                          <span class="font-medium text-emerald-600 dark:text-emerald-400">{{ ev.action }}</span>
+                          · {{ ev.resourceType }}
+                        </div>
+                      </div>
+                    }
+                  </div>
+                }
+              </div>
+            }
+          </div>
+
           @if (store.orphanReport().totalIssues > 0) {
             <button
               type="button"
@@ -103,8 +176,7 @@ import { FlowskStore } from '../../core/store/flowsk.store';
             </button>
           }
 
-          @if (store.activeProjectId() !== null || store.scopeTab() !== 'board') {
-            <!-- View Switcher: Kanban vs Grid -->
+          @if (store.scopeTab() !== 'goals' && (store.activeProjectId() !== null || store.scopeTab() !== 'board')) {
             <div
               class="inline-flex p-0.5 rounded-md bg-zinc-100 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800"
             >
@@ -145,7 +217,7 @@ import { FlowskStore } from '../../core/store/flowsk.store';
             </button>
           }
 
-          @if (store.activeProjectId()) {
+          @if (store.visibleProjects().length > 0) {
             <button
               type="button"
               (click)="openNewTask.emit()"
@@ -159,22 +231,22 @@ import { FlowskStore } from '../../core/store/flowsk.store';
             type="button"
             (click)="store.refreshProjectContext({ projectId: store.activeProjectId() })"
             class="px-2 py-1 rounded-md text-xs border border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors"
-            title="Refresh projects, bindings, and tasks"
+            title="Manual refresh"
           >
             ↻
           </button>
         </div>
       </div>
 
-      <!-- Second Row: Instant Task Search & Structured Filters (shown when inspecting a project or task list) -->
-      @if (store.activeProjectId() !== null || store.scopeTab() !== 'board') {
+      <!-- Second Row: Instant Task Search & Structured Filters (shown on task board/backlog/all/archive) -->
+      @if (store.scopeTab() !== 'goals' && (store.activeProjectId() !== null || store.scopeTab() !== 'board')) {
         <div class="flex flex-wrap items-center gap-2">
           <div class="relative flex-1 min-w-[220px]">
             <input
               type="search"
               [ngModel]="store.searchQuery()"
               (ngModelChange)="store.setSearchQuery($event)"
-              placeholder="Search tasks (e.g. state:in_progress is:md is:blocked @actor keyword)..."
+              placeholder="Search tasks (e.g. state:in_progress is:md is:claimed ext:CU-123 @actor keyword)..."
               class="w-full px-3 py-1.5 rounded-md text-xs bg-zinc-100/80 dark:bg-zinc-900/90 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-500 focus:outline-none focus:border-zinc-400 dark:focus:border-zinc-600"
             />
           </div>
@@ -202,14 +274,14 @@ import { FlowskStore } from '../../core/store/flowsk.store';
             <option value="TASK_PRIORITY_LOW">P3 · Low</option>
           </select>
 
-          @if (store.objectives().length > 0) {
+          @if (store.scopedObjectives().length > 0) {
             <select
               [ngModel]="store.objectiveFilterId()"
               (ngModelChange)="store.setObjectiveFilter($event)"
               class="px-2.5 py-1.5 rounded-md text-xs bg-zinc-100/80 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300 focus:outline-none max-w-[180px]"
             >
               <option value="all">All Goals</option>
-              @for (obj of store.objectives(); track obj.id) {
+              @for (obj of store.scopedObjectives(); track obj.id) {
                 <option [value]="obj.id">{{ obj.title }}</option>
               }
             </select>
@@ -237,6 +309,7 @@ import { FlowskStore } from '../../core/store/flowsk.store';
 export class TopbarComponent {
   readonly store = inject(FlowskStore);
   readonly statusColumns = CANONICAL_STATUS_COLUMNS;
+  readonly activityOpen = signal<boolean>(false);
 
   readonly openNewTask = output<void>();
   readonly openProjectCharter = output<void>();
@@ -263,5 +336,45 @@ export class TopbarComponent {
 
   archiveCurrentProject(projectId: string): void {
     this.store.archiveProject({ payload: { projectId } });
+  }
+
+  streamLabel(): string {
+    switch (this.store.streamStatus()) {
+      case 'live':
+        return 'Live';
+      case 'reconnecting':
+        return 'Reconnecting';
+      case 'paused':
+        return 'Paused';
+      default:
+        return 'Connecting';
+    }
+  }
+
+  streamPillClass(): string {
+    switch (this.store.streamStatus()) {
+      case 'live':
+        return 'border-emerald-500/35 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/20';
+      case 'reconnecting':
+        return 'border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300';
+      default:
+        return 'border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900 text-zinc-500 dark:text-zinc-400';
+    }
+  }
+
+  streamDotClass(): string {
+    switch (this.store.streamStatus()) {
+      case 'live':
+        return 'bg-emerald-400 animate-pulse';
+      case 'reconnecting':
+        return 'bg-amber-400 animate-pulse';
+      default:
+        return 'bg-zinc-400';
+    }
+  }
+
+  formatEventTime(iso: LiveStreamEventModel['occurredAt']): string {
+    if (!iso || iso.length < 19) return '';
+    return iso.slice(11, 19);
   }
 }

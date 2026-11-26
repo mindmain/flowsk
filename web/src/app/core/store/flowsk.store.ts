@@ -3,12 +3,16 @@ import { PLATFORM_ID, computed, inject } from '@angular/core';
 import { tapResponse } from '@ngrx/operators';
 import { patchState, signalStore, withComputed, withHooks, withMethods, withState } from '@ngrx/signals';
 import { rxMethod } from '@ngrx/signals/rxjs-interop';
-import { forkJoin, of, pipe, switchMap } from 'rxjs';
+import { EMPTY, debounceTime, forkJoin, of, pipe, switchMap } from 'rxjs';
 import { SanitizedApiError } from '../http/flowsk-api.interceptor';
 import {
   ActorModel,
   CANONICAL_STATUS_COLUMNS,
+  LiveStreamEventModel,
+  ObjectiveKind,
   ObjectiveModel,
+  ObjectiveProgressView,
+  ObjectiveStatus,
   OrphanResourcesReport,
   ProjectBindingModel,
   ProjectHierarchyNode,
@@ -17,6 +21,7 @@ import {
   PruneResourcesResult,
   PurgeArchivedResult,
   ScopeTab,
+  StreamConnectionState,
   TaskCommentModel,
   TaskKind,
   TaskModel,
@@ -29,6 +34,7 @@ import {
 } from '../models/flowsk.models';
 import { FlowskHeaderContextService } from '../services/flowsk-header-context.service';
 import { FlowskRpcService } from '../services/flowsk-rpc.service';
+import { FlowskStreamService } from '../services/flowsk-stream.service';
 
 export interface UiActionPayload<P, R = void> {
   readonly payload: P;
@@ -48,6 +54,10 @@ export interface FlowskState {
   readonly workspaceSlug: string;
   readonly actorId: string;
   readonly actorHandle: string;
+
+  readonly streamStatus: StreamConnectionState;
+  readonly liveStreamEnabled: boolean;
+  readonly liveEvents: readonly LiveStreamEventModel[];
 
   readonly workspaces: readonly WorkspaceModel[];
   readonly actors: readonly ActorModel[];
@@ -100,6 +110,10 @@ const INITIAL_STATE: FlowskState = {
   workspaceSlug: 'default',
   actorId: '',
   actorHandle: 'web-operator',
+
+  streamStatus: 'connecting',
+  liveStreamEnabled: true,
+  liveEvents: [],
 
   workspaces: [],
   actors: [],
@@ -160,9 +174,9 @@ const ZERO_COUNTS: ProjectTaskCounts = {
 };
 
 /**
- * Root singleton SignalStore orchestrating all Flowsk Web UI state, filtering,
- * drag-and-drop workflow transitions, Markdown document persistence, archive
- * purging, and orphan pruning.
+ * Root singleton SignalStore orchestrating all Flowsk Web UI state, real-time
+ * Go channel SSE streaming, structured Goals/Milestones tracking, drag-and-drop
+ * Kanban transitions, Markdown document persistence, archive purging, and orphan pruning.
  */
 export const FlowskStore = signalStore(
   { providedIn: 'root' },
@@ -202,11 +216,25 @@ export const FlowskStore = signalStore(
       return map;
     });
 
+    const scopedObjectives = computed(() => {
+      const pid = store.activeProjectId();
+      const visibleIds = new Set(visibleProjects().map((p) => p.id));
+      return store.objectives().filter((o) => {
+        if (pid) {
+          return o.projectId === pid;
+        }
+        return visibleIds.has(o.projectId);
+      });
+    });
+
+    const activeObjectivesCount = computed(() =>
+      scopedObjectives().filter((o) => o.status !== 'achieved' && o.status !== 'dropped').length,
+    );
+
     const projectScopedTasks = computed(() => {
       const pid = store.activeProjectId();
       const all = store.workspaceTasks();
       if (store.scopeTab() === 'archived') {
-        // Archive tab shows archived tasks (globally across workspace or focused project)
         return all.filter((t) => t.status === 'archived');
       }
       if (!pid) {
@@ -311,23 +339,71 @@ export const FlowskStore = signalStore(
       }));
     });
 
-    const objectivesWithProgress = computed(() => {
-      const pid = store.activeProjectId();
-      const pTasks = store
+    const objectivesWithProgress = computed<readonly ObjectiveProgressView[]>(() => {
+      const byProj = projectMapById();
+      const allNonArchived = store
         .workspaceTasks()
-        .filter((t) => (!pid || t.projectId === pid) && t.status !== 'archived');
-      return store.objectives().map((o) => {
-        const linked = pTasks.filter((t) => t.objectiveId === o.id);
-        const done = linked.filter((t) => t.status === 'done').length;
+        .filter((t) => t.status !== 'archived' && t.status !== 'cancelled');
+
+      return scopedObjectives().map((o) => {
+        const linked = allNonArchived
+          .filter((t) => t.objectiveId === o.id)
+          .slice()
+          .sort((a, b) => {
+            const rankA = statusProgressSortOrder(a.status);
+            const rankB = statusProgressSortOrder(b.status);
+            if (rankA !== rankB) return rankA - rankB;
+            if (a.priorityRank !== b.priorityRank) return a.priorityRank - b.priorityRank;
+            return a.sequenceNumber - b.sequenceNumber;
+          });
+
         const total = linked.length;
-        const pct = total > 0 ? Math.round((done * 100) / total) : 0;
+        const done = linked.filter((t) => t.status === 'done').length;
+        const inProgress = linked.filter((t) => t.status === 'in_progress').length;
+        const inReview = linked.filter((t) => t.status === 'in_review').length;
+        const blocked = linked.filter((t) => t.status === 'blocked').length;
+        const todo = linked.filter((t) => t.status === 'ready').length;
+        const backlog = linked.filter((t) => t.status === 'backlog').length;
+        const claims = linked.filter((t) => Boolean(t.claimedByActorId)).length;
+
+        const progressPct = total > 0 ? Math.round((done * 100) / total) : 0;
+        const activeWorkPct = total > 0 ? Math.round(((inProgress + inReview) * 100) / total) : 0;
+        const blockedPct = total > 0 ? Math.round((blocked * 100) / total) : 0;
+
+        const proj = byProj[o.projectId];
         return {
           ...o,
-          doneCount: done,
+          projectKeyPrefix: proj?.keyPrefix ?? 'PRJ',
+          projectName: proj?.name ?? 'Project',
+          tasks: linked,
           totalCount: total,
-          progressPct: pct,
+          doneCount: done,
+          inProgressCount: inProgress,
+          inReviewCount: inReview,
+          blockedCount: blocked,
+          todoCount: todo,
+          backlogCount: backlog,
+          activeClaimsCount: claims,
+          progressPct,
+          activeWorkPct,
+          blockedPct,
         };
       });
+    });
+
+    const unlinkedProjectTasks = computed(() => {
+      const pid = store.activeProjectId();
+      return store
+        .workspaceTasks()
+        .filter(
+          (t) =>
+            (!pid || t.projectId === pid) &&
+            !t.objectiveId &&
+            t.status !== 'archived' &&
+            t.status !== 'cancelled',
+        )
+        .slice()
+        .sort((a, b) => a.sequenceNumber - b.sequenceNumber);
     });
 
     const selectedTask = computed(() => {
@@ -427,7 +503,6 @@ export const FlowskStore = signalStore(
         buildNode(root, 0, '', null, new Set<string>()),
       );
 
-      // Defensive fallback so any unvisited project is still surfaced cleanly as a root.
       for (const p of visible) {
         if (!visitedGlobal.has(p.id)) {
           roots.push(buildNode(p, 0, '', null, new Set<string>()));
@@ -491,6 +566,8 @@ export const FlowskStore = signalStore(
       actorMapById,
       projectMapById,
       objectiveMapById,
+      scopedObjectives,
+      activeObjectivesCount,
       projectCountsById,
       projectTree,
       flatProjectHierarchy,
@@ -504,11 +581,13 @@ export const FlowskStore = signalStore(
       filteredTasks,
       kanbanColumns,
       objectivesWithProgress,
+      unlinkedProjectTasks,
       selectedTask,
     };
   }),
   withMethods((store) => {
     const rpc = inject(FlowskRpcService);
+    const stream = inject(FlowskStreamService);
     const headerCtx = inject(FlowskHeaderContextService);
     const platformId = inject(PLATFORM_ID);
 
@@ -538,6 +617,100 @@ export const FlowskStore = signalStore(
       return matching?.id ?? null;
     };
 
+    const silentSyncFromStream = rxMethod<LiveStreamEventModel>(
+      pipe(
+        debounceTime(180),
+        switchMap((lastEvent) => {
+          const wsId = store.workspaceId();
+          const actorId = store.actorId();
+          if (!wsId || !actorId || store.saving()) {
+            return of(null);
+          }
+          const projectId = store.activeProjectId();
+          const openTaskId = store.selectedTaskId();
+
+          return forkJoin({
+            actors: rpc.listActors(wsId, actorId),
+            projects: rpc.listProjects(wsId, actorId),
+            bindings: rpc.listProjectBindings(wsId, actorId),
+            objectives: rpc.listObjectives(wsId, actorId),
+            tasks: rpc.listTasks(wsId, actorId),
+            orphans: rpc.inspectOrphanResources(wsId, actorId),
+            states: projectId ? rpc.listWorkflowStates(wsId, actorId, projectId) : of(store.workflowStates() as WorkflowStateModel[]),
+            inspector: openTaskId
+              ? forkJoin({
+                  comments: rpc.listTaskComments(wsId, actorId, openTaskId),
+                  md: rpc.getTaskMarkdown(wsId, actorId, openTaskId),
+                  detail: rpc.getTaskDetail(wsId, actorId, openTaskId),
+                })
+              : of(null),
+            trigger: of(lastEvent),
+          }).pipe(
+            tapResponse({
+              next: (bundle) => {
+                const inspectorPatch =
+                  bundle.inspector && store.selectedTaskId() === openTaskId
+                    ? {
+                        selectedTaskComments: bundle.inspector.comments,
+                        selectedTaskRelations: bundle.inspector.detail.relations,
+                        selectedTaskMarkdown: bundle.inspector.md.markdown,
+                      }
+                    : {};
+                patchState(store, {
+                  actors: bundle.actors,
+                  projects: bundle.projects,
+                  projectBindings: bundle.bindings,
+                  objectives: bundle.objectives,
+                  workspaceTasks: bundle.tasks,
+                  orphanReport: bundle.orphans,
+                  workflowStates: bundle.states,
+                  ...inspectorPatch,
+                });
+              },
+              error: () => {
+                // Keep background live sync silent so transient reloads never interrupt operator work
+              },
+            }),
+          );
+        }),
+      ),
+    );
+
+    const connectLiveStream = rxMethod<{ workspaceId: string; actorHandle: string; enabled: boolean }>(
+      pipe(
+        switchMap(({ workspaceId, actorHandle, enabled }) => {
+          if (!enabled) {
+            patchState(store, { streamStatus: 'paused' });
+            return EMPTY;
+          }
+          if (!workspaceId) {
+            return EMPTY;
+          }
+          return stream.connectWorkspace(workspaceId, actorHandle).pipe(
+            tapResponse({
+              next: (sig) => {
+                if (sig.type === 'status') {
+                  patchState(store, { streamStatus: sig.status });
+                  return;
+                }
+                const existing = store.liveEvents();
+                if (sig.event.id && existing.some((e) => e.id === sig.event.id)) {
+                  return;
+                }
+                patchState(store, {
+                  liveEvents: [sig.event, ...existing].slice(0, 30),
+                });
+                silentSyncFromStream(sig.event);
+              },
+              error: () => {
+                patchState(store, { streamStatus: 'reconnecting' });
+              },
+            }),
+          );
+        }),
+      ),
+    );
+
     const refreshProjectContext = rxMethod<{ projectId: string | null }>(
       pipe(
         switchMap(({ projectId }) => {
@@ -548,14 +721,16 @@ export const FlowskStore = signalStore(
           }
           patchState(store, { loading: true, errorBanner: null });
 
+          const actors$ = rpc.listActors(wsId, actorId);
           const projects$ = rpc.listProjects(wsId, actorId);
           const bindings$ = rpc.listProjectBindings(wsId, actorId);
           const tasks$ = rpc.listTasks(wsId, actorId);
           const orphans$ = rpc.inspectOrphanResources(wsId, actorId);
           const states$ = projectId ? rpc.listWorkflowStates(wsId, actorId, projectId) : of([] as WorkflowStateModel[]);
-          const objs$ = projectId ? rpc.listObjectives(wsId, actorId, projectId) : of([] as ObjectiveModel[]);
+          const objs$ = rpc.listObjectives(wsId, actorId);
 
           return forkJoin({
+            actors: actors$,
             projects: projects$,
             bindings: bindings$,
             tasks: tasks$,
@@ -566,6 +741,7 @@ export const FlowskStore = signalStore(
             tapResponse({
               next: (bundle) => {
                 patchState(store, {
+                  actors: bundle.actors,
                   projects: bundle.projects,
                   projectBindings: bundle.bindings,
                   workspaceTasks: bundle.tasks,
@@ -638,6 +814,7 @@ export const FlowskStore = signalStore(
                         actors: rpc.listActors(wsId, actorId),
                         projects: rpc.listProjects(wsId, actorId),
                         bindings: rpc.listProjectBindings(wsId, actorId),
+                        objectives: rpc.listObjectives(wsId, actorId),
                         tasks: rpc.listTasks(wsId, actorId),
                         orphans: rpc.inspectOrphanResources(wsId, actorId),
                       });
@@ -663,20 +840,15 @@ export const FlowskStore = signalStore(
                   chosenId: null as string | null,
                   openedFromBoundFolder: false,
                   states: [] as WorkflowStateModel[],
-                  objectives: [] as ObjectiveModel[],
                 });
               }
-              return forkJoin({
-                states: rpc.listWorkflowStates(ctx.actor.workspaceId, ctx.actor.id, chosen.id),
-                objectives: rpc.listObjectives(ctx.actor.workspaceId, ctx.actor.id, chosen.id),
-              }).pipe(
-                switchMap((projBundle) =>
+              return rpc.listWorkflowStates(ctx.actor.workspaceId, ctx.actor.id, chosen.id).pipe(
+                switchMap((states) =>
                   of({
                     ...ctx,
                     chosenId: chosen.id,
                     openedFromBoundFolder: true,
-                    states: projBundle.states,
-                    objectives: projBundle.objectives,
+                    states,
                   }),
                 ),
               );
@@ -700,6 +872,11 @@ export const FlowskStore = signalStore(
                   objectives: res.objectives,
                   workspaceTasks: res.tasks,
                   orphanReport: res.orphans,
+                });
+                connectLiveStream({
+                  workspaceId: res.actor.workspaceId,
+                  actorHandle: res.actor.handle,
+                  enabled: store.liveStreamEnabled(),
                 });
               },
               error: (err: unknown) => {
@@ -770,7 +947,6 @@ export const FlowskStore = signalStore(
           }
 
           const previousTasks = store.workspaceTasks();
-          // Optimistic patch for snappy Kanban drag & drop UX
           patchState(store, {
             workspaceTasks: previousTasks.map((t) =>
               t.id === payload.taskId ? { ...t, status: payload.targetStatus } : t,
@@ -980,11 +1156,22 @@ export const FlowskStore = signalStore(
     );
 
     const createObjective = rxMethod<
-      UiActionPayload<{ title: string; kind: 'goal' | 'milestone' | 'cycle'; description: string }, ObjectiveModel>
+      UiActionPayload<
+        {
+          projectId?: string;
+          title: string;
+          kind: ObjectiveKind;
+          status?: ObjectiveStatus;
+          description: string;
+          successCriteria?: string;
+          targetDate?: string;
+        },
+        ObjectiveModel
+      >
     >(
       pipe(
         switchMap(({ payload, onSuccess, onError }) => {
-          const pid = store.activeProjectId();
+          const pid = payload.projectId || store.activeProjectId() || store.visibleProjects()[0]?.id;
           if (!pid) return of(null);
           patchState(store, { saving: true, errorBanner: null });
           return rpc
@@ -993,8 +1180,11 @@ export const FlowskStore = signalStore(
               actorId: store.actorId(),
               projectId: pid,
               kind: payload.kind,
+              status: payload.status ?? 'active',
               title: payload.title.trim(),
               description: payload.description.trim(),
+              successCriteria: payload.successCriteria?.trim(),
+              targetDate: payload.targetDate?.trim(),
             })
             .pipe(
               tapResponse({
@@ -1002,9 +1192,57 @@ export const FlowskStore = signalStore(
                   patchState(store, {
                     saving: false,
                     objectives: [...store.objectives(), created],
-                    toastMessage: `Objective '${created.title}' added`,
+                    toastMessage: `${created.kind} '${created.title}' added`,
                   });
                   onSuccess?.(created);
+                },
+                error: (err: unknown) => {
+                  const msg = extractErrorMessage(err);
+                  patchState(store, { saving: false, errorBanner: msg });
+                  onError?.(msg);
+                },
+              }),
+            );
+        }),
+      ),
+    );
+
+    const updateObjective = rxMethod<
+      UiActionPayload<
+        {
+          objectiveId: string;
+          title?: string;
+          description?: string;
+          successCriteria?: string;
+          status?: ObjectiveStatus;
+          targetDate?: string;
+        },
+        ObjectiveModel
+      >
+    >(
+      pipe(
+        switchMap(({ payload, onSuccess, onError }) => {
+          patchState(store, { saving: true, errorBanner: null });
+          return rpc
+            .updateObjective({
+              workspaceId: store.workspaceId(),
+              actorId: store.actorId(),
+              objectiveId: payload.objectiveId,
+              title: payload.title?.trim(),
+              description: payload.description,
+              successCriteria: payload.successCriteria,
+              status: payload.status,
+              targetDate: payload.targetDate,
+            })
+            .pipe(
+              tapResponse({
+                next: (updated) => {
+                  patchState(store, {
+                    saving: false,
+                    objectives: store.objectives().map((o) => (o.id === updated.id ? updated : o)),
+                    toastMessage: `Updated '${updated.title}'`,
+                  });
+                  onSuccess?.(updated);
                 },
                 error: (err: unknown) => {
                   const msg = extractErrorMessage(err);
@@ -1025,7 +1263,7 @@ export const FlowskStore = signalStore(
               next: (closed) => {
                 patchState(store, {
                   objectives: store.objectives().map((o) => (o.id === closed.id ? closed : o)),
-                  toastMessage: `Objective closed`,
+                  toastMessage: payload.achieved ? `Marked '${closed.title}' achieved` : `Dropped '${closed.title}'`,
                 });
                 onSuccess?.(closed);
               },
@@ -1040,9 +1278,77 @@ export const FlowskStore = signalStore(
       ),
     );
 
+    const deleteObjective = rxMethod<UiActionPayload<{ objectiveId: string }, string>>(
+      pipe(
+        switchMap(({ payload, onSuccess, onError }) => {
+          patchState(store, { saving: true, errorBanner: null });
+          return rpc.deleteObjective(store.workspaceId(), store.actorId(), payload.objectiveId).pipe(
+            tapResponse({
+              next: (removedId) => {
+                patchState(store, {
+                  saving: false,
+                  objectives: store.objectives().filter((o) => o.id !== removedId),
+                  objectiveFilterId: store.objectiveFilterId() === removedId ? 'all' : store.objectiveFilterId(),
+                  workspaceTasks: store
+                    .workspaceTasks()
+                    .map((t) => (t.objectiveId === removedId ? { ...t, objectiveId: undefined } : t)),
+                  toastMessage: `Objective deleted`,
+                });
+                onSuccess?.(removedId);
+              },
+              error: (err: unknown) => {
+                const msg = extractErrorMessage(err);
+                patchState(store, { saving: false, errorBanner: msg });
+                onError?.(msg);
+              },
+            }),
+          );
+        }),
+      ),
+    );
+
+    const assignTaskToObjective = rxMethod<
+      UiActionPayload<{ taskId: string; objectiveId: string | null }, TaskModel>
+    >(
+      pipe(
+        switchMap(({ payload, onSuccess, onError }) => {
+          const targetObjId = payload.objectiveId?.trim() || '';
+          return rpc
+            .updateTask({
+              workspaceId: store.workspaceId(),
+              actorId: store.actorId(),
+              taskId: payload.taskId,
+              objectiveId: targetObjId || undefined,
+              clearObjective: !targetObjId,
+            })
+            .pipe(
+              tapResponse({
+                next: (updated) => {
+                  patchState(store, {
+                    workspaceTasks: store
+                      .workspaceTasks()
+                      .map((t) => (t.id === updated.id ? updated : t)),
+                    toastMessage: targetObjId
+                      ? `${updated.identifier} linked to goal`
+                      : `${updated.identifier} detached from goal`,
+                  });
+                  onSuccess?.(updated);
+                },
+                error: (err: unknown) => {
+                  const msg = extractErrorMessage(err);
+                  patchState(store, { errorBanner: msg });
+                  onError?.(msg);
+                },
+              }),
+            );
+        }),
+      ),
+    );
+
     const createTask = rxMethod<
       UiActionPayload<
         {
+          projectId?: string;
           title: string;
           description: string;
           acceptanceCriteria: string;
@@ -1057,49 +1363,57 @@ export const FlowskStore = signalStore(
     >(
       pipe(
         switchMap(({ payload, onSuccess, onError }) => {
-          const pid = store.activeProjectId();
+          const linkedObj = payload.objectiveId ? store.objectiveMapById()[payload.objectiveId] : undefined;
+          const pid = payload.projectId || linkedObj?.projectId || store.activeProjectId() || store.visibleProjects()[0]?.id;
           if (!pid) return of(null);
           const wsId = store.workspaceId();
           const actorId = store.actorId();
-          const stateId = resolveStateIdForStatus(pid, payload.initialStatus) ?? undefined;
+          const knownStateId = resolveStateIdForStatus(pid, payload.initialStatus);
+          const stateId$ = knownStateId
+            ? of(knownStateId)
+            : rpc
+                .listWorkflowStates(wsId, actorId, pid)
+                .pipe(switchMap((sts) => of(sts.find((s) => s.statusKey === payload.initialStatus)?.id ?? undefined)));
+
           patchState(store, { saving: true, errorBanner: null });
-          return rpc
-            .createTask({
-              workspaceId: wsId,
-              actorId,
-              projectId: pid,
-              title: payload.title.trim(),
-              description: payload.description.trim(),
-              acceptanceCriteria: payload.acceptanceCriteria.trim(),
-              kind: payload.kind,
-              priority: payload.priority,
-              workflowStateId: stateId,
-              objectiveId: payload.objectiveId || undefined,
-            })
-            .pipe(
-              switchMap((created) => {
-                const md = (payload.markdownDoc ?? '').trim();
-                if (!md) {
-                  return of(created);
-                }
-                return rpc.putTaskMarkdown(wsId, actorId, created.id, md);
+          return stateId$.pipe(
+            switchMap((stateId) =>
+              rpc.createTask({
+                workspaceId: wsId,
+                actorId,
+                projectId: pid,
+                title: payload.title.trim(),
+                description: payload.description.trim(),
+                acceptanceCriteria: payload.acceptanceCriteria.trim(),
+                kind: payload.kind,
+                priority: payload.priority,
+                workflowStateId: stateId ?? undefined,
+                objectiveId: payload.objectiveId || undefined,
               }),
-              tapResponse({
-                next: (created) => {
-                  patchState(store, {
-                    saving: false,
-                    workspaceTasks: [created, ...store.workspaceTasks()],
-                    toastMessage: `Created ${created.identifier}`,
-                  });
-                  onSuccess?.(created);
-                },
-                error: (err: unknown) => {
-                  const msg = extractErrorMessage(err);
-                  patchState(store, { saving: false, errorBanner: msg });
-                  onError?.(msg);
-                },
-              }),
-            );
+            ),
+            switchMap((created) => {
+              const md = (payload.markdownDoc ?? '').trim();
+              if (!md) {
+                return of(created);
+              }
+              return rpc.putTaskMarkdown(wsId, actorId, created.id, md);
+            }),
+            tapResponse({
+              next: (created) => {
+                patchState(store, {
+                  saving: false,
+                  workspaceTasks: [created, ...store.workspaceTasks()],
+                  toastMessage: `Created ${created.identifier}`,
+                });
+                onSuccess?.(created);
+              },
+              error: (err: unknown) => {
+                const msg = extractErrorMessage(err);
+                patchState(store, { saving: false, errorBanner: msg });
+                onError?.(msg);
+              },
+            }),
+          );
         }),
       ),
     );
@@ -1366,7 +1680,10 @@ export const FlowskStore = signalStore(
       loadProjectMarkdown,
       saveProjectMarkdown,
       createObjective,
+      updateObjective,
       closeObjective,
+      deleteObjective,
+      assignTaskToObjective,
       createTask,
       updateTaskDetails,
       saveTaskMarkdown,
@@ -1376,6 +1693,23 @@ export const FlowskStore = signalStore(
       purgeArchivedTasks,
       inspectOrphans,
       pruneOrphans,
+
+      toggleLiveStream(): void {
+        const nextEnabled = !store.liveStreamEnabled();
+        patchState(store, {
+          liveStreamEnabled: nextEnabled,
+          streamStatus: nextEnabled ? 'connecting' : 'paused',
+        });
+        connectLiveStream({
+          workspaceId: store.workspaceId(),
+          actorHandle: store.actorHandle(),
+          enabled: nextEnabled,
+        });
+      },
+
+      clearLiveEvents(): void {
+        patchState(store, { liveEvents: [] });
+      },
 
       selectProject(projectId: string | null): void {
         const nextTab = store.scopeTab() === 'archived' ? 'board' : store.scopeTab();
@@ -1464,6 +1798,25 @@ export const FlowskStore = signalStore(
   }),
 );
 
+function statusProgressSortOrder(status: TaskStatus): number {
+  switch (status) {
+    case 'in_progress':
+      return 0;
+    case 'in_review':
+      return 1;
+    case 'blocked':
+      return 2;
+    case 'ready':
+      return 3;
+    case 'backlog':
+      return 4;
+    case 'done':
+      return 5;
+    default:
+      return 6;
+  }
+}
+
 function matchesSearchExpression(
   task: TaskModel,
   rawQuery: string,
@@ -1474,12 +1827,19 @@ function matchesSearchExpression(
   const holder = task.claimedByActorId ? actors[task.claimedByActorId]?.handle ?? '' : '';
   const assignee = task.assigneeActorId ? actors[task.assigneeActorId]?.handle ?? '' : '';
   const objTitle = task.objectiveId ? objectives[task.objectiveId]?.title ?? '' : '';
-  const haystack = `${task.identifier} ${task.title} ${task.description} ${task.acceptanceCriteria} ${objTitle} ${holder} ${assignee}`.toLowerCase();
+  const haystack = `${task.identifier} ${task.externalId} ${task.title} ${task.description} ${task.acceptanceCriteria} ${objTitle} ${holder} ${assignee}`.toLowerCase();
 
   for (const tok of tokens) {
     if (tok.startsWith('state:') || tok.startsWith('status:')) {
       const val = tok.slice(tok.indexOf(':') + 1).replace('-', '_');
       if (val && task.status !== val && !(val === 'todo' && task.status === 'ready')) {
+        return false;
+      }
+      continue;
+    }
+    if (tok.startsWith('ext:')) {
+      const extVal = tok.slice(4).toLowerCase();
+      if (extVal && task.externalId.toLowerCase() !== extVal) {
         return false;
       }
       continue;
