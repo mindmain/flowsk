@@ -123,16 +123,30 @@ Flowsk implements **Cloudflare Code Mode**: instead of making dozens of sequenti
     bind(parentKey: string, childKey: string, scopeSubpath?: string): ProjectBinding;
     unbind(parentKey: string, childKey: string): { parentKey: string; childKey: string; removed: boolean };
     bindings(): ProjectBinding[];
+    getDoc(slugOrKey?: string): { id: string; key: string; slug: string; markdown: string; hasMarkdownDoc: boolean };
+    setDoc(slugOrKey: string, markdown: string): Project;
+    deleteDoc(slugOrKey?: string): Project;
   };
   goals: { // alias: flowsk.objectives
     list(filter?: string): Goal[];
     create(in: {
       title: string;
       project?: string;
+      kind?: "goal" | "milestone" | "cycle";
+      status?: "planned" | "active" | "at_risk";
       slug?: string;
       summary?: string;
       priority?: number | "urgent" | "high" | "medium" | "low";
       targetDate?: string; // YYYY-MM-DD
+      successCriteria?: string[];
+    }): Goal;
+    update(slugOrId: string, patch: {
+      title?: string;
+      kind?: "goal" | "milestone" | "cycle";
+      status?: "planned" | "active" | "at_risk" | "achieved" | "dropped";
+      summary?: string;
+      priority?: number | string;
+      targetDate?: string;
       successCriteria?: string[];
     }): Goal;
     close(slugOrId: string): Goal;
@@ -150,6 +164,7 @@ Flowsk implements **Cloudflare Code Mode**: instead of making dozens of sequenti
       externalId?: string;
       kind?: "epic" | "feature" | "bug" | "chore" | "research";
       description?: string;
+      markdown?: string; // Extended .md specification saved in ~/.flowsk/tasks/
       priority?: number | "urgent" | "high" | "medium" | "low";
       state?: string;
       objective?: string;
@@ -163,12 +178,16 @@ Flowsk implements **Cloudflare Code Mode**: instead of making dozens of sequenti
       project?: string;
       title: string;
       description?: string;
+      markdown?: string;
       priority?: number | "urgent" | "high" | "medium" | "low";
       state?: string;
       tags?: string[];
       acceptance?: string | string[];
     }): TaskDetail;
-    update(keyOrId: string, patch: { title?: string; externalId?: string; description?: string; priority?: number | string; tags?: string[]; acceptance?: string | string[] }): TaskDetail;
+    update(keyOrId: string, patch: { title?: string; externalId?: string; description?: string; markdown?: string; objective?: string; priority?: number | string; tags?: string[]; acceptance?: string | string[] }): TaskDetail;
+    getDoc(keyOrId: string): { id: string; key: string; markdown: string; hasMarkdownDoc: boolean };
+    setDoc(keyOrId: string, markdown: string): TaskDetail;
+    deleteDoc(keyOrId: string): TaskDetail;
     move(keyOrId: string, state: string, note?: string): TaskDetail;
     done(keyOrId: string, note?: string): TaskDetail;
     claim(keyOrId: string, ttlSeconds?: number): TaskDetail;

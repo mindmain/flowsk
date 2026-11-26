@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/mindmain/flowsk/internal/adapter/codemode"
 	"github.com/mindmain/flowsk/internal/adapter/db/sqlite"
+	"github.com/mindmain/flowsk/internal/adapter/mdstore"
 	"github.com/mindmain/flowsk/internal/domain/authctx"
 	"github.com/mindmain/flowsk/internal/domain/project"
 	"github.com/mindmain/flowsk/internal/domain/task"
@@ -240,5 +241,98 @@ func TestCodeModeEngine_SandboxIsolationAndInfiniteLoopTimeout(t *testing.T) {
 	}
 	if err := codemode.ValidateSyntax(`const = ;`); err == nil {
 		t.Fatal("expected invalid ES6 syntax to fail ValidateSyntax")
+	}
+}
+
+func TestCodeModeEngine_MarkdownDocsAndGoalsLifecycle(t *testing.T) {
+	t.Parallel()
+	_, adapter, ctx, wsID, projID := setupCodeModeTestEnv(t)
+
+	mdRoot := t.TempDir()
+	store, err := mdstore.NewFileStore(mdRoot)
+	if err != nil {
+		t.Fatalf("mdstore.NewFileStore: %v", err)
+	}
+
+	eng := codemode.NewEngine(codemode.Dependencies{
+		TxManager:     adapter.TxManager(),
+		ProjectRepo:   adapter.ProjectRepository(),
+		ObjectiveRepo: adapter.ObjectiveRepository(),
+		TaskRepo:      adapter.TaskRepository(),
+		MarkdownStore: store,
+	})
+
+	// 1. DryRun with markdown attachment must NOT write any .md file to disk!
+	_, err = eng.Execute(ctx, codemode.ExecuteInput{
+		WorkspaceID:      wsID,
+		DefaultProjectID: &projID,
+		DryRun:           true,
+		Script: `
+			const t = flowsk.tasks.create({
+				title: "Simulated spec task",
+				state: "backlog",
+				markdown: "# Simulated Spec\nShould never hit disk"
+			});
+			return flowsk.tasks.getDoc(t.key);
+		`,
+	})
+	if err != nil {
+		t.Fatalf("DryRun with markdown failed: %v", err)
+	}
+	scanAfterDry, err := store.ScanTaskMarkdown(ctx, wsID)
+	if err != nil || len(scanAfterDry.ValidIDs) != 0 {
+		t.Fatalf("expected 0 disk .md files after DryRun, got %+v (err=%v)", scanAfterDry, err)
+	}
+
+	// 2. Committed script creates milestone, updates status to at_risk, creates backlog task with .md, updates .md, and filters is:md.
+	commitRes, err := eng.Execute(ctx, codemode.ExecuteInput{
+		WorkspaceID:      wsID,
+		DefaultProjectID: &projID,
+		Script: `
+			const ms = flowsk.goals.create({
+				title: "Real-Time Streaming v1",
+				kind: "milestone",
+				priority: "urgent",
+				successCriteria: ["SSE hub live", "Structured Goals UI"]
+			});
+			const updatedMs = flowsk.goals.update(ms.key, { status: "at_risk" });
+
+			flowsk.projects.setDoc("CORE", "# Core Architecture\n\nGo channels + SSE");
+			const t1 = flowsk.tasks.create({
+				title: "Implement Go channel EventBroker",
+				state: "backlog",
+				objective: ms.key,
+				markdown: "# EventBroker Spec\n\n- Buffered per-workspace channels"
+			});
+			const docBefore = flowsk.tasks.getDoc(t1.key);
+			flowsk.tasks.setDoc(t1.key, docBefore.markdown + "\n- Heartbeat ping frames");
+			const mdTasks = flowsk.tasks.search("is:md");
+
+			return {
+				milestoneKind: updatedMs.kind,
+				milestoneStatus: updatedMs.status,
+				taskKey: t1.key,
+				hasDoc: t1.hasMarkdownDoc,
+				mdMatchCount: mdTasks.length,
+				projDoc: flowsk.projects.getDoc("CORE").hasMarkdownDoc
+			};
+		`,
+	})
+	if err != nil {
+		t.Fatalf("Committed Execute failed: %v", err)
+	}
+	for _, want := range []string{`"milestoneKind":"milestone"`, `"milestoneStatus":"at_risk"`, `"mdMatchCount":1`, `"projDoc":true`} {
+		if !strings.Contains(commitRes.Summary, want) {
+			t.Fatalf("expected %s in summary, got:\n%s", want, commitRes.Summary)
+		}
+	}
+
+	scanAfterCommit, err := store.ScanTaskMarkdown(ctx, wsID)
+	if err != nil || len(scanAfterCommit.ValidIDs) != 1 {
+		t.Fatalf("expected 1 persisted task .md file on disk, got %+v (err=%v)", scanAfterCommit, err)
+	}
+	diskContent, err := store.ReadTaskMarkdown(ctx, wsID, scanAfterCommit.ValidIDs[0])
+	if err != nil || !strings.Contains(diskContent, "Heartbeat ping frames") {
+		t.Fatalf("unexpected persisted task markdown content: %q (err=%v)", diskContent, err)
 	}
 }

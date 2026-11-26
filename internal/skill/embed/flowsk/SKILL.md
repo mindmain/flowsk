@@ -17,21 +17,23 @@ Always use the **`flowsk` MCP server** tools instead of shelling out to the CLI 
 2. `flowsk_search` — Query tasks, goals, or SDK docs (`state:ready is:unclaimed`, `ext:CU-869abc`, `#backend`, `@agent`, `type:sdk`).
 3. `flowsk_execute` — Run ES6 JavaScript against the `flowsk` SDK inside **one atomic ACID transaction** (`dry_run: true` to simulate):
    ```js
-   // Import/sync an external ticket, decompose subtasks, and claim the first ready step:
+   // Import/sync an external ticket, decompose subtasks with attached .md specs, and claim the first ready step:
    const epic = flowsk.tasks.upsertExternal({
      externalId: "CU-869abc",
      title: "Implement webhook signature verifier",
      priority: "high",
-     tags: ["security", "api"]
+     tags: ["security", "api"],
+     markdown: "# Webhook Verifier Spec\n\n- Verify X-Signature HMAC-SHA256\n- Reject timestamps > 300s"
    });
    const sub = flowsk.tasks.create({
      title: "Add HMAC-SHA256 middleware tests",
      parent: epic.key,
-     priority: "high"
+     priority: "high",
+     markdown: "## Test Matrix\n\n1. Valid signature\n2. Tampered body\n3. Expired timestamp"
    });
    return flowsk.tasks.claim(sub.key, 1800);
    ```
-4. `flowsk_language_guide` — Retrieve exact `flowsk.*` TypeScript signatures on demand.
+4. `flowsk_language_guide` — Retrieve exact `flowsk.*` TypeScript signatures (including `flowsk.tasks.getDoc` / `setDoc` and `flowsk.goals.*`) on demand.
 
 If the `flowsk` MCP server is not available in your tool list, run `flowsk install --yes` (or inspect snippets via `flowsk mcp guide`) to register `flowsk mcp serve --transport stdio` before falling back to the CLI.
 

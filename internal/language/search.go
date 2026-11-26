@@ -68,6 +68,9 @@ type SearchQuery struct {
 	// Claimed optionally filters tasks by active claim lease presence (`true` / `false`).
 	Claimed *bool
 
+	// HasMarkdownDoc optionally filters tasks by extended Markdown document presence (`is:md` / `has:md`).
+	HasMarkdownDoc *bool
+
 	// Terms holds lowercase free-text keywords and quoted phrases that must all
 	// appear across the candidate entity's searchable text fields.
 	Terms []string
@@ -212,22 +215,29 @@ declare const flowsk: {
     list(): Project[];
     get(slugOrKey?: string): Project;
     create(in: { key: string; name: string; slug?: string; description?: string }): Project;
+    getDoc(slugOrKey?: string): { id: string; key: string; slug: string; markdown: string; hasMarkdownDoc: boolean };
+    setDoc(slugOrKey: string, markdown: string): Project;
+    deleteDoc(slugOrKey?: string): Project;
   };
   goals: { // alias: flowsk.objectives
     list(filter?: string): Goal[];
-    create(in: { title: string; slug?: string; summary?: string; priority?: number | "urgent" | "high" | "medium" | "low"; targetDate?: string }): Goal;
+    create(in: { title: string; kind?: "goal" | "milestone" | "cycle"; status?: "planned" | "active" | "at_risk"; slug?: string; summary?: string; priority?: number | "urgent" | "high" | "medium" | "low"; targetDate?: string; successCriteria?: string[] }): Goal;
+    update(slugOrId: string, patch: { title?: string; kind?: "goal" | "milestone" | "cycle"; status?: "planned" | "active" | "at_risk" | "achieved" | "dropped"; summary?: string; priority?: number | string; targetDate?: string; successCriteria?: string[] }): Goal;
     close(slugOrId: string, note?: string): Goal;
   };
   tasks: {
     list(filter?: string | { state?: string; tag?: string; objective?: string; externalId?: string; actor?: string; blocked?: boolean; limit?: number }): Task[];
-    search(query: string): Task[]; // e.g. "state:done #storage ext:CU-123" or "is:open is:unclaimed"
+    search(query: string): Task[]; // e.g. "state:done #storage ext:CU-123" or "is:open is:unclaimed is:md"
     ready(limit?: number): Task[];
     get(keyOrId: string): TaskDetail;
     getByExternal(externalId: string, project?: string): TaskDetail | null;
     next(opts?: { claim?: boolean; ttlSeconds?: number }): Task | null;
-    create(in: { title: string; externalId?: string; description?: string; priority?: number | "urgent" | "high" | "medium" | "low"; state?: string; objective?: string; parent?: string; tags?: string[]; dependsOn?: string[]; acceptance?: string | string[] }): Task;
-    upsertExternal(in: { externalId: string; project?: string; title: string; description?: string; priority?: number | "urgent" | "high" | "medium" | "low"; state?: string; objective?: string; parent?: string; tags?: string[]; dependsOn?: string[]; acceptance?: string | string[] }): TaskDetail;
-    update(keyOrId: string, patch: { title?: string; externalId?: string; description?: string; priority?: number | string; tags?: string[]; acceptance?: string | string[]; objective?: string }): Task;
+    create(in: { title: string; externalId?: string; description?: string; markdown?: string; priority?: number | "urgent" | "high" | "medium" | "low"; state?: string; objective?: string; parent?: string; tags?: string[]; dependsOn?: string[]; acceptance?: string | string[] }): Task;
+    upsertExternal(in: { externalId: string; project?: string; title: string; description?: string; markdown?: string; priority?: number | "urgent" | "high" | "medium" | "low"; state?: string; objective?: string; parent?: string; tags?: string[]; dependsOn?: string[]; acceptance?: string | string[] }): TaskDetail;
+    update(keyOrId: string, patch: { title?: string; externalId?: string; description?: string; markdown?: string; priority?: number | string; tags?: string[]; acceptance?: string | string[]; objective?: string }): Task;
+    getDoc(keyOrId: string): { id: string; key: string; markdown: string; hasMarkdownDoc: boolean };
+    setDoc(keyOrId: string, markdown: string): TaskDetail;
+    deleteDoc(keyOrId: string): TaskDetail;
     move(keyOrId: string, state: string, note?: string): Task;
     done(keyOrId: string, note?: string): Task;
     claim(keyOrId: string, ttlSeconds?: number): Task;
@@ -326,6 +336,34 @@ func CodeModeSDKCatalog() []SDKMethodDoc {
 			Signature: "flowsk.tasks.comment(keyOrId: string, body: string, kind?: string): Comment",
 			Summary:   "Appends an immutable progress, decision, handoff, blocker, or note comment to a task.",
 			Example:   `flowsk.tasks.comment("FLW-1", "Verified WAL checkpointing", "progress");`,
+		},
+		{
+			Name:      "flowsk.tasks.getDoc",
+			Category:  "tasks",
+			Signature: "flowsk.tasks.getDoc(keyOrId: string): { id: string, key: string, markdown: string, hasMarkdownDoc: boolean }",
+			Summary:   "Reads the extended Markdown document (<task_id>.md) attached to a task inside ~/.flowsk/tasks.",
+			Example:   `return flowsk.tasks.getDoc("FLW-1");`,
+		},
+		{
+			Name:      "flowsk.tasks.setDoc",
+			Category:  "tasks",
+			Signature: "flowsk.tasks.setDoc(keyOrId: string, markdown: string): Task",
+			Summary:   "Creates or updates the extended Markdown specification file (<task_id>.md) attached to a task atomically.",
+			Example:   `flowsk.tasks.setDoc("FLW-1", "# Design Spec\n\n- Zero host paths");`,
+		},
+		{
+			Name:      "flowsk.goals.update",
+			Category:  "goals",
+			Signature: "flowsk.goals.update(slugOrId: string, { title?, kind?, status?, summary?, priority?, targetDate?, successCriteria? }): Goal",
+			Summary:   "Updates metadata, status (planned, active, at_risk, achieved, dropped), or success criteria of a goal/milestone.",
+			Example:   `flowsk.goals.update("launch-v1", { status: "at_risk", summary: "Waiting on security review" });`,
+		},
+		{
+			Name:      "flowsk.projects.setDoc",
+			Category:  "projects",
+			Signature: "flowsk.projects.setDoc(slugOrKey: string, markdown: string): Project",
+			Summary:   "Creates or updates the extended Markdown charter (<project_id>.md) inside ~/.flowsk/projects.",
+			Example:   `flowsk.projects.setDoc("CORE", "# Core Platform Charter\n\nStrict 3-layer architecture.");`,
 		},
 		{
 			Name:      "flowsk.goals.create",
@@ -450,9 +488,20 @@ func applyQualifier(q *SearchQuery, key, val string) bool {
 			case "unclaimed", "free":
 				c := false
 				q.Claimed = &c
+			case "md", "doc", "markdown":
+				md := true
+				q.HasMarkdownDoc = &md
 			}
 		}
 		return true
+	case "has":
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "md", "doc", "markdown":
+			md := true
+			q.HasMarkdownDoc = &md
+			return true
+		}
+		return false
 	case "label", "tag", "labels", "tags":
 		for _, part := range strings.Split(val, ",") {
 			if t := strings.ToLower(strings.TrimSpace(part)); t != "" {
