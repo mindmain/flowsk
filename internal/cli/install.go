@@ -1,7 +1,8 @@
 // File install.go implements `flowsk install` with an interactive 3-stage Lip Gloss +
 // Bubble Tea TUI (Skill targets -> MCP server targets -> Review & Confirm) that installs
 // both the embedded Flowsk `SKILL.md` and the `flowsk` stdio MCP server together,
-// defaulting to Universal (`~/.agents`) for Skill and Universal (all detected clients) for MCP.
+// pre-selecting ONLY Universal Agents (`~/.agents/skills/flowsk/SKILL.md` and
+// `~/.agents/mcp.json`) by default while leaving all other providers optional.
 package cli
 
 import (
@@ -17,7 +18,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Lip Gloss palette shared across `flowsk install`, `flowsk doctor`, and `flowsk update`.
+// Lip Gloss palette shared across `flowsk install`, `flowsk uninstall`, `flowsk doctor`, and `flowsk update`.
 var (
 	tuiTitleBadgeStyle = lipgloss.NewStyle().
 				Bold(true).
@@ -87,7 +88,6 @@ type InstallTUIModel struct {
 	statuses      []skill.ProviderStatus
 	mcpStatuses   []skill.ProviderStatus
 	selectedSkill map[string]bool
-	universalMCP  bool
 	selectedMCP   map[string]bool
 	skillCursor   int
 	mcpCursor     int
@@ -99,21 +99,31 @@ type InstallTUIModel struct {
 }
 
 // NewInstallTUIModel constructs a 3-stage Bubble Tea model (Skill -> MCP -> Confirm)
-// defaulting to Universal (`~/.agents`) for Skill and Universal (all detected clients) for MCP.
+// defaulting to ONLY Universal Agents (`~/.agents`) pre-selected for both Skill and MCP.
 func NewInstallTUIModel(statuses []skill.ProviderStatus, preselectedSkillIDs []string) *InstallTUIModel {
 	return NewInstallTUIModelWithMCP(statuses, preselectedSkillIDs, nil)
 }
 
 // NewInstallTUIModelWithMCP constructs a 3-stage Bubble Tea model with optional
-// pre-selected Skill provider IDs and MCP provider IDs (including `"universal"`).
+// pre-selected Skill provider IDs and MCP provider IDs.
 func NewInstallTUIModelWithMCP(statuses []skill.ProviderStatus, preselectedSkillIDs, preselectedMCPIDs []string) *InstallTUIModel {
 	selectedSkill := make(map[string]bool, len(statuses))
 	if len(preselectedSkillIDs) > 0 {
 		for _, id := range preselectedSkillIDs {
-			selectedSkill[strings.ToLower(strings.TrimSpace(id))] = true
+			tok := strings.ToLower(strings.TrimSpace(id))
+			if tok == "universal" {
+				tok = skill.ProviderAgents
+			}
+			if tok == "all" {
+				for _, st := range statuses {
+					selectedSkill[st.Target.ID] = true
+				}
+			} else if tok != "" {
+				selectedSkill[tok] = true
+			}
 		}
 	} else {
-		// Default: ONLY Universal Agents (~/.agents) is pre-selected; the user opts into extras.
+		// Default: ONLY Universal Agents (~/.agents/skills/flowsk/SKILL.md) is pre-selected.
 		selectedSkill[skill.ProviderAgents] = true
 	}
 
@@ -125,36 +135,29 @@ func NewInstallTUIModelWithMCP(statuses []skill.ProviderStatus, preselectedSkill
 	}
 
 	selectedMCP := make(map[string]bool, len(mcpStatuses))
-	universalMCP := false
 	if len(preselectedMCPIDs) > 0 {
 		for _, raw := range preselectedMCPIDs {
 			token := strings.ToLower(strings.TrimSpace(raw))
-			switch token {
-			case skill.MCPUniversalID, "detected":
-				universalMCP = true
-			case "all":
+			if token == "universal" {
+				token = skill.ProviderAgents
+			}
+			if token == "all" {
 				for _, st := range mcpStatuses {
 					selectedMCP[st.Target.ID] = true
 				}
-			default:
-				if token != "" {
-					selectedMCP[token] = true
-				}
+			} else if token != "" {
+				selectedMCP[token] = true
 			}
 		}
-		if universalMCP {
-			clear(selectedMCP)
-		}
 	} else {
-		// Default: Universal MCP option (all detected MCP-capable clients) is pre-selected.
-		universalMCP = true
+		// Default: ONLY Universal Agents (~/.agents/mcp.json) is pre-selected; other providers stay unchecked.
+		selectedMCP[skill.ProviderAgents] = true
 	}
 
 	return &InstallTUIModel{
 		statuses:      statuses,
 		mcpStatuses:   mcpStatuses,
 		selectedSkill: selectedSkill,
-		universalMCP:  universalMCP,
 		selectedMCP:   selectedMCP,
 		stage:         installStageSkill,
 	}
@@ -175,11 +178,6 @@ func (m *InstallTUIModel) Canceled() bool {
 	return m == nil || m.canceled || !m.confirmed
 }
 
-// UniversalMCPSelected reports whether the "Universal (all detected clients)" MCP option is active.
-func (m *InstallTUIModel) UniversalMCPSelected() bool {
-	return m != nil && m.universalMCP
-}
-
 // SelectedTargets returns the ordered slice of Skill ProviderTargets chosen by the user.
 func (m *InstallTUIModel) SelectedTargets() []skill.ProviderTarget {
 	if m == nil {
@@ -194,14 +192,10 @@ func (m *InstallTUIModel) SelectedTargets() []skill.ProviderTarget {
 	return out
 }
 
-// SelectedMCPTargets returns the ordered slice of MCP-capable ProviderTargets chosen by
-// the user (resolving the Universal bundle to all detected MCP clients when active).
+// SelectedMCPTargets returns the ordered slice of MCP ProviderTargets chosen by the user.
 func (m *InstallTUIModel) SelectedMCPTargets() []skill.ProviderTarget {
 	if m == nil {
 		return nil
-	}
-	if m.universalMCP {
-		return skill.ResolveUniversalMCPTargets(m.statuses)
 	}
 	var out []skill.ProviderTarget
 	for _, st := range m.mcpStatuses {
@@ -263,7 +257,6 @@ func (m *InstallTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case installStageMCP:
-		totalRows := 1 + len(m.mcpStatuses) // Row 0 = Universal, Rows 1..N = individual MCP clients
 		switch key {
 		case "q", "esc":
 			m.canceled = true
@@ -273,41 +266,28 @@ func (m *InstallTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.validation = ""
 			m.stage = installStageSkill
 		case "up", "k":
-			if totalRows > 0 {
-				m.mcpCursor = (m.mcpCursor - 1 + totalRows) % totalRows
+			if len(m.mcpStatuses) > 0 {
+				m.mcpCursor = (m.mcpCursor - 1 + len(m.mcpStatuses)) % len(m.mcpStatuses)
 			}
 		case "down", "j":
-			if totalRows > 0 {
-				m.mcpCursor = (m.mcpCursor + 1) % totalRows
+			if len(m.mcpStatuses) > 0 {
+				m.mcpCursor = (m.mcpCursor + 1) % len(m.mcpStatuses)
 			}
 		case " ", "x":
-			m.validation = ""
-			if m.mcpCursor == 0 {
-				m.universalMCP = !m.universalMCP
-				if m.universalMCP {
-					clear(m.selectedMCP)
-				}
-			} else if idx := m.mcpCursor - 1; idx >= 0 && idx < len(m.mcpStatuses) {
-				id := m.mcpStatuses[idx].Target.ID
-				if m.universalMCP {
-					// Switching from Universal bundle to explicit per-client choice.
-					m.universalMCP = false
-					clear(m.selectedMCP)
-					m.selectedMCP[id] = true
-				} else {
-					m.selectedMCP[id] = !m.selectedMCP[id]
-				}
+			if m.mcpCursor >= 0 && m.mcpCursor < len(m.mcpStatuses) {
+				id := m.mcpStatuses[m.mcpCursor].Target.ID
+				m.selectedMCP[id] = !m.selectedMCP[id]
+				m.validation = ""
 			}
 		case "a":
-			m.validation = ""
-			allIndividual := !m.universalMCP && len(m.SelectedMCPTargets()) == len(m.mcpStatuses)
-			m.universalMCP = false
+			allSelected := len(m.SelectedMCPTargets()) == len(m.mcpStatuses)
 			for _, st := range m.mcpStatuses {
-				m.selectedMCP[st.Target.ID] = !allIndividual
+				m.selectedMCP[st.Target.ID] = !allSelected
 			}
+			m.validation = ""
 		case "enter":
 			if len(m.SelectedMCPTargets()) == 0 {
-				m.validation = "Select Universal or at least one MCP client with Space (Skill and MCP install together)."
+				m.validation = "Select at least one MCP target with Space (Skill and MCP install together)."
 				return m, nil
 			}
 			m.validation = ""
@@ -374,7 +354,7 @@ func (m *InstallTUIModel) renderSkillStage(shortHash string) string {
 
 	var body strings.Builder
 	body.WriteString(header + "\n\n")
-	body.WriteString("Select where the Flowsk SKILL.md should be installed (Universal is selected by default):\n\n")
+	body.WriteString("Select where the Flowsk SKILL.md should be installed (Universal ~/.agents is selected by default):\n\n")
 
 	for i, st := range m.statuses {
 		cursor := "  "
@@ -409,52 +389,20 @@ func (m *InstallTUIModel) renderMCPStage() string {
 
 	var body strings.Builder
 	body.WriteString(header + "\n\n")
-	body.WriteString("Select where the Flowsk MCP server should be registered (Universal is selected by default):\n\n")
+	body.WriteString("Select where the Flowsk MCP server should be registered (Universal ~/.agents is selected by default):\n\n")
 
-	universalResolved := skill.ResolveUniversalMCPTargets(m.statuses)
-	universalIDs := make(map[string]bool, len(universalResolved))
-	universalNames := make([]string, 0, len(universalResolved))
-	for _, t := range universalResolved {
-		universalIDs[t.ID] = true
-		universalNames = append(universalNames, t.Name)
-	}
-
-	// Row 0: Universal MCP option.
-	{
-		cursor := "  "
-		label := "Universal (All Detected Clients)"
-		if m.mcpCursor == 0 {
-			cursor = tuiCursorStyle.Render("▸ ")
-			label = tuiCursorStyle.Render(label)
-		}
-		check := tuiMutedStyle.Render("[ ]")
-		if m.universalMCP {
-			check = tuiOKStyle.Render("[✓]")
-		}
-		badge := tuiInfoStyle.Render(fmt.Sprintf("• %d client(s)", len(universalResolved)))
-		fmt.Fprintf(&body, "%s%s %-30s %s\n", cursor, check, label, badge)
-		fmt.Fprintf(&body, "      %s\n", tuiMutedStyle.Render("Covers: "+strings.Join(universalNames, ", ")))
-	}
-
-	// Rows 1..N: Individual MCP-capable clients.
 	for i, st := range m.mcpStatuses {
-		rowIdx := i + 1
 		cursor := "  "
 		name := st.Target.Name
-		if m.mcpCursor == rowIdx {
+		if i == m.mcpCursor {
 			cursor = tuiCursorStyle.Render("▸ ")
 			name = tuiCursorStyle.Render(name)
 		}
-
 		check := tuiMutedStyle.Render("[ ]")
-		switch {
-		case m.universalMCP && universalIDs[st.Target.ID]:
-			check = tuiInfoStyle.Render("[•]")
-		case !m.universalMCP && m.selectedMCP[st.Target.ID]:
+		if m.selectedMCP[st.Target.ID] {
 			check = tuiOKStyle.Render("[✓]")
 		}
-
-		badge := formatMCPTUIBadge(st, m.universalMCP && universalIDs[st.Target.ID])
+		badge := formatMCPTUIBadge(st)
 		fmt.Fprintf(&body, "%s%s %-30s %s\n", cursor, check, name, badge)
 		fmt.Fprintf(&body, "      %s\n", tuiMutedStyle.Render(shortenHomePath(st.Target.MCPConfigPath)))
 	}
@@ -489,11 +437,7 @@ func (m *InstallTUIModel) renderConfirmStage(shortHash string) string {
 		)
 	}
 
-	mcpModeLabel := ""
-	if m.universalMCP {
-		mcpModeLabel = " [Universal]"
-	}
-	fmt.Fprintf(&body, "\n2. Flowsk MCP Server (stdio)%s → %d client config(s):\n", mcpModeLabel, len(mcpTargets))
+	fmt.Fprintf(&body, "\n2. Flowsk MCP Server (stdio) → %d client config(s):\n", len(mcpTargets))
 	for _, t := range mcpTargets {
 		fmt.Fprintf(&body, "   %s %-28s %s\n",
 			tuiInfoStyle.Render("•"),
@@ -526,7 +470,7 @@ func formatSkillTUIBadge(st skill.ProviderStatus) string {
 	case st.Installed && !st.UpToDate:
 		return tuiWarnStyle.Render("↻ update (" + skill.ShortHash(st.InstalledHash) + " → " + skill.ShortHash(st.ExpectedHash) + ")")
 	case st.Target.ID == skill.ProviderAgents:
-		return tuiInfoStyle.Render("★ default universal skill")
+		return tuiInfoStyle.Render("★ default universal")
 	case st.Detected:
 		return tuiInfoStyle.Render("• detected on machine")
 	default:
@@ -534,18 +478,16 @@ func formatSkillTUIBadge(st skill.ProviderStatus) string {
 	}
 }
 
-func formatMCPTUIBadge(st skill.ProviderStatus, viaUniversal bool) string {
-	suffix := ""
-	if viaUniversal {
-		suffix = " " + tuiInfoStyle.Render("(via Universal)")
-	}
+func formatMCPTUIBadge(st skill.ProviderStatus) string {
 	switch {
 	case st.MCPConfigured:
-		return tuiOKStyle.Render("✓ mcp configured") + suffix
+		return tuiOKStyle.Render("✓ mcp configured")
+	case st.Target.ID == skill.ProviderAgents:
+		return tuiInfoStyle.Render("★ default universal")
 	case st.Detected:
-		return tuiInfoStyle.Render("• detected on machine") + suffix
+		return tuiInfoStyle.Render("• detected on machine")
 	default:
-		return tuiMutedStyle.Render("· not detected") + suffix
+		return tuiMutedStyle.Render("· not detected")
 	}
 }
 
@@ -581,20 +523,19 @@ by SHA-256 hash) AND the Flowsk stdio MCP server ('flowsk mcp serve --transport 
 together across your AI coding agents.
 
 Default selections:
-  1. Skill: 'Universal Agents (~/.agents)' (~/.agents/skills/flowsk/SKILL.md) is pre-selected
-     by default; you can optionally check additional agent-specific directories.
-  2. MCP Server: 'Universal (All Detected Clients)' is pre-selected by default so every
-     detected AI client config (~/.claude.json, ~/.codex/config.toml,
-     ~/.gemini/antigravity/mcp_config.json, ~/.gemini/settings.json, ~/.cursor/mcp.json)
-     receives 'flowsk' non-destructively, or you can pick individual clients.`,
-		Example: `  # Launch interactive 3-stage TUI (Skill -> MCP -> Confirm) with Universal defaults
+  1. Skill: ONLY 'Universal Agents (~/.agents)' (~/.agents/skills/flowsk/SKILL.md) is
+     pre-selected by default; you can manually select additional providers if needed.
+  2. MCP Server: ONLY 'Universal Agents (~/.agents)' (~/.agents/mcp.json) is pre-selected
+     by default; you can manually select Claude Code, OpenAI Codex, Google Antigravity,
+     Gemini CLI, or Cursor to write into their respective global config files.`,
+		Example: `  # Launch interactive 3-stage TUI (Skill -> MCP -> Confirm) with Universal (~/.agents) defaults
   flowsk install
 
-  # Non-interactive install using Universal defaults (Universal skill + all detected MCP clients)
+  # Non-interactive install into Universal (~/.agents/skills/flowsk/SKILL.md + ~/.agents/mcp.json)
   flowsk install --yes
 
-  # Explicit Skill and MCP targets for scripts or CI
-  flowsk install --providers agents --mcp-providers codex,antigravity --yes`,
+  # Explicit Skill and MCP targets
+  flowsk install --providers agents --mcp-providers agents,codex --yes`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
@@ -672,8 +613,7 @@ Default selections:
 				MCPItems:       make([]MCPInstallItemView, 0, len(chosenMCPs)),
 			}
 
-			// 1. Install Flowsk MCP server into selected client configuration files first
-			// so SkillInstallItemView.MCPConfigured reflects the live post-install state.
+			// 1. Register Flowsk MCP server in selected client configuration files first.
 			mcpConfiguredByID := make(map[string]bool, len(statuses))
 			for _, st := range statuses {
 				mcpConfiguredByID[st.Target.ID] = st.MCPConfigured
@@ -734,7 +674,7 @@ Default selections:
 
 	flags := cmd.Flags()
 	flags.StringSliceVarP(&providers, "providers", "p", nil, "Comma-separated Skill provider IDs (default: agents; supported: agents, claude, codex, antigravity, gemini, cursor, all)")
-	flags.StringSliceVar(&mcpProviders, "mcp-providers", nil, "Comma-separated MCP provider IDs (default: universal; supported: universal, claude, codex, antigravity, gemini, cursor, all)")
+	flags.StringSliceVar(&mcpProviders, "mcp-providers", nil, "Comma-separated MCP provider IDs (default: agents; supported: agents, claude, codex, antigravity, gemini, cursor, all)")
 	flags.StringVar(&mcpCommand, "mcp-command", "", "Override executable path written into MCP client configs (defaults to resolved flowsk binary path)")
 	flags.BoolVar(&all, "all", false, "Install Flowsk SKILL.md and MCP server across all supported AI provider locations")
 	flags.BoolVarP(&assumeYes, "yes", "y", false, "Confirm installation without launching interactive prompts")
@@ -746,11 +686,11 @@ Default selections:
 
 func resolveInstallPreselections(homeDir string, statuses []skill.ProviderStatus, all bool, providers, mcpProviders []string) ([]string, []string, error) {
 	if all {
-		var allSkills []string
+		var allIDs []string
 		for _, st := range statuses {
-			allSkills = append(allSkills, st.Target.ID)
+			allIDs = append(allIDs, st.Target.ID)
 		}
-		return allSkills, []string{"all"}, nil
+		return allIDs, allIDs, nil
 	}
 
 	var preselectedSkill []string
@@ -768,29 +708,15 @@ func resolveInstallPreselections(homeDir string, statuses []skill.ProviderStatus
 
 	var preselectedMCP []string
 	if len(mcpProviders) > 0 {
-		hasUniversal := false
-		for _, raw := range mcpProviders {
-			for _, part := range strings.Split(raw, ",") {
-				tok := strings.ToLower(strings.TrimSpace(part))
-				if tok == skill.MCPUniversalID || tok == "detected" {
-					hasUniversal = true
-				}
-			}
-		}
 		resolvedMCP, err := skill.ResolveMCPProvidersByIDs(homeDir, mcpProviders)
 		if err != nil {
 			return nil, nil, err
 		}
-		if hasUniversal && len(mcpProviders) == 1 && !strings.Contains(mcpProviders[0], ",") {
-			preselectedMCP = []string{skill.MCPUniversalID}
-		} else {
-			for _, t := range resolvedMCP {
-				preselectedMCP = append(preselectedMCP, t.ID)
-			}
+		for _, t := range resolvedMCP {
+			preselectedMCP = append(preselectedMCP, t.ID)
 		}
 	} else if len(resolvedSkillTargets) > 0 {
-		// When --providers was explicitly passed without --mcp-providers, mirror any
-		// MCP-capable providers chosen; if only `agents` was passed, keep Universal MCP.
+		// When --providers was explicitly passed without --mcp-providers, mirror those exact providers.
 		for _, t := range resolvedSkillTargets {
 			if t.SupportsMCP() {
 				preselectedMCP = append(preselectedMCP, t.ID)

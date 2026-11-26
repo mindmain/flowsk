@@ -2067,6 +2067,58 @@ type InstallSkillView struct {
 	MCPItems []MCPInstallItemView `json:"mcp_items,omitempty"`
 }
 
+// SkillUninstallItemView records the result of removing `SKILL.md` from one AI provider.
+type SkillUninstallItemView struct {
+	// ProviderID is the canonical provider slug.
+	ProviderID string `json:"provider_id"`
+
+	// ProviderName is the human-readable AI tool name.
+	ProviderName string `json:"provider_name"`
+
+	// SkillPath is the target `SKILL.md` path inspected/removed.
+	SkillPath string `json:"skill_path"`
+
+	// Action is "removed" or "not_found".
+	Action string `json:"action"`
+}
+
+// MCPUninstallItemView records the result of removing the Flowsk MCP server from one AI client config.
+type MCPUninstallItemView struct {
+	// ProviderID is the canonical provider slug.
+	ProviderID string `json:"provider_id"`
+
+	// ProviderName is the human-readable AI client name.
+	ProviderName string `json:"provider_name"`
+
+	// ConfigPath is the configured MCP file path inspected/updated.
+	ConfigPath string `json:"config_path"`
+
+	// Action is "removed" or "not_found".
+	Action string `json:"action"`
+}
+
+// UninstallSkillView summarizes the execution of `flowsk uninstall` across both
+// global `SKILL.md` directories and client MCP server configuration files.
+type UninstallSkillView struct {
+	// RemovedSkillCount counts deleted `SKILL.md` files.
+	RemovedSkillCount int `json:"removed_skill_count"`
+
+	// NotFoundSkillCount counts selected skill paths that were already absent.
+	NotFoundSkillCount int `json:"not_found_skill_count"`
+
+	// SkillItems lists per-provider skill removal outcomes.
+	SkillItems []SkillUninstallItemView `json:"skill_items,omitempty"`
+
+	// RemovedMCPCount counts removed `flowsk` MCP server entries.
+	RemovedMCPCount int `json:"removed_mcp_count"`
+
+	// NotFoundMCPCount counts selected MCP configs where `flowsk` was already absent.
+	NotFoundMCPCount int `json:"not_found_mcp_count"`
+
+	// MCPItems lists per-provider MCP removal outcomes.
+	MCPItems []MCPUninstallItemView `json:"mcp_items,omitempty"`
+}
+
 // DoctorCheckView represents one diagnostic subsystem check inside `flowsk doctor`.
 type DoctorCheckView struct {
 	// Name identifies the inspected subsystem ("home", "database", "migrations", "prune", "skills", "mcp").

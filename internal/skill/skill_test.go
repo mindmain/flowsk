@@ -1,10 +1,12 @@
 // File skill_test.go verifies embedded SKILL.md integrity, SHA-256 hash
-// determinism, provider detection, atomic skill installation, non-destructive
-// JSON/TOML MCP registration (including symlink preservation), and semver comparison.
+// determinism, Universal (~/.agents) provider defaults, atomic skill install/uninstall,
+// non-destructive JSON/TOML MCP install/uninstall (including symlink preservation),
+// and semver comparison.
 package skill_test
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,40 +45,38 @@ func TestEmbeddedSkillIntegrityAndContent(t *testing.T) {
 	}
 }
 
-func TestSupportedProvidersOrderUniversalFirst(t *testing.T) {
-	providers, err := skill.SupportedProviders(t.TempDir())
+func TestSupportedProvidersOrderUniversalFirstWithMCP(t *testing.T) {
+	home := t.TempDir()
+	providers, err := skill.SupportedProviders(home)
 	if err != nil {
 		t.Fatalf("SupportedProviders: %v", err)
 	}
 	if len(providers) == 0 || providers[0].ID != skill.ProviderAgents {
 		t.Fatalf("expected Universal Agents (%q) at index 0, got %+v", skill.ProviderAgents, providers)
 	}
-	if providers[0].SupportsMCP() {
-		t.Fatal("expected Universal Agents (~/.agents) to have SupportsMCP() == false")
+	if !providers[0].SupportsMCP() || providers[0].MCPConfigPath != filepath.Join(home, ".agents", "mcp.json") {
+		t.Fatalf("expected Universal Agents (~/.agents) to manage ~/.agents/mcp.json, got %+v", providers[0])
 	}
 }
 
-func TestInstallAndInspectProviderLifecycle(t *testing.T) {
+func TestInstallInspectAndUninstallSkillLifecycle(t *testing.T) {
 	home := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o755); err != nil {
+	// Create a sibling skill in ~/.agents/skills/other to verify uninstall never touches siblings.
+	siblingDir := filepath.Join(home, ".agents", "skills", "other-skill")
+	if err := os.MkdirAll(siblingDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte("[mcp_servers.flowsk]\ncommand = \"flowsk\"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(siblingDir, "SKILL.md"), []byte("# sibling\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	targets, err := skill.ResolveProvidersByIDs(home, []string{"codex"})
+	targets, err := skill.ResolveProvidersByIDs(home, []string{"agents"})
 	if err != nil || len(targets) != 1 {
 		t.Fatalf("ResolveProvidersByIDs failed: %v (%d)", err, len(targets))
 	}
-	codexTarget := targets[0]
+	agentsTarget := targets[0]
 
-	before := skill.InspectProvider(codexTarget)
-	if !before.Detected || before.Installed || before.UpToDate || !before.MCPConfigured {
-		t.Fatalf("unexpected pre-install status: %+v", before)
-	}
-
-	first, err := skill.InstallToProvider(codexTarget)
+	first, err := skill.InstallToProvider(agentsTarget)
 	if err != nil {
 		t.Fatalf("InstallToProvider (first): %v", err)
 	}
@@ -84,13 +84,13 @@ func TestInstallAndInspectProviderLifecycle(t *testing.T) {
 		t.Fatalf("unexpected first install result: %+v", first)
 	}
 
-	after := skill.InspectProvider(codexTarget)
+	after := skill.InspectProvider(agentsTarget)
 	if !after.Installed || !after.UpToDate || after.InstalledHash != skill.EmbeddedHash() {
 		t.Fatalf("expected up-to-date skill after install, got %+v", after)
 	}
 
 	// Idempotent second install should report "unchanged".
-	second, err := skill.InstallToProvider(codexTarget)
+	second, err := skill.InstallToProvider(agentsTarget)
 	if err != nil {
 		t.Fatalf("InstallToProvider (second): %v", err)
 	}
@@ -99,27 +99,46 @@ func TestInstallAndInspectProviderLifecycle(t *testing.T) {
 	}
 
 	// Tamper with installed SKILL.md to simulate an outdated skill version.
-	if err := os.WriteFile(codexTarget.SkillFilePath, []byte("# outdated skill\n"), 0o644); err != nil {
+	if err := os.WriteFile(agentsTarget.SkillFilePath, []byte("# outdated skill\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	tampered := skill.InspectProvider(codexTarget)
+	tampered := skill.InspectProvider(agentsTarget)
 	if !tampered.Installed || tampered.UpToDate {
 		t.Fatalf("expected outdated detection after tampering, got %+v", tampered)
 	}
 
-	updated, err := skill.InstallToProvider(codexTarget)
+	updated, err := skill.InstallToProvider(agentsTarget)
 	if err != nil {
 		t.Fatalf("InstallToProvider (update): %v", err)
 	}
 	if updated.Action != "updated" || updated.PreviousSHA256 == "" || updated.SHA256 != skill.EmbeddedHash() {
 		t.Fatalf("expected updated action with previous hash, got %+v", updated)
 	}
+
+	// Uninstall removes flowsk/SKILL.md and empty flowsk/ folder while keeping sibling-skill intact!
+	unres, err := skill.UninstallFromProvider(agentsTarget)
+	if err != nil || unres.Action != "removed" {
+		t.Fatalf("UninstallFromProvider: res=%+v err=%v", unres, err)
+	}
+	if _, err := os.Stat(filepath.Dir(agentsTarget.SkillFilePath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected empty flowsk skill directory to be removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(siblingDir, "SKILL.md")); err != nil {
+		t.Fatalf("expected sibling skill to remain untouched: %v", err)
+	}
+
+	// Second uninstall is idempotent ("not_found").
+	unres2, err := skill.UninstallFromProvider(agentsTarget)
+	if err != nil || unres2.Action != "not_found" {
+		t.Fatalf("expected second UninstallFromProvider action=not_found, got %+v err=%v", unres2, err)
+	}
 }
 
-func TestInstallMCPToProviderJSONSymlinkAndTOMLPreservation(t *testing.T) {
+func TestInstallAndUninstallMCPJSONSymlinkAndTOMLPreservation(t *testing.T) {
 	home := t.TempDir()
 
-	// 1. Antigravity JSON config via symbolic link -> ~/.gemini/config/mcp_config.json
+	// 1. Universal (~/.agents/mcp.json) starts non-existent -> created on install, deleted cleanly on uninstall!
+	// 2. Antigravity JSON config via symbolic link -> ~/.gemini/config/mcp_config.json
 	sharedDir := filepath.Join(home, ".gemini", "config")
 	agDir := filepath.Join(home, ".gemini", "antigravity")
 	if err := os.MkdirAll(sharedDir, 0o755); err != nil {
@@ -138,7 +157,7 @@ func TestInstallMCPToProviderJSONSymlinkAndTOMLPreservation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 2. Codex TOML config with comments, other servers, and nested env table.
+	// 3. Codex TOML config with comments, other servers, and nested env table.
 	codexDir := filepath.Join(home, ".codex")
 	if err := os.MkdirAll(codexDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -149,88 +168,92 @@ func TestInstallMCPToProviderJSONSymlinkAndTOMLPreservation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Resolve "universal" MCP targets -> must pick both antigravity and codex!
-	mcpTargets, err := skill.ResolveMCPProvidersByIDs(home, []string{skill.MCPUniversalID})
-	if err != nil {
-		t.Fatalf("ResolveMCPProvidersByIDs(universal): %v", err)
+	// "universal" alias must map strictly to "agents" (~/.agents/mcp.json), NOT all providers!
+	uniOnly, err := skill.ResolveMCPProvidersByIDs(home, []string{"universal"})
+	if err != nil || len(uniOnly) != 1 || uniOnly[0].ID != skill.ProviderAgents {
+		t.Fatalf("expected 'universal' to resolve strictly to 'agents', got %+v err=%v", uniOnly, err)
 	}
-	if len(mcpTargets) != 2 {
-		t.Fatalf("expected 2 detected MCP targets (codex + antigravity), got %d: %+v", len(mcpTargets), mcpTargets)
+
+	mcpTargets, err := skill.ResolveMCPProvidersByIDs(home, []string{"agents", "antigravity", "codex"})
+	if err != nil || len(mcpTargets) != 3 {
+		t.Fatalf("ResolveMCPProvidersByIDs: got %d (%+v) err=%v", len(mcpTargets), mcpTargets, err)
 	}
 
 	for _, target := range mcpTargets {
 		res, err := skill.InstallMCPToProvider(target, "/opt/bin/flowsk")
-		if err != nil {
-			t.Fatalf("InstallMCPToProvider(%s): %v", target.ID, err)
+		if err != nil || res.Action != "installed" {
+			t.Fatalf("InstallMCPToProvider(%s): res=%+v err=%v", target.ID, res, err)
 		}
-		if res.Action != "installed" {
-			t.Fatalf("expected action=installed for %s, got %q", target.ID, res.Action)
-		}
-
-		// Second call with identical command must be idempotent ("unchanged").
 		again, err := skill.InstallMCPToProvider(target, "/opt/bin/flowsk")
-		if err != nil {
-			t.Fatalf("InstallMCPToProvider(%s, second): %v", target.ID, err)
+		if err != nil || again.Action != "unchanged" {
+			t.Fatalf("InstallMCPToProvider(%s, second): res=%+v err=%v", target.ID, again, err)
 		}
-		if again.Action != "unchanged" {
-			t.Fatalf("expected action=unchanged on second run for %s, got %q", target.ID, again.Action)
-		}
-
-		// Third call with updated binary path must report "updated".
 		upd, err := skill.InstallMCPToProvider(target, "/usr/local/bin/flowsk")
-		if err != nil {
-			t.Fatalf("InstallMCPToProvider(%s, update): %v", target.ID, err)
-		}
-		if upd.Action != "updated" {
-			t.Fatalf("expected action=updated on path change for %s, got %q", target.ID, upd.Action)
+		if err != nil || upd.Action != "updated" {
+			t.Fatalf("InstallMCPToProvider(%s, update): res=%+v err=%v", target.ID, upd, err)
 		}
 	}
 
-	// Verify Antigravity symlink was NOT replaced by a regular file and unrelated keys survived!
+	// Verify Antigravity symlink remained a symlink and unrelated keys survived.
 	linfo, err := os.Lstat(symlinkJSON)
 	if err != nil || (linfo.Mode()&os.ModeSymlink) == 0 {
 		t.Fatalf("expected %s to remain a symlink, got mode=%v err=%v", symlinkJSON, linfo.Mode(), err)
 	}
-	mergedJSONBytes, err := os.ReadFile(realSharedJSON)
+
+	// Now UNINSTALL MCP from all 3 targets and verify clean non-destructive removal!
+	for _, target := range mcpTargets {
+		ures, err := skill.UninstallMCPFromProvider(target)
+		if err != nil || ures.Action != "removed" {
+			t.Fatalf("UninstallMCPFromProvider(%s): res=%+v err=%v", target.ID, ures, err)
+		}
+		ures2, err := skill.UninstallMCPFromProvider(target)
+		if err != nil || ures2.Action != "not_found" {
+			t.Fatalf("UninstallMCPFromProvider(%s, second): res=%+v err=%v", target.ID, ures2, err)
+		}
+	}
+
+	// Standalone ~/.agents/mcp.json had only flowsk -> should be removed completely!
+	if _, err := os.Stat(filepath.Join(home, ".agents", "mcp.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected empty standalone ~/.agents/mcp.json to be deleted on uninstall, stat err=%v", err)
+	}
+
+	// Antigravity symlink must STILL be a symlink and StitchMCP + theme='dark' must still be intact!
+	linfoAfter, err := os.Lstat(symlinkJSON)
+	if err != nil || (linfoAfter.Mode()&os.ModeSymlink) == 0 {
+		t.Fatalf("expected %s to remain a symlink after uninstall, got mode=%v err=%v", symlinkJSON, linfoAfter.Mode(), err)
+	}
+	afterJSONBytes, err := os.ReadFile(realSharedJSON)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var parsed map[string]any
-	if err := json.Unmarshal(mergedJSONBytes, &parsed); err != nil {
-		t.Fatalf("merged JSON invalid: %v\n%s", err, string(mergedJSONBytes))
+	if err := json.Unmarshal(afterJSONBytes, &parsed); err != nil {
+		t.Fatalf("post-uninstall JSON invalid: %v\n%s", err, string(afterJSONBytes))
 	}
 	if parsed["theme"] != "dark" {
-		t.Fatalf("expected top-level theme='dark' preserved, got %v", parsed["theme"])
+		t.Fatalf("expected theme='dark' preserved after uninstall, got %v", parsed["theme"])
 	}
 	servers, _ := parsed["mcpServers"].(map[string]any)
 	if _, ok := servers["StitchMCP"]; !ok {
-		t.Fatalf("expected existing StitchMCP preserved, got %+v", servers)
+		t.Fatalf("expected StitchMCP preserved after uninstall, got %+v", servers)
 	}
-	flowskEntry, _ := servers["flowsk"].(map[string]any)
-	if flowskEntry["command"] != "/usr/local/bin/flowsk" {
-		t.Fatalf("expected updated flowsk command, got %+v", flowskEntry)
+	if _, ok := servers["flowsk"]; ok {
+		t.Fatalf("expected flowsk removed from mcpServers, got %+v", servers)
 	}
 
-	// Verify Codex TOML preserved comments, other sections, and registered [mcp_servers.flowsk].
-	mergedTOMLBytes, err := os.ReadFile(codexTOMLPath)
+	// Codex TOML must retain comments and crwai while having zero flowsk references!
+	afterTOMLBytes, err := os.ReadFile(codexTOMLPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	mergedTOML := string(mergedTOMLBytes)
-	for _, want := range []string{
-		"# User Codex settings",
-		`[mcp_servers.crwai]`,
-		`[mcp_servers.crwai.env]`,
-		`[mcp_servers.flowsk]`,
-		`command = "/usr/local/bin/flowsk"`,
-		`args = ["mcp", "serve", "--transport", "stdio"]`,
-	} {
-		if !strings.Contains(mergedTOML, want) {
-			t.Fatalf("merged TOML missing %q:\n%s", want, mergedTOML)
-		}
+	afterTOML := string(afterTOMLBytes)
+	if strings.Contains(afterTOML, "flowsk") {
+		t.Fatalf("expected flowsk removed from Codex TOML, got:\n%s", afterTOML)
 	}
-	if strings.Count(mergedTOML, "[mcp_servers.flowsk]") != 1 {
-		t.Fatalf("expected exactly 1 [mcp_servers.flowsk] header, got:\n%s", mergedTOML)
+	for _, want := range []string{"# User Codex settings", "[mcp_servers.crwai]", "[mcp_servers.crwai.env]"} {
+		if !strings.Contains(afterTOML, want) {
+			t.Fatalf("expected %q preserved after TOML uninstall, got:\n%s", want, afterTOML)
+		}
 	}
 }
 

@@ -36,10 +36,6 @@ const (
 
 	// ProviderCursor identifies Cursor global skills (`~/.cursor/skills`).
 	ProviderCursor = "cursor"
-
-	// MCPUniversalID is the virtual selector slug representing all detected MCP-capable
-	// AI clients on the current workstation (default MCP selection in `flowsk install`).
-	MCPUniversalID = "universal"
 )
 
 //go:embed embed/flowsk/SKILL.md
@@ -158,6 +154,15 @@ type InstallResult struct {
 	PreviousSHA256 string `json:"previous_sha256,omitempty"`
 }
 
+// UninstallResult summarizes removing `SKILL.md` from one ProviderTarget.
+type UninstallResult struct {
+	// Target is the inspected provider target.
+	Target ProviderTarget `json:"target"`
+
+	// Action is "removed" when `<SkillsDir>/flowsk/SKILL.md` existed and was deleted, or "not_found".
+	Action string `json:"action"`
+}
+
 // SupportedProviders returns the ordered catalog of supported AI coding agent
 // global skill locations rooted under homeDir (resolving `os.UserHomeDir()` when homeDir is empty).
 func SupportedProviders(homeDir string) ([]ProviderTarget, error) {
@@ -190,7 +195,7 @@ func SupportedProviders(homeDir string) ([]ProviderTarget, error) {
 	}
 
 	return []ProviderTarget{
-		mk(ProviderAgents, "Universal Agents (~/.agents)", "~/.agents/skills/flowsk/SKILL.md", ".agents", filepath.Join(".agents", "skills"), "", ""),
+		mk(ProviderAgents, "Universal Agents (~/.agents)", "~/.agents/skills/flowsk/SKILL.md", ".agents", filepath.Join(".agents", "skills"), filepath.Join(".agents", "mcp.json"), MCPFormatJSON),
 		mk(ProviderClaude, "Claude Code", "~/.claude/skills/flowsk/SKILL.md", ".claude", filepath.Join(".claude", "skills"), ".claude.json", MCPFormatJSON),
 		mk(ProviderCodex, "OpenAI Codex", "~/.codex/skills/flowsk/SKILL.md", ".codex", filepath.Join(".codex", "skills"), filepath.Join(".codex", "config.toml"), MCPFormatTOML),
 		mk(ProviderAntigravity, "Google Antigravity", "~/.gemini/antigravity/skills/flowsk/SKILL.md", filepath.Join(".gemini", "antigravity"), filepath.Join(".gemini", "antigravity", "skills"), filepath.Join(".gemini", "antigravity", "mcp_config.json"), MCPFormatJSON),
@@ -347,6 +352,32 @@ func InstallToProvider(target ProviderTarget) (InstallResult, error) {
 		Action:         action,
 		SHA256:         gotHash,
 		PreviousSHA256: prevHash,
+	}, nil
+}
+
+// UninstallFromProvider removes `<SkillsDir>/flowsk/SKILL.md` if present and
+// cleans up the `<SkillsDir>/flowsk` folder when empty, never touching sibling skills.
+func UninstallFromProvider(target ProviderTarget) (UninstallResult, error) {
+	if strings.TrimSpace(target.SkillFilePath) == "" {
+		return UninstallResult{}, errors.New("provider skill_file_path must not be empty")
+	}
+
+	if err := os.Remove(target.SkillFilePath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return UninstallResult{
+				Target: target,
+				Action: "not_found",
+			}, nil
+		}
+		return UninstallResult{}, fmt.Errorf("remove skill %s: %w", target.SkillFilePath, err)
+	}
+
+	// Best-effort removal of `<SkillsDir>/flowsk` only if now empty.
+	_ = os.Remove(filepath.Dir(target.SkillFilePath))
+
+	return UninstallResult{
+		Target: target,
+		Action: "removed",
 	}, nil
 }
 

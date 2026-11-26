@@ -68,6 +68,7 @@ Core Capabilities:
 	rootCmd.AddCommand(
 		newInitCommand(opts, deps),
 		newInstallCommand(opts, deps),
+		newUninstallCommand(opts, deps),
 		newDoctorCommand(v, opts, deps),
 		newUpdateCommand(opts, deps),
 		newBoardCommand(opts, deps),
@@ -99,7 +100,7 @@ func isConfigBootstrapCommand(cmd *cobra.Command) bool {
 	}
 	if parent.Parent() == nil {
 		switch cmd.Name() {
-		case "install", "doctor", "update":
+		case "install", "uninstall", "doctor", "update":
 			return true
 		}
 	}

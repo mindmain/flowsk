@@ -1,6 +1,7 @@
 // File mcp.go implements non-destructive, symlink-preserving Model Context Protocol
-// (`flowsk mcp serve --transport stdio`) configuration writers across supported JSON
-// (`mcpServers.flowsk`) and TOML (`[mcp_servers.flowsk]`) AI client configuration files.
+// (`flowsk mcp serve --transport stdio`) installation and uninstallation writers across
+// supported JSON (`mcpServers.flowsk`, including `~/.agents/mcp.json`) and TOML
+// (`[mcp_servers.flowsk]`) AI client configuration files.
 package skill
 
 import (
@@ -70,44 +71,35 @@ type MCPInstallResult struct {
 	Action string `json:"action"`
 }
 
-// ResolveUniversalMCPTargets returns all detected MCP-capable ProviderTargets from statuses.
-// When zero MCP-capable providers are currently detected on a fresh machine, it falls back
-// to Claude Code, OpenAI Codex, and Google Antigravity so Universal MCP installation remains actionable.
-func ResolveUniversalMCPTargets(statuses []ProviderStatus) []ProviderTarget {
-	var detected []ProviderTarget
-	for _, st := range statuses {
-		if st.Target.SupportsMCP() && st.Detected {
-			detected = append(detected, st.Target)
-		}
-	}
-	if len(detected) > 0 {
-		return detected
-	}
+// MCPUninstallResult summarizes removing the `flowsk` MCP server from one ProviderTarget.
+type MCPUninstallResult struct {
+	// Target is the inspected AI client provider metadata.
+	Target ProviderTarget `json:"target"`
 
-	fallbackIDs := []string{ProviderClaude, ProviderCodex, ProviderAntigravity}
-	var fallback []ProviderTarget
-	for _, st := range statuses {
-		if st.Target.SupportsMCP() && slices.Contains(fallbackIDs, st.Target.ID) {
-			fallback = append(fallback, st.Target)
-		}
-	}
-	return fallback
+	// ConfigPath is the configured MCP file path.
+	ConfigPath string `json:"config_path"`
+
+	// ResolvedPath is the real underlying file path after symlink resolution.
+	ResolvedPath string `json:"resolved_path"`
+
+	// Action is "removed" when `flowsk` was present and removed, or "not_found".
+	Action string `json:"action"`
 }
 
-// ResolveMCPProvidersByIDs resolves MCP-capable provider slugs (supporting `"universal"` and `"all"`)
-// against the inspected provider statuses under homeDir.
+// ResolveMCPProvidersByIDs resolves MCP-capable provider slugs (`agents` / `universal`,
+// `claude`, `codex`, `antigravity`, `gemini`, `cursor`, or `all`) against SupportedProviders.
 func ResolveMCPProvidersByIDs(homeDir string, ids []string) ([]ProviderTarget, error) {
-	statuses, err := InspectAll(homeDir)
+	catalog, err := SupportedProviders(homeDir)
 	if err != nil {
 		return nil, err
 	}
 
-	byID := make(map[string]ProviderTarget, len(statuses))
+	byID := make(map[string]ProviderTarget, len(catalog))
 	var allMCP []ProviderTarget
-	for _, st := range statuses {
-		if st.Target.SupportsMCP() {
-			byID[st.Target.ID] = st.Target
-			allMCP = append(allMCP, st.Target)
+	for _, p := range catalog {
+		if p.SupportsMCP() {
+			byID[p.ID] = p
+			allMCP = append(allMCP, p)
 		}
 	}
 
@@ -129,20 +121,14 @@ func ResolveMCPProvidersByIDs(homeDir string, ids []string) ([]ProviderTarget, e
 			switch token {
 			case "all":
 				return allMCP, nil
-			case MCPUniversalID, "detected":
-				for _, t := range ResolveUniversalMCPTargets(statuses) {
-					addUnique(t)
-				}
-			default:
-				target, ok := byID[token]
-				if !ok {
-					if token == ProviderAgents {
-						return nil, fmt.Errorf("provider %q (~/.agents) has no universal MCP config file; use %q to configure all detected MCP clients or specify claude, codex, antigravity, gemini, cursor", token, MCPUniversalID)
-					}
-					return nil, fmt.Errorf("unknown MCP provider %q (supported: universal, claude, codex, antigravity, gemini, cursor, all)", token)
-				}
-				addUnique(target)
+			case "universal":
+				token = ProviderAgents
 			}
+			target, ok := byID[token]
+			if !ok {
+				return nil, fmt.Errorf("unknown MCP provider %q (supported: agents, claude, codex, antigravity, gemini, cursor, all)", token)
+			}
+			addUnique(target)
 		}
 	}
 	return selected, nil
@@ -159,7 +145,7 @@ func InstallMCPToProvider(target ProviderTarget, customCommand string) (MCPInsta
 	cmd := ResolveMCPCommand(customCommand)
 	args := DefaultMCPArgs()
 
-	realPath, err := resolveWritableTargetPath(target.MCPConfigPath)
+	realPath, _, err := resolveWritableTargetPath(target.MCPConfigPath)
 	if err != nil {
 		return MCPInstallResult{}, fmt.Errorf("resolve MCP config path %s: %w", target.MCPConfigPath, err)
 	}
@@ -183,6 +169,42 @@ func InstallMCPToProvider(target ProviderTarget, customCommand string) (MCPInsta
 		ResolvedPath: realPath,
 		Command:      cmd,
 		Args:         args,
+		Action:       action,
+	}, nil
+}
+
+// UninstallMCPFromProvider non-destructively removes the `flowsk` MCP server entry
+// from `target.MCPConfigPath`, preserving all other MCP servers, unrelated settings,
+// comments, permissions, and symbolic links. When a non-symlink config file becomes
+// completely empty (e.g. a standalone `mcp.json` created solely for `flowsk`), the
+// empty file is removed cleanly.
+func UninstallMCPFromProvider(target ProviderTarget) (MCPUninstallResult, error) {
+	if !target.SupportsMCP() {
+		return MCPUninstallResult{}, fmt.Errorf("provider %q does not have a managed MCP config file", target.ID)
+	}
+
+	realPath, isSymlink, err := resolveWritableTargetPath(target.MCPConfigPath)
+	if err != nil {
+		return MCPUninstallResult{}, fmt.Errorf("resolve MCP config path %s: %w", target.MCPConfigPath, err)
+	}
+
+	var action string
+	switch target.MCPFormat {
+	case MCPFormatJSON:
+		action, err = removeJSONMCPServer(realPath, isSymlink)
+	case MCPFormatTOML:
+		action, err = removeTOMLMCPServer(realPath, isSymlink)
+	default:
+		return MCPUninstallResult{}, fmt.Errorf("unsupported MCP format %q for provider %q", target.MCPFormat, target.ID)
+	}
+	if err != nil {
+		return MCPUninstallResult{}, err
+	}
+
+	return MCPUninstallResult{
+		Target:       target,
+		ConfigPath:   target.MCPConfigPath,
+		ResolvedPath: realPath,
 		Action:       action,
 	}, nil
 }
@@ -233,7 +255,6 @@ func upsertJSONMCPServer(realPath, cmd string, args []string) (string, error) {
 					return "unchanged", nil
 				}
 			}
-			// Preserve any custom extra fields inside mcpServers.flowsk while updating command and args.
 			cmdRaw, _ := json.Marshal(desired.Command)
 			argsRaw, _ := json.Marshal(desired.Args)
 			prevMap["command"] = cmdRaw
@@ -278,6 +299,64 @@ func upsertJSONMCPServer(realPath, cmd string, args []string) (string, error) {
 	return action, nil
 }
 
+func removeJSONMCPServer(realPath string, isSymlink bool) (string, error) {
+	raw, err := os.ReadFile(realPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "not_found", nil
+		}
+		return "", fmt.Errorf("read %s: %w", realPath, err)
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return "not_found", nil
+	}
+
+	root := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return "", fmt.Errorf("refusing to modify malformed JSON in %s: %w", realPath, err)
+	}
+
+	existingServersRaw, ok := root["mcpServers"]
+	if !ok || len(bytes.TrimSpace(existingServersRaw)) == 0 || string(bytes.TrimSpace(existingServersRaw)) == "null" {
+		return "not_found", nil
+	}
+
+	servers := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(existingServersRaw, &servers); err != nil {
+		return "", fmt.Errorf("refusing to modify non-object mcpServers in %s: %w", realPath, err)
+	}
+
+	if _, exists := servers[SkillName]; !exists {
+		return "not_found", nil
+	}
+	delete(servers, SkillName)
+
+	// If no other MCP servers and no other top-level keys remain in a standalone non-symlink file, remove it cleanly.
+	if len(servers) == 0 && len(root) == 1 && !isSymlink {
+		if err := os.Remove(realPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("remove empty MCP config %s: %w", realPath, err)
+		}
+		return "removed", nil
+	}
+
+	serversBytes, err := json.Marshal(servers)
+	if err != nil {
+		return "", fmt.Errorf("marshal mcpServers map for %s: %w", realPath, err)
+	}
+	root["mcpServers"] = serversBytes
+
+	formatted, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("format JSON for %s: %w", realPath, err)
+	}
+	formatted = append(formatted, '\n')
+
+	if err := atomicWriteConfigFile(realPath, formatted, 0o600); err != nil {
+		return "", err
+	}
+	return "removed", nil
+}
+
 func upsertTOMLMCPServer(realPath, cmd string, args []string) (string, error) {
 	var raw []byte
 	if existing, err := os.ReadFile(realPath); err == nil {
@@ -311,7 +390,7 @@ func upsertTOMLMCPServer(realPath, cmd string, args []string) (string, error) {
 			continue
 		}
 		if startIdx == -1 {
-			if isFlowskTOMLHeader(hdr) {
+			if isFlowskTOMLHeader(hdr, false) {
 				startIdx = i
 			}
 		} else {
@@ -329,7 +408,6 @@ func upsertTOMLMCPServer(realPath, cmd string, args []string) (string, error) {
 		return "installed", nil
 	}
 
-	// Trim trailing blank lines inside the matched section so spacing before the next table is preserved.
 	bodyEnd := endIdx
 	for bodyEnd > startIdx+1 && strings.TrimSpace(lines[bodyEnd-1]) == "" {
 		bodyEnd--
@@ -352,6 +430,73 @@ func upsertTOMLMCPServer(realPath, cmd string, args []string) (string, error) {
 	return "updated", nil
 }
 
+func removeTOMLMCPServer(realPath string, isSymlink bool) (string, error) {
+	raw, err := os.ReadFile(realPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "not_found", nil
+		}
+		return "", fmt.Errorf("read %s: %w", realPath, err)
+	}
+
+	normalized := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	if strings.TrimSpace(normalized) == "" {
+		return "not_found", nil
+	}
+
+	lines := strings.Split(normalized, "\n")
+	var kept []string
+	skipping := false
+	removedAny := false
+
+	for _, line := range lines {
+		if hdr, isHdr := parseTOMLTableHeader(line); isHdr {
+			if isFlowskTOMLHeader(hdr, true) {
+				skipping = true
+				removedAny = true
+				continue
+			}
+			skipping = false
+		}
+		if !skipping {
+			kept = append(kept, line)
+		}
+	}
+
+	if !removedAny {
+		return "not_found", nil
+	}
+
+	// Collapse consecutive blank lines left behind by removed sections.
+	var compact []string
+	prevBlank := false
+	for _, line := range kept {
+		blank := strings.TrimSpace(line) == ""
+		if blank && prevBlank {
+			continue
+		}
+		compact = append(compact, line)
+		prevBlank = blank
+	}
+
+	finalStr := strings.TrimSpace(strings.Join(compact, "\n"))
+	if finalStr == "" && !isSymlink {
+		if err := os.Remove(realPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("remove empty TOML config %s: %w", realPath, err)
+		}
+		return "removed", nil
+	}
+
+	var outBytes []byte
+	if finalStr != "" {
+		outBytes = []byte(finalStr + "\n")
+	}
+	if err := atomicWriteConfigFile(realPath, outBytes, 0o600); err != nil {
+		return "", err
+	}
+	return "removed", nil
+}
+
 // parseTOMLTableHeader extracts the raw header expression inside `[...]` or `[[...]]`
 // when line starts a TOML table, ignoring `#` comments outside double/single quotes.
 func parseTOMLTableHeader(line string) (string, bool) {
@@ -365,9 +510,12 @@ func parseTOMLTableHeader(line string) (string, bool) {
 	return strings.TrimSpace(s[1 : len(s)-1]), true
 }
 
-func isFlowskTOMLHeader(hdr string) bool {
+func isFlowskTOMLHeader(hdr string, includeSubtables bool) bool {
 	parts := strings.Split(hdr, ".")
-	if len(parts) != 2 {
+	if len(parts) < 2 {
+		return false
+	}
+	if !includeSubtables && len(parts) != 2 {
 		return false
 	}
 	clean := func(p string) string {
@@ -407,37 +555,36 @@ func stripTOMLComment(line string) string {
 
 // resolveWritableTargetPath resolves symbolic links on path (if present) so atomic
 // rename writes update the symlink target file instead of replacing the symlink itself.
-func resolveWritableTargetPath(path string) (string, error) {
+func resolveWritableTargetPath(path string) (realPath string, isSymlink bool, err error) {
 	cleaned := filepath.Clean(strings.TrimSpace(path))
 	if cleaned == "" || cleaned == "." {
-		return "", errors.New("empty config file path")
+		return "", false, errors.New("empty config file path")
 	}
 
 	linfo, err := os.Lstat(cleaned)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return cleaned, nil
+			return cleaned, false, nil
 		}
-		return "", err
+		return "", false, err
 	}
 
 	if linfo.Mode()&os.ModeSymlink != 0 {
 		resolved, evalErr := filepath.EvalSymlinks(cleaned)
 		if evalErr == nil {
-			return resolved, nil
+			return resolved, true, nil
 		}
-		// Handle dangling symlink whose target file has not been created yet.
 		linkDest, readErr := os.Readlink(cleaned)
 		if readErr != nil {
-			return "", evalErr
+			return "", true, evalErr
 		}
 		if !filepath.IsAbs(linkDest) {
 			linkDest = filepath.Join(filepath.Dir(cleaned), linkDest)
 		}
-		return filepath.Clean(linkDest), nil
+		return filepath.Clean(linkDest), true, nil
 	}
 
-	return cleaned, nil
+	return cleaned, false, nil
 }
 
 func atomicWriteConfigFile(realPath string, content []byte, defaultPerm os.FileMode) error {

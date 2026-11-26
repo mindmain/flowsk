@@ -470,6 +470,16 @@ func renderCompact(w io.Writer, payload any) error {
 				m.ProviderID, m.Action, m.Command, m.ConfigPath)
 		}
 		return nil
+	case UninstallSkillView:
+		_, _ = fmt.Fprintf(w, "uninstall skill_removed=%d skill_absent=%d mcp_removed=%d mcp_absent=%d\n",
+			v.RemovedSkillCount, v.NotFoundSkillCount, v.RemovedMCPCount, v.NotFoundMCPCount)
+		for _, it := range v.SkillItems {
+			_, _ = fmt.Fprintf(w, "  skill %s action=%s path=%s\n", it.ProviderID, it.Action, it.SkillPath)
+		}
+		for _, m := range v.MCPItems {
+			_, _ = fmt.Fprintf(w, "  mcp   %s action=%s path=%s\n", m.ProviderID, m.Action, m.ConfigPath)
+		}
+		return nil
 	case DoctorReportView:
 		_, _ = fmt.Fprintf(w, "doctor version=%s mode=%s ok=%d warn=%d fail=%d skill_sha256=%s\n",
 			v.Version, v.Mode, v.OKCount, v.WarnCount, v.FailCount, v.EmbeddedSkillSHA256[:min(len(v.EmbeddedSkillSHA256), 12)])
@@ -1199,6 +1209,8 @@ func renderHumanAdminAndSystem(w io.Writer, payload any) error {
 		return nil
 	case InstallSkillView:
 		return renderHumanInstallSkill(w, v)
+	case UninstallSkillView:
+		return renderHumanUninstallSkill(w, v)
 	case DoctorReportView:
 		return renderHumanDoctorReport(w, v)
 	case UpdateCheckView:

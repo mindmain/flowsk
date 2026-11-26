@@ -13,7 +13,7 @@
 # Build the unified binary (embeds the Angular 21 Web UI + Goose SQL migrations + AI SKILL.md)
 task build
 
-# Install both SKILL.md (default: Universal ~/.agents) and Flowsk MCP server (default: Universal detected clients)
+# Install SKILL.md + MCP server (defaults to Universal ~/.agents; use 'flowsk uninstall' to remove)
 ./bin/flowsk install
 
 # Bind the current Git repository/worktree to a logical project in ~/.flowsk
