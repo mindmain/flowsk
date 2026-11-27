@@ -17,22 +17,36 @@ import (
 )
 
 func TestEmbeddedSkillIntegrityAndContent(t *testing.T) {
-	md := skill.EmbeddedMarkdown()
-	if len(md) < 200 {
-		t.Fatalf("embedded SKILL.md unexpectedly short: %d bytes", len(md))
+	planMD := skill.EmbeddedPlanMarkdown()
+	devMD := skill.EmbeddedDevMarkdown()
+	if len(planMD) < 200 || len(devMD) < 200 {
+		t.Fatalf("embedded skill docs unexpectedly short: plan=%d dev=%d", len(planMD), len(devMD))
 	}
 	for _, required := range []string{
-		"name: flowsk",
+		"name: flowsk-plan",
 		"description:",
 		"flowsk_digest",
 		"flowsk_search",
 		"flowsk_execute",
+		"flowsk.goals.bundle",
 		"externalId",
 		"upsertExternal",
-		"flowsk mcp serve --transport stdio",
 	} {
-		if !strings.Contains(md, required) {
-			t.Fatalf("embedded SKILL.md missing required operational token %q", required)
+		if !strings.Contains(planMD, required) {
+			t.Fatalf("embedded flowsk-plan/SKILL.md missing required token %q", required)
+		}
+	}
+	for _, required := range []string{
+		"name: flowsk-dev",
+		"description:",
+		"flowsk_digest",
+		"flowsk_search",
+		"flowsk_execute",
+		"flowsk.goals.bundle",
+		"externalId",
+	} {
+		if !strings.Contains(devMD, required) {
+			t.Fatalf("embedded flowsk-dev/SKILL.md missing required token %q", required)
 		}
 	}
 
@@ -98,8 +112,8 @@ func TestInstallInspectAndUninstallSkillLifecycle(t *testing.T) {
 		t.Fatalf("expected unchanged on second install, got %+v", second)
 	}
 
-	// Tamper with installed SKILL.md to simulate an outdated skill version.
-	if err := os.WriteFile(agentsTarget.SkillFilePath, []byte("# outdated skill\n"), 0o644); err != nil {
+	// Tamper with installed flowsk-plan/SKILL.md to simulate an outdated skill version.
+	if err := os.WriteFile(agentsTarget.SkillPlanFilePath, []byte("# outdated plan skill\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	tampered := skill.InspectProvider(agentsTarget)
@@ -115,13 +129,16 @@ func TestInstallInspectAndUninstallSkillLifecycle(t *testing.T) {
 		t.Fatalf("expected updated action with previous hash, got %+v", updated)
 	}
 
-	// Uninstall removes flowsk/SKILL.md and empty flowsk/ folder while keeping sibling-skill intact!
+	// Uninstall removes flowsk-plan/SKILL.md and flowsk-dev/SKILL.md and their empty folders while keeping sibling-skill intact!
 	unres, err := skill.UninstallFromProvider(agentsTarget)
 	if err != nil || unres.Action != "removed" {
 		t.Fatalf("UninstallFromProvider: res=%+v err=%v", unres, err)
 	}
-	if _, err := os.Stat(filepath.Dir(agentsTarget.SkillFilePath)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected empty flowsk skill directory to be removed, stat err=%v", err)
+	if _, err := os.Stat(filepath.Dir(agentsTarget.SkillPlanFilePath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected empty flowsk-plan skill directory to be removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Dir(agentsTarget.SkillDevFilePath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected empty flowsk-dev skill directory to be removed, stat err=%v", err)
 	}
 	if _, err := os.Stat(filepath.Join(siblingDir, "SKILL.md")); err != nil {
 		t.Fatalf("expected sibling skill to remain untouched: %v", err)
@@ -456,30 +473,45 @@ func TestAntigravityCanonicalConfigPathsAndLegacySkillCleanup(t *testing.T) {
 	}
 	ag := targets[0]
 
-	wantSkillPath := filepath.Join(home, ".gemini", "config", "skills", "flowsk", "SKILL.md")
+	wantPlanPath := filepath.Join(home, ".gemini", "config", "skills", "flowsk-plan", "SKILL.md")
+	wantDevPath := filepath.Join(home, ".gemini", "config", "skills", "flowsk-dev", "SKILL.md")
 	wantMCPPath := filepath.Join(home, ".gemini", "config", "mcp_config.json")
-	if ag.SkillFilePath != wantSkillPath || ag.MCPConfigPath != wantMCPPath {
-		t.Fatalf("expected canonical ~/.gemini/config paths (%s, %s), got (%s, %s)",
-			wantSkillPath, wantMCPPath, ag.SkillFilePath, ag.MCPConfigPath)
+	if ag.SkillPlanFilePath != wantPlanPath || ag.SkillDevFilePath != wantDevPath || ag.MCPConfigPath != wantMCPPath {
+		t.Fatalf("expected canonical ~/.gemini/config paths (%s, %s, %s), got (%s, %s, %s)",
+			wantPlanPath, wantDevPath, wantMCPPath, ag.SkillPlanFilePath, ag.SkillDevFilePath, ag.MCPConfigPath)
 	}
 
-	// Pre-migration ~/.gemini/antigravity must still mark Antigravity as Detected=true,
-	// while Installed=false because canonical ~/.gemini/config/skills/flowsk/SKILL.md is missing.
+	// Also seed pre-split ~/.gemini/config/skills/flowsk/SKILL.md to verify migration cleanup!
+	sameDirLegacy := filepath.Join(home, ".gemini", "config", "skills", "flowsk", "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(sameDirLegacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sameDirLegacy, []byte("# pre-split flowsk skill\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-split single skill counts as Installed=true, UpToDate=false so install upgrades it cleanly!
 	pre := skill.InspectProvider(ag)
-	if !pre.Detected || pre.Installed {
-		t.Fatalf("expected Detected=true and Installed=false before canonical install, got %+v", pre)
+	if !pre.Detected || !pre.Installed || pre.UpToDate {
+		t.Fatalf("expected Detected=true, Installed=true (legacy), UpToDate=false before upgrade, got %+v", pre)
 	}
 
-	// Installing writes ~/.gemini/config/skills/flowsk/SKILL.md AND removes legacy flowsk/SKILL.md!
+	// Installing writes flowsk-plan + flowsk-dev AND removes both legacy flowsk/SKILL.md files!
 	res, err := skill.InstallToProvider(ag)
-	if err != nil || res.Action != "installed" {
+	if err != nil || res.Action != "updated" {
 		t.Fatalf("InstallToProvider(antigravity): res=%+v err=%v", res, err)
 	}
-	if _, err := os.Stat(wantSkillPath); err != nil {
-		t.Fatalf("expected canonical skill installed at %s: %v", wantSkillPath, err)
+	if _, err := os.Stat(wantPlanPath); err != nil {
+		t.Fatalf("expected canonical plan skill installed at %s: %v", wantPlanPath, err)
+	}
+	if _, err := os.Stat(wantDevPath); err != nil {
+		t.Fatalf("expected canonical dev skill installed at %s: %v", wantDevPath, err)
 	}
 	if _, err := os.Stat(legacySkillPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected legacy skill %s to be cleaned up, stat err=%v", legacySkillPath, err)
+	}
+	if _, err := os.Stat(sameDirLegacy); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected pre-split skill %s to be cleaned up, stat err=%v", sameDirLegacy, err)
 	}
 	if _, err := os.Stat(filepath.Join(legacySiblingDir, "SKILL.md")); err != nil {
 		t.Fatalf("expected legacy sibling skill to remain untouched: %v", err)

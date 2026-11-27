@@ -216,8 +216,11 @@ func TestInstallDoctorAndUninstallCommandsEndToEnd(t *testing.T) {
 		if uninst.RemovedSkillCount != 1 || uninst.RemovedMCPCount != 1 {
 			t.Fatalf("expected 1 removed skill and 1 removed MCP, got %+v", uninst)
 		}
-		if _, err := os.Stat(filepath.Join(userHome, ".agents", "skills", "flowsk", "SKILL.md")); !os.IsNotExist(err) {
-			t.Fatal("expected SKILL.md to be removed after uninstall")
+		if _, err := os.Stat(filepath.Join(userHome, ".agents", "skills", "flowsk-plan", "SKILL.md")); !os.IsNotExist(err) {
+			t.Fatal("expected flowsk-plan/SKILL.md to be removed after uninstall")
+		}
+		if _, err := os.Stat(filepath.Join(userHome, ".agents", "skills", "flowsk-dev", "SKILL.md")); !os.IsNotExist(err) {
+			t.Fatal("expected flowsk-dev/SKILL.md to be removed after uninstall")
 		}
 		if _, err := os.Stat(filepath.Join(userHome, ".agents", "mcp.json")); !os.IsNotExist(err) {
 			t.Fatal("expected ~/.agents/mcp.json to be removed after uninstall")
@@ -235,10 +238,16 @@ func TestInstallDoctorAndUninstallCommandsEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	agCfgDir := filepath.Join(userHome, ".gemini", "config")
-	if err := os.MkdirAll(filepath.Join(agCfgDir, "skills", "flowsk"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(agCfgDir, "skills", "flowsk-plan"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(agCfgDir, "skills", "flowsk", "SKILL.md"), skill.EmbeddedContent(), 0o644); err != nil {
+	if err := os.MkdirAll(filepath.Join(agCfgDir, "skills", "flowsk-dev"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agCfgDir, "skills", "flowsk-plan", "SKILL.md"), skill.EmbeddedPlanContent(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agCfgDir, "skills", "flowsk-dev", "SKILL.md"), skill.EmbeddedDevContent(), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(agCfgDir, "mcp_config.json"), []byte(`{"mcpServers":{"flowsk":{"command":"/usr/local/bin/flowsk","args":["mcp","serve","--transport","stdio"]}}}`), 0o600); err != nil {
