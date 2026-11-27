@@ -28,8 +28,8 @@ const (
 	// MaxLeaseTTLSeconds bounds individual task claim leases to 24 hours.
 	MaxLeaseTTLSeconds int64 = 86400
 
-	defaultWorkQueueLimit   int32 = 20
-	maxWorkQueueLimit       int32 = 100
+	defaultWorkQueueLimit   int32 = 25
+	maxWorkQueueLimit       int32 = 1000
 	defaultDigestReadyMax   int32 = 15
 	defaultDigestBlockedMax int32 = 10
 	maxDigestItemsLimit     int32 = 100
@@ -339,6 +339,11 @@ func (s *ServiceSkeleton) CreateTask(ctx context.Context, in CreateTaskInput) (T
 	if status.IsTerminal() {
 		completedAt = &now
 	}
+	var lastSignalAt *time.Time
+	if authctx.ShouldEmitTaskSignal(ctx) && status.AcceptsSignal() {
+		sig := now
+		lastSignalAt = &sig
+	}
 
 	created := Task{
 		ID:                 newUUID(),
@@ -361,6 +366,7 @@ func (s *ServiceSkeleton) CreateTask(ctx context.Context, in CreateTaskInput) (T
 		CreatedAt:          now,
 		UpdatedAt:          now,
 		CompletedAt:        completedAt,
+		LastSignalAt:       lastSignalAt,
 	}
 
 	var out Task
@@ -450,7 +456,8 @@ func (s *ServiceSkeleton) GetTask(ctx context.Context, workspaceID, taskID uuid.
 	if err := checkContext(ctx, op); err != nil {
 		return Task{}, err
 	}
-	if _, err := authctx.RequireWorkspaceOwnership(ctx, workspaceID); err != nil {
+	caller, err := authctx.RequireWorkspaceOwnership(ctx, workspaceID)
+	if err != nil {
 		return Task{}, err
 	}
 	if taskID == uuid.Nil {
@@ -467,6 +474,12 @@ func (s *ServiceSkeleton) GetTask(ctx context.Context, workspaceID, taskID uuid.
 	if err != nil {
 		return Task{}, err
 	}
+	if authctx.ShouldEmitTaskSignal(ctx) && t.Status.AcceptsSignal() {
+		t, err = s.recordReadSignal(ctx, caller, t)
+		if err != nil {
+			return Task{}, err
+		}
+	}
 	return t.Clone(), nil
 }
 
@@ -477,7 +490,8 @@ func (s *ServiceSkeleton) GetTaskByKey(ctx context.Context, workspaceID uuid.UUI
 	if err := checkContext(ctx, op); err != nil {
 		return Task{}, err
 	}
-	if _, err := authctx.RequireWorkspaceOwnership(ctx, workspaceID); err != nil {
+	caller, err := authctx.RequireWorkspaceOwnership(ctx, workspaceID)
+	if err != nil {
 		return Task{}, err
 	}
 	normalized := strings.TrimSpace(key)
@@ -495,6 +509,12 @@ func (s *ServiceSkeleton) GetTaskByKey(ctx context.Context, workspaceID uuid.UUI
 	if err != nil {
 		return Task{}, err
 	}
+	if authctx.ShouldEmitTaskSignal(ctx) && t.Status.AcceptsSignal() {
+		t, err = s.recordReadSignal(ctx, caller, t)
+		if err != nil {
+			return Task{}, err
+		}
+	}
 	return t.Clone(), nil
 }
 
@@ -505,7 +525,8 @@ func (s *ServiceSkeleton) GetTaskByExternalID(ctx context.Context, workspaceID, 
 	if err := checkContext(ctx, op); err != nil {
 		return Task{}, err
 	}
-	if _, err := authctx.RequireWorkspaceOwnership(ctx, workspaceID); err != nil {
+	caller, err := authctx.RequireWorkspaceOwnership(ctx, workspaceID)
+	if err != nil {
 		return Task{}, err
 	}
 	var violations []errs.FieldViolation
@@ -535,7 +556,59 @@ func (s *ServiceSkeleton) GetTaskByExternalID(ctx context.Context, workspaceID, 
 	if err != nil {
 		return Task{}, err
 	}
+	if authctx.ShouldEmitTaskSignal(ctx) && t.Status.AcceptsSignal() {
+		t, err = s.recordReadSignal(ctx, caller, t)
+		if err != nil {
+			return Task{}, err
+		}
+	}
 	return t.Clone(), nil
+}
+
+func (s *ServiceSkeleton) recordReadSignal(ctx context.Context, caller authctx.Identity, current Task) (Task, error) {
+	const op = "task.Service.recordReadSignal"
+	if s.txMgr == nil || !current.Status.AcceptsSignal() {
+		return current, nil
+	}
+	var touched Task
+	err := s.txMgr.WithTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		scopedRepo := s.repo.WithScope(scope)
+		now := time.Now().UTC()
+		oldSnap, snapErr := marshalSnapshot(op, current)
+		if snapErr != nil {
+			return snapErr
+		}
+		next, touchErr := scopedRepo.TouchSignal(txCtx, current.WorkspaceID, current.ID, now)
+		if touchErr != nil {
+			return touchErr
+		}
+		newSnap, newErr := marshalSnapshot(op, next)
+		if newErr != nil {
+			return newErr
+		}
+		if recErr := scope.Audit().Record(txCtx, tx.AuditEntry{
+			ID:           newUUID(),
+			WorkspaceID:  current.WorkspaceID,
+			ActorID:      caller.ActorID,
+			Action:       tx.AuditActionUpdate,
+			ResourceType: "task",
+			ResourceID:   current.ID.String(),
+			OldValues:    oldSnap,
+			NewValues:    newSnap,
+			OccurredAt:   now,
+		}); recErr != nil {
+			return recErr
+		}
+		touched = next
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errs.ErrNotImplemented) {
+			return current, nil
+		}
+		return Task{}, err
+	}
+	return touched, nil
 }
 
 func normalizeExternalID(raw string) (string, *errs.FieldViolation) {
@@ -730,6 +803,10 @@ func (s *ServiceSkeleton) UpdateTask(ctx context.Context, in UpdateTaskInput) (T
 			next.ExternalID = nextExtID
 		}
 		next.UpdatedAt = now
+		if authctx.ShouldEmitTaskSignal(ctx) && next.Status.AcceptsSignal() {
+			sig := now
+			next.LastSignalAt = &sig
+		}
 
 		if err := scopedRepo.Update(ctx, next.Clone(), in.ExpectedVersion); err != nil {
 			return err
@@ -835,6 +912,10 @@ func (s *ServiceSkeleton) TransitionTask(ctx context.Context, in TransitionTaskI
 		next := current.Clone()
 		next.Status = in.TargetStatus
 		next.UpdatedAt = now
+		if authctx.ShouldEmitTaskSignal(ctx) && in.TargetStatus.AcceptsSignal() {
+			sig := now
+			next.LastSignalAt = &sig
+		}
 		if in.TargetStatus.IsTerminal() {
 			if next.CompletedAt == nil {
 				completed := now
@@ -932,7 +1013,7 @@ func (s *ServiceSkeleton) DeleteTask(ctx context.Context, workspaceID, taskID uu
 		return err
 	}
 
-	return s.txMgr.WithTransaction(ctx, func(ctx context.Context, scope tx.Scope) error {
+	if err := s.txMgr.WithTransaction(ctx, func(ctx context.Context, scope tx.Scope) error {
 		scopedRepo := s.repo.WithScope(scope)
 		now := time.Now().UTC()
 
@@ -954,9 +1035,6 @@ func (s *ServiceSkeleton) DeleteTask(ctx context.Context, workspaceID, taskID uu
 		if err := scopedRepo.SoftDelete(ctx, workspaceID, taskID); err != nil {
 			return err
 		}
-		if s.mdStore != nil {
-			_ = s.mdStore.DeleteTaskMarkdown(ctx, workspaceID, taskID)
-		}
 
 		deleted := current.Clone()
 		deleted.ActiveLease = nil
@@ -977,7 +1055,14 @@ func (s *ServiceSkeleton) DeleteTask(ctx context.Context, workspaceID, taskID uu
 			NewValues:    newSnapshot,
 			OccurredAt:   now,
 		})
-	})
+	}); err != nil {
+		return err
+	}
+
+	if s.mdStore != nil {
+		_ = s.mdStore.DeleteTaskMarkdown(context.WithoutCancel(ctx), workspaceID, taskID)
+	}
+	return nil
 }
 
 // ClaimTask acquires, renews, or preempts an expired exclusive ClaimLease on a Task
@@ -1095,13 +1180,19 @@ func (s *ServiceSkeleton) ClaimTask(ctx context.Context, in ClaimTaskInput) (Cla
 			}
 		}
 
+		effectiveStatus := currentTask.Status
 		if in.AutoTransitionInProgress && currentTask.Status == StatusReady {
 			if err := ensureNoUnresolvedBlockers(ctx, scopedRepo, op, currentTask); err != nil {
 				return err
 			}
 			updatedTask := currentTask.Clone()
 			updatedTask.Status = StatusInProgress
+			effectiveStatus = StatusInProgress
 			updatedTask.UpdatedAt = now
+			if authctx.ShouldEmitTaskSignal(ctx) {
+				sig := now
+				updatedTask.LastSignalAt = &sig
+			}
 			if updatedTask.AssigneeActorID == nil {
 				actorID := caller.ActorID
 				updatedTask.AssigneeActorID = &actorID
@@ -1113,6 +1204,11 @@ func (s *ServiceSkeleton) ClaimTask(ctx context.Context, in ClaimTaskInput) (Cla
 
 		if err := scopedRepo.UpsertLease(ctx, nextLease.Clone()); err != nil {
 			return err
+		}
+		if authctx.ShouldEmitTaskSignal(ctx) && effectiveStatus.AcceptsSignal() {
+			if _, err := scopedRepo.TouchSignal(ctx, in.WorkspaceID, in.TaskID, now); err != nil && !errors.Is(err, errs.ErrNotImplemented) {
+				return err
+			}
 		}
 
 		newSnapshot, err := marshalSnapshot(op, nextLease)
@@ -1190,7 +1286,7 @@ func (s *ServiceSkeleton) ReleaseTask(ctx context.Context, in ReleaseTaskInput) 
 				return errs.New(errs.ErrLeaseHeld, op, "cannot release a claim lease owned by another actor without force=true")
 			}
 			suppliedToken := strings.TrimSpace(in.LeaseToken)
-			if suppliedToken == "" || suppliedToken != existingLease.LeaseToken {
+			if suppliedToken != "" && suppliedToken != existingLease.LeaseToken {
 				return errs.New(errs.ErrPreconditionFailed, op, "lease fencing token mismatch")
 			}
 		}
@@ -1202,6 +1298,11 @@ func (s *ServiceSkeleton) ReleaseTask(ctx context.Context, in ReleaseTaskInput) 
 
 		if err := scopedRepo.DeleteLease(ctx, in.WorkspaceID, in.TaskID); err != nil {
 			return err
+		}
+		if authctx.ShouldEmitTaskSignal(ctx) && currentTask.Status.AcceptsSignal() {
+			if _, err := scopedRepo.TouchSignal(ctx, in.WorkspaceID, in.TaskID, now); err != nil && !errors.Is(err, errs.ErrNotImplemented) {
+				return err
+			}
 		}
 
 		handoff := strings.TrimSpace(in.HandoffComment)
@@ -1272,6 +1373,7 @@ func (s *ServiceSkeleton) PollWorkQueue(ctx context.Context, filter AgentWorkQue
 		ProjectID:     filter.ProjectID,
 		ObjectiveID:   normalizeUUIDPtr(filter.ObjectiveID),
 		ParentTaskID:  normalizeUUIDPtr(filter.ParentTaskID),
+		ExternalID:    strings.TrimSpace(filter.ExternalID),
 		OnlyUnblocked: filter.OnlyUnblocked,
 		OnlyUnclaimed: filter.OnlyUnclaimed,
 		Limit:         filter.Limit,
@@ -1569,11 +1671,17 @@ func (s *ServiceSkeleton) AddComment(ctx context.Context, in AddCommentInput) (T
 
 	if err := s.txMgr.WithTransaction(ctx, func(ctx context.Context, scope tx.Scope) error {
 		scopedRepo := s.repo.WithScope(scope)
-		if _, err := scopedRepo.GetByID(ctx, in.WorkspaceID, in.TaskID); err != nil {
+		currentTask, err := scopedRepo.GetByID(ctx, in.WorkspaceID, in.TaskID)
+		if err != nil {
 			return err
 		}
 		if err := scopedRepo.CreateComment(ctx, comment); err != nil {
 			return err
+		}
+		if authctx.ShouldEmitTaskSignal(ctx) && currentTask.Status.AcceptsSignal() {
+			if _, err := scopedRepo.TouchSignal(ctx, in.WorkspaceID, in.TaskID, now); err != nil && !errors.Is(err, errs.ErrNotImplemented) {
+				return err
+			}
 		}
 		newSnapshot, err := marshalSnapshot(op, comment)
 		if err != nil {
@@ -1758,7 +1866,7 @@ func ensureNoUnresolvedBlockers(ctx context.Context, scopedRepo Repository, op s
 			}
 			return err
 		}
-		if blocker.Status != StatusDone {
+		if !blocker.Status.IsTerminal() {
 			return errs.New(
 				errs.ErrPreconditionFailed,
 				op,
@@ -1931,7 +2039,8 @@ func (s *ServiceSkeleton) GetTaskMarkdown(ctx context.Context, workspaceID, task
 	if err := checkContext(ctx, op); err != nil {
 		return "", false, err
 	}
-	if _, err := authctx.RequireWorkspaceOwnership(ctx, workspaceID); err != nil {
+	caller, err := authctx.RequireWorkspaceOwnership(ctx, workspaceID)
+	if err != nil {
 		return "", false, err
 	}
 	if taskID == uuid.Nil {
@@ -1946,6 +2055,11 @@ func (s *ServiceSkeleton) GetTaskMarkdown(ctx context.Context, workspaceID, task
 	t, err := s.repo.GetByID(ctx, workspaceID, taskID)
 	if err != nil {
 		return "", false, err
+	}
+	if authctx.ShouldEmitTaskSignal(ctx) && t.Status.AcceptsSignal() {
+		if _, sigErr := s.recordReadSignal(ctx, caller, t); sigErr != nil {
+			return "", false, sigErr
+		}
 	}
 	if s.mdStore == nil {
 		return "", t.HasMarkdownDoc, nil
@@ -1991,6 +2105,7 @@ func (s *ServiceSkeleton) PutTaskMarkdown(ctx context.Context, workspaceID, task
 	}
 
 	var updated Task
+	var prevHasDoc bool
 	if err := s.txMgr.WithTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
 		scopedRepo := s.repo.WithScope(scope)
 		now := time.Now().UTC()
@@ -2001,6 +2116,7 @@ func (s *ServiceSkeleton) PutTaskMarkdown(ctx context.Context, workspaceID, task
 		if err := ensureLeaseAllowsActor(txCtx, scopedRepo, op, current, caller.ActorID, now); err != nil {
 			return err
 		}
+		prevHasDoc = current.HasMarkdownDoc
 		oldSnap, err := marshalSnapshot(op, current)
 		if err != nil {
 			return err
@@ -2009,8 +2125,14 @@ func (s *ServiceSkeleton) PutTaskMarkdown(ctx context.Context, workspaceID, task
 		if err != nil {
 			return err
 		}
-		if err := s.mdStore.WriteTaskMarkdown(txCtx, workspaceID, taskID, markdown); err != nil {
-			return err
+		if authctx.ShouldEmitTaskSignal(txCtx) && next.Status.AcceptsSignal() {
+			touched, tErr := scopedRepo.TouchSignal(txCtx, workspaceID, taskID, now)
+			if tErr != nil && !errors.Is(tErr, errs.ErrNotImplemented) {
+				return tErr
+			}
+			if tErr == nil {
+				next = touched
+			}
 		}
 		newSnap, err := marshalSnapshot(op, next)
 		if err != nil {
@@ -2032,6 +2154,16 @@ func (s *ServiceSkeleton) PutTaskMarkdown(ctx context.Context, workspaceID, task
 		updated = next
 		return nil
 	}); err != nil {
+		return Task{}, err
+	}
+
+	if err := s.mdStore.WriteTaskMarkdown(context.WithoutCancel(ctx), workspaceID, taskID, markdown); err != nil {
+		if !prevHasDoc {
+			_ = s.txMgr.WithNoAuditTransaction(context.WithoutCancel(ctx), func(cCtx context.Context, scope tx.Scope) error {
+				_, cErr := s.repo.WithScope(scope).SetHasMarkdownDoc(cCtx, workspaceID, taskID, false)
+				return cErr
+			})
+		}
 		return Task{}, err
 	}
 	return updated.Clone(), nil
@@ -2077,9 +2209,13 @@ func (s *ServiceSkeleton) DeleteTaskMarkdown(ctx context.Context, workspaceID, t
 		if err != nil {
 			return err
 		}
-		if s.mdStore != nil {
-			if err := s.mdStore.DeleteTaskMarkdown(txCtx, workspaceID, taskID); err != nil {
-				return err
+		if authctx.ShouldEmitTaskSignal(txCtx) && next.Status.AcceptsSignal() {
+			touched, tErr := scopedRepo.TouchSignal(txCtx, workspaceID, taskID, now)
+			if tErr != nil && !errors.Is(tErr, errs.ErrNotImplemented) {
+				return tErr
+			}
+			if tErr == nil {
+				next = touched
 			}
 		}
 		newSnap, err := marshalSnapshot(op, next)
@@ -2103,6 +2239,12 @@ func (s *ServiceSkeleton) DeleteTaskMarkdown(ctx context.Context, workspaceID, t
 		return nil
 	}); err != nil {
 		return Task{}, err
+	}
+
+	if s.mdStore != nil {
+		if err := s.mdStore.DeleteTaskMarkdown(context.WithoutCancel(ctx), workspaceID, taskID); err != nil {
+			return Task{}, err
+		}
 	}
 	return updated.Clone(), nil
 }
@@ -2349,7 +2491,7 @@ func (s *ServiceSkeleton) PruneOrphans(ctx context.Context, workspaceID uuid.UUI
 				if _, uErr := scopedRepo.SetHasMarkdownDoc(txCtx, workspaceID, t.ID, false); uErr != nil && !errors.Is(uErr, errs.ErrNotFound) {
 					return uErr
 				}
-				_ = scope.Audit().Record(txCtx, tx.AuditEntry{
+				if aErr := scope.Audit().Record(txCtx, tx.AuditEntry{
 					ID:           newUUID(),
 					WorkspaceID:  workspaceID,
 					ActorID:      caller.ActorID,
@@ -2357,7 +2499,9 @@ func (s *ServiceSkeleton) PruneOrphans(ctx context.Context, workspaceID uuid.UUI
 					ResourceType: "task",
 					ResourceID:   t.ID.String(),
 					OccurredAt:   now,
-				})
+				}); aErr != nil {
+					return aErr
+				}
 			}
 			if s.projDocs != nil {
 				for _, p := range found.missingProjectDocs {

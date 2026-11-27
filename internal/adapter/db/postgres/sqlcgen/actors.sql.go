@@ -11,6 +11,22 @@ import (
 	"github.com/google/uuid"
 )
 
+const checkActorIDExists = `-- name: CheckActorIDExists :one
+SELECT EXISTS (
+    SELECT 1
+    FROM actors
+    WHERE id = $1
+)
+`
+
+// CheckActorIDExists reports whether an actor primary key UUID is already allocated in any workspace.
+func (q *Queries) CheckActorIDExists(ctx context.Context, id uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, checkActorIDExists, id)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const createActor = `-- name: CreateActor :one
 
 INSERT INTO actors (

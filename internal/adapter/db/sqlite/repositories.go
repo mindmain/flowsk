@@ -29,11 +29,12 @@ import (
 
 // Compile-time repository interface checks.
 var (
-	_ workspace.Repository = (*WorkspaceRepository)(nil)
-	_ project.Repository   = (*ProjectRepository)(nil)
-	_ objective.Repository = (*ObjectiveRepository)(nil)
-	_ task.Repository      = (*TaskRepository)(nil)
-	_ audit.Repository     = (*AuditRepository)(nil)
+	_ workspace.Repository            = (*WorkspaceRepository)(nil)
+	_ project.Repository              = (*ProjectRepository)(nil)
+	_ project.BoardMetadataRepository = (*ProjectRepository)(nil)
+	_ objective.Repository            = (*ObjectiveRepository)(nil)
+	_ task.Repository                 = (*TaskRepository)(nil)
+	_ audit.Repository                = (*AuditRepository)(nil)
 )
 
 // resolveReadQuerier selects either the active transaction Querier or the concurrent read pool.
@@ -746,7 +747,8 @@ func (r *ProjectRepository) NextTaskSequence(ctx context.Context, workspaceID, p
 	return updated.KeyPrefix, updated.IssueCounter, nil
 }
 
-// SoftDelete marks (workspaceID, projectID) as soft-deleted.
+// SoftDelete marks (workspaceID, projectID) as soft-deleted after cascading soft-deletes
+// to its tasks (releasing active leases) and objectives inside the enclosing transaction.
 func (r *ProjectRepository) SoftDelete(ctx context.Context, workspaceID, projectID uuid.UUID) error {
 	const op = "sqlite.ProjectRepository.SoftDelete"
 	if err := ctx.Err(); err != nil {
@@ -758,9 +760,29 @@ func (r *ProjectRepository) SoftDelete(ctx context.Context, workspaceID, project
 	}
 	defer release()
 
+	wsStr := workspaceID.String()
+	projStr := projectID.String()
+	if _, err := q.GetProjectByID(ctx, sqlcgen.GetProjectByIDParams{
+		WorkspaceID: wsStr,
+		ID:          projStr,
+	}); err != nil {
+		return db.MapSQLDriverError(op, err)
+	}
+	if err := q.SoftDeleteTasksByProject(ctx, sqlcgen.SoftDeleteTasksByProjectParams{
+		WorkspaceID: wsStr,
+		ProjectID:   projStr,
+	}); err != nil {
+		return db.MapSQLDriverError(op, err)
+	}
+	if err := q.SoftDeleteObjectivesByProject(ctx, sqlcgen.SoftDeleteObjectivesByProjectParams{
+		WorkspaceID: wsStr,
+		ProjectID:   projStr,
+	}); err != nil {
+		return db.MapSQLDriverError(op, err)
+	}
 	rows, err := q.SoftDeleteProject(ctx, sqlcgen.SoftDeleteProjectParams{
-		WorkspaceID: workspaceID.String(),
-		ID:          projectID.String(),
+		WorkspaceID: wsStr,
+		ID:          projStr,
 	})
 	if err != nil {
 		return db.MapSQLDriverError(op, err)
@@ -768,10 +790,12 @@ func (r *ProjectRepository) SoftDelete(ctx context.Context, workspaceID, project
 	if rows == 0 {
 		return errs.New(errs.ErrNotFound, op, "project not found or already soft-deleted")
 	}
-	_ = q.DeleteProjectBindingsForProject(ctx, sqlcgen.DeleteProjectBindingsForProjectParams{
-		WorkspaceID: workspaceID.String(),
-		ProjectID:   projectID.String(),
-	})
+	if err := q.DeleteProjectBindingsForProject(ctx, sqlcgen.DeleteProjectBindingsForProjectParams{
+		WorkspaceID: wsStr,
+		ProjectID:   projStr,
+	}); err != nil {
+		return db.MapSQLDriverError(op, err)
+	}
 	return nil
 }
 
@@ -942,6 +966,379 @@ func (r *ProjectRepository) SetHasMarkdownDoc(ctx context.Context, workspaceID, 
 		return project.Project{}, db.MapSQLDriverError(op, err)
 	}
 	return mapSQLiteProject(row, buildSQLiteActorLookup(ctx, q, workspaceID))
+}
+
+func mapSQLiteWorkflowState(row sqlcgen.WorkflowState) (project.WorkflowState, error) {
+	id, err := uuid.Parse(row.ID)
+	if err != nil {
+		return project.WorkflowState{}, err
+	}
+	wsID, err := uuid.Parse(row.WorkspaceID)
+	if err != nil {
+		return project.WorkflowState{}, err
+	}
+	projID, err := uuid.Parse(row.ProjectID)
+	if err != nil {
+		return project.WorkflowState{}, err
+	}
+	return project.WorkflowState{
+		ID:          id,
+		WorkspaceID: wsID,
+		ProjectID:   projID,
+		Name:        row.Name,
+		Category:    db.DomainWorkflowStateCategory(row.Name, row.Category),
+		ColorHex:    row.Color,
+		Position:    int32(row.Position),
+		IsDefault:   row.IsDefault != 0,
+		CreatedAt:   db.ParseSQLiteTime(row.CreatedAt),
+		UpdatedAt:   db.ParseSQLiteTime(row.UpdatedAt),
+	}, nil
+}
+
+func mapSQLiteProjectLabel(row sqlcgen.Label) (project.ProjectLabel, error) {
+	id, err := uuid.Parse(row.ID)
+	if err != nil {
+		return project.ProjectLabel{}, err
+	}
+	wsID, err := uuid.Parse(row.WorkspaceID)
+	if err != nil {
+		return project.ProjectLabel{}, err
+	}
+	var projID uuid.UUID
+	if row.ProjectID != nil && *row.ProjectID != "" {
+		projID, _ = uuid.Parse(*row.ProjectID)
+	}
+	return project.ProjectLabel{
+		ID:          id,
+		WorkspaceID: wsID,
+		ProjectID:   projID,
+		Name:        row.Name,
+		ColorHex:    row.Color,
+		Description: row.Description,
+		CreatedAt:   db.ParseSQLiteTime(row.CreatedAt),
+		UpdatedAt:   db.ParseSQLiteTime(row.UpdatedAt),
+	}, nil
+}
+
+// ListWorkflowStates returns all active WorkflowStates for (workspaceID, projectID) ordered by Position.
+func (r *ProjectRepository) ListWorkflowStates(ctx context.Context, workspaceID, projectID uuid.UUID) ([]project.WorkflowState, error) {
+	const op = "sqlite.ProjectRepository.ListWorkflowStates"
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+	q, err := resolveReadQuerier(r.adapter, r.scoped, r.scope)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := q.GetProjectByID(ctx, sqlcgen.GetProjectByIDParams{
+		WorkspaceID: workspaceID.String(),
+		ID:          projectID.String(),
+	}); err != nil {
+		return nil, db.MapSQLDriverError(op, err)
+	}
+	rows, err := q.ListWorkflowStatesByProject(ctx, sqlcgen.ListWorkflowStatesByProjectParams{
+		WorkspaceID: workspaceID.String(),
+		ProjectID:   projectID.String(),
+	})
+	if err != nil {
+		return nil, db.MapSQLDriverError(op, err)
+	}
+	out := make([]project.WorkflowState, 0, len(rows))
+	for _, row := range rows {
+		if st, mErr := mapSQLiteWorkflowState(row); mErr == nil {
+			out = append(out, st)
+		}
+	}
+	return out, nil
+}
+
+// CreateWorkflowState inserts a custom WorkflowState scoped to (st.WorkspaceID, st.ProjectID).
+func (r *ProjectRepository) CreateWorkflowState(ctx context.Context, st project.WorkflowState) (project.WorkflowState, error) {
+	const op = "sqlite.ProjectRepository.CreateWorkflowState"
+	if err := ctx.Err(); err != nil {
+		return project.WorkflowState{}, fmt.Errorf("%s: %w", op, err)
+	}
+	q, release, err := resolveWriteQuerier(ctx, op, r.adapter, r.scoped, r.scope)
+	if err != nil {
+		return project.WorkflowState{}, err
+	}
+	defer release()
+
+	wsStr := st.WorkspaceID.String()
+	projStr := st.ProjectID.String()
+	if _, err := q.GetProjectByID(ctx, sqlcgen.GetProjectByIDParams{
+		WorkspaceID: wsStr,
+		ID:          projStr,
+	}); err != nil {
+		return project.WorkflowState{}, db.MapSQLDriverError(op, err)
+	}
+	if st.IsDefault {
+		existing, lErr := q.ListWorkflowStatesByProject(ctx, sqlcgen.ListWorkflowStatesByProjectParams{
+			WorkspaceID: wsStr,
+			ProjectID:   projStr,
+		})
+		if lErr != nil {
+			return project.WorkflowState{}, db.MapSQLDriverError(op, lErr)
+		}
+		zero := int64(0)
+		for _, ex := range existing {
+			if ex.IsDefault != 0 {
+				if _, uErr := q.UpdateWorkflowState(ctx, sqlcgen.UpdateWorkflowStateParams{
+					IsDefault:   &zero,
+					WorkspaceID: wsStr,
+					ProjectID:   projStr,
+					ID:          ex.ID,
+				}); uErr != nil {
+					return project.WorkflowState{}, db.MapSQLDriverError(op, uErr)
+				}
+			}
+		}
+	}
+
+	stID := st.ID
+	if stID == uuid.Nil {
+		stID = uuid.New()
+	}
+	var isDef int64
+	if st.IsDefault {
+		isDef = 1
+	}
+	color := st.ColorHex
+	if strings.TrimSpace(color) == "" {
+		color = "#6B7280"
+	}
+	row, err := q.CreateWorkflowState(ctx, sqlcgen.CreateWorkflowStateParams{
+		ID:          stID.String(),
+		WorkspaceID: wsStr,
+		ProjectID:   projStr,
+		Name:        st.Name,
+		Category:    db.SQLWorkflowStateCategory(st.Category),
+		Position:    int64(st.Position),
+		Color:       color,
+		IsDefault:   isDef,
+	})
+	if err != nil {
+		return project.WorkflowState{}, db.MapSQLDriverError(op, err)
+	}
+	mapped, err := mapSQLiteWorkflowState(row)
+	if err != nil {
+		return project.WorkflowState{}, err
+	}
+	mapped.Description = st.Description
+	if strings.EqualFold(strings.TrimSpace(st.Category), "archived") {
+		mapped.Category = "archived"
+	}
+	return mapped, nil
+}
+
+// UpdateWorkflowState mutates an existing WorkflowState inside (in.WorkspaceID, in.ProjectID).
+func (r *ProjectRepository) UpdateWorkflowState(ctx context.Context, in project.UpdateWorkflowStateInput) (project.WorkflowState, error) {
+	const op = "sqlite.ProjectRepository.UpdateWorkflowState"
+	if err := ctx.Err(); err != nil {
+		return project.WorkflowState{}, fmt.Errorf("%s: %w", op, err)
+	}
+	q, release, err := resolveWriteQuerier(ctx, op, r.adapter, r.scoped, r.scope)
+	if err != nil {
+		return project.WorkflowState{}, err
+	}
+	defer release()
+
+	wsStr := in.WorkspaceID.String()
+	projStr := in.ProjectID.String()
+	stStr := in.StateID.String()
+	if _, err := q.GetProjectByID(ctx, sqlcgen.GetProjectByIDParams{
+		WorkspaceID: wsStr,
+		ID:          projStr,
+	}); err != nil {
+		return project.WorkflowState{}, db.MapSQLDriverError(op, err)
+	}
+	cur, err := q.GetWorkflowStateByID(ctx, sqlcgen.GetWorkflowStateByIDParams{
+		WorkspaceID: wsStr,
+		ID:          stStr,
+	})
+	if err != nil {
+		return project.WorkflowState{}, db.MapSQLDriverError(op, err)
+	}
+	if cur.ProjectID != projStr {
+		return project.WorkflowState{}, errs.New(errs.ErrNotFound, op, "workflow state not found in project")
+	}
+
+	if in.IsDefault != nil && *in.IsDefault {
+		existing, lErr := q.ListWorkflowStatesByProject(ctx, sqlcgen.ListWorkflowStatesByProjectParams{
+			WorkspaceID: wsStr,
+			ProjectID:   projStr,
+		})
+		if lErr != nil {
+			return project.WorkflowState{}, db.MapSQLDriverError(op, lErr)
+		}
+		zero := int64(0)
+		for _, ex := range existing {
+			if ex.ID != stStr && ex.IsDefault != 0 {
+				if _, uErr := q.UpdateWorkflowState(ctx, sqlcgen.UpdateWorkflowStateParams{
+					IsDefault:   &zero,
+					WorkspaceID: wsStr,
+					ProjectID:   projStr,
+					ID:          ex.ID,
+				}); uErr != nil {
+					return project.WorkflowState{}, db.MapSQLDriverError(op, uErr)
+				}
+			}
+		}
+	}
+
+	var catPtr *string
+	if in.Category != nil {
+		sqlCat := db.SQLWorkflowStateCategory(*in.Category)
+		catPtr = &sqlCat
+	}
+	var posPtr *int64
+	if in.Position != nil {
+		p := int64(*in.Position)
+		posPtr = &p
+	}
+	var defPtr *int64
+	if in.IsDefault != nil {
+		var d int64
+		if *in.IsDefault {
+			d = 1
+		}
+		defPtr = &d
+	}
+
+	row, err := q.UpdateWorkflowState(ctx, sqlcgen.UpdateWorkflowStateParams{
+		Name:        in.Name,
+		Category:    catPtr,
+		Position:    posPtr,
+		Color:       in.ColorHex,
+		IsDefault:   defPtr,
+		WorkspaceID: wsStr,
+		ProjectID:   projStr,
+		ID:          stStr,
+	})
+	if err != nil {
+		return project.WorkflowState{}, db.MapSQLDriverError(op, err)
+	}
+	mapped, err := mapSQLiteWorkflowState(row)
+	if err != nil {
+		return project.WorkflowState{}, err
+	}
+	if in.Description != nil {
+		mapped.Description = *in.Description
+	}
+	if in.Category != nil && strings.EqualFold(strings.TrimSpace(*in.Category), "archived") {
+		mapped.Category = "archived"
+	}
+	return mapped, nil
+}
+
+// ListLabels returns active ProjectLabels visible to (workspaceID, projectID).
+func (r *ProjectRepository) ListLabels(ctx context.Context, workspaceID, projectID uuid.UUID) ([]project.ProjectLabel, error) {
+	const op = "sqlite.ProjectRepository.ListLabels"
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+	q, err := resolveReadQuerier(r.adapter, r.scoped, r.scope)
+	if err != nil {
+		return nil, err
+	}
+	wsStr := workspaceID.String()
+	projStr := projectID.String()
+	if _, err := q.GetProjectByID(ctx, sqlcgen.GetProjectByIDParams{
+		WorkspaceID: wsStr,
+		ID:          projStr,
+	}); err != nil {
+		return nil, db.MapSQLDriverError(op, err)
+	}
+	rows, err := q.ListLabelsByProject(ctx, sqlcgen.ListLabelsByProjectParams{
+		WorkspaceID: wsStr,
+		ProjectID:   &projStr,
+	})
+	if err != nil {
+		return nil, db.MapSQLDriverError(op, err)
+	}
+	out := make([]project.ProjectLabel, 0, len(rows))
+	for _, row := range rows {
+		if lbl, mErr := mapSQLiteProjectLabel(row); mErr == nil {
+			out = append(out, lbl)
+		}
+	}
+	return out, nil
+}
+
+// CreateLabel inserts a new ProjectLabel scoped to (lbl.WorkspaceID, lbl.ProjectID).
+func (r *ProjectRepository) CreateLabel(ctx context.Context, lbl project.ProjectLabel) (project.ProjectLabel, error) {
+	const op = "sqlite.ProjectRepository.CreateLabel"
+	if err := ctx.Err(); err != nil {
+		return project.ProjectLabel{}, fmt.Errorf("%s: %w", op, err)
+	}
+	q, release, err := resolveWriteQuerier(ctx, op, r.adapter, r.scoped, r.scope)
+	if err != nil {
+		return project.ProjectLabel{}, err
+	}
+	defer release()
+
+	wsStr := lbl.WorkspaceID.String()
+	projStr := lbl.ProjectID.String()
+	if _, err := q.GetProjectByID(ctx, sqlcgen.GetProjectByIDParams{
+		WorkspaceID: wsStr,
+		ID:          projStr,
+	}); err != nil {
+		return project.ProjectLabel{}, db.MapSQLDriverError(op, err)
+	}
+	lblID := lbl.ID
+	if lblID == uuid.Nil {
+		lblID = uuid.New()
+	}
+	color := lbl.ColorHex
+	if strings.TrimSpace(color) == "" {
+		color = "#6B7280"
+	}
+	row, err := q.CreateLabel(ctx, sqlcgen.CreateLabelParams{
+		ID:          lblID.String(),
+		WorkspaceID: wsStr,
+		ProjectID:   &projStr,
+		Name:        lbl.Name,
+		Color:       color,
+		Description: lbl.Description,
+	})
+	if err != nil {
+		return project.ProjectLabel{}, db.MapSQLDriverError(op, err)
+	}
+	return mapSQLiteProjectLabel(row)
+}
+
+// DeleteLabel soft-deletes an active ProjectLabel matching (workspaceID, projectID, labelID).
+func (r *ProjectRepository) DeleteLabel(ctx context.Context, workspaceID, projectID, labelID uuid.UUID) error {
+	const op = "sqlite.ProjectRepository.DeleteLabel"
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	q, release, err := resolveWriteQuerier(ctx, op, r.adapter, r.scoped, r.scope)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	wsStr := workspaceID.String()
+	projStr := projectID.String()
+	if _, err := q.GetProjectByID(ctx, sqlcgen.GetProjectByIDParams{
+		WorkspaceID: wsStr,
+		ID:          projStr,
+	}); err != nil {
+		return db.MapSQLDriverError(op, err)
+	}
+	rows, err := q.SoftDeleteLabel(ctx, sqlcgen.SoftDeleteLabelParams{
+		WorkspaceID: wsStr,
+		ProjectID:   &projStr,
+		ID:          labelID.String(),
+	})
+	if err != nil {
+		return db.MapSQLDriverError(op, err)
+	}
+	if rows == 0 {
+		return errs.New(errs.ErrNotFound, op, "label not found in project")
+	}
+	return nil
 }
 
 // =============================================================================
@@ -1236,13 +1633,15 @@ func (r *ObjectiveRepository) Update(ctx context.Context, o objective.Objective)
 	}
 
 	_, err = q.UpdateObjective(ctx, sqlcgen.UpdateObjectiveParams{
-		Title:       &o.Title,
-		Description: &encodedDesc,
-		Kind:        kindPtr,
-		Status:      &statusStr,
-		TargetDate:  targetPtr,
-		WorkspaceID: o.WorkspaceID.String(),
-		ID:          o.ID.String(),
+		ParentObjectiveID: existing.ParentObjectiveID,
+		Title:             &o.Title,
+		Description:       &encodedDesc,
+		Kind:              kindPtr,
+		Status:            &statusStr,
+		StartsAt:          existing.StartsAt,
+		TargetDate:        targetPtr,
+		WorkspaceID:       o.WorkspaceID.String(),
+		ID:                o.ID.String(),
 	})
 	return db.MapSQLDriverError(op, err)
 }
@@ -1495,6 +1894,13 @@ func mapSQLiteTaskRow(
 		parsed := db.ParseSQLiteTime(*row.CompletedAt)
 		completedAt = &parsed
 	}
+	var lastSignalAt *time.Time
+	if row.LastSignalAt != nil {
+		parsed := db.ParseSQLiteTime(*row.LastSignalAt)
+		if !parsed.IsZero() {
+			lastSignalAt = &parsed
+		}
+	}
 	var deletedAt *time.Time
 	if row.DeletedAt != nil {
 		parsed := db.ParseSQLiteTime(*row.DeletedAt)
@@ -1531,6 +1937,7 @@ func mapSQLiteTaskRow(
 		CreatedAt:              db.ParseSQLiteTime(row.CreatedAt),
 		UpdatedAt:              db.ParseSQLiteTime(row.UpdatedAt),
 		CompletedAt:            completedAt,
+		LastSignalAt:           lastSignalAt,
 		DeletedAt:              deletedAt,
 	}, storedLease, nil
 }
@@ -1547,58 +1954,104 @@ func (r *TaskRepository) Create(ctx context.Context, t task.Task) error {
 	}
 	defer release()
 
+	wsStr := t.WorkspaceID.String()
+	projStr := t.ProjectID.String()
 	if _, err := q.GetProjectByID(ctx, sqlcgen.GetProjectByIDParams{
-		WorkspaceID: t.WorkspaceID.String(),
-		ID:          t.ProjectID.String(),
+		WorkspaceID: wsStr,
+		ID:          projStr,
 	}); err != nil {
 		return db.MapSQLDriverError(op, err)
 	}
 
-	existingTasks, err := q.ListTasksByProject(ctx, sqlcgen.ListTasksByProjectParams{
-		WorkspaceID: t.WorkspaceID.String(),
-		ProjectID:   t.ProjectID.String(),
-	})
-	if err != nil {
-		return db.MapSQLDriverError(op, err)
+	var objPtr, parentPtr *string
+	if t.ObjectiveID != nil && *t.ObjectiveID != uuid.Nil {
+		objRow, objErr := q.GetObjectiveByID(ctx, sqlcgen.GetObjectiveByIDParams{
+			WorkspaceID: wsStr,
+			ID:          t.ObjectiveID.String(),
+		})
+		if objErr != nil {
+			if errors.Is(objErr, sql.ErrNoRows) {
+				return errs.New(errs.ErrNotFound, op, "objective not found in workspace")
+			}
+			return db.MapSQLDriverError(op, objErr)
+		}
+		if objRow.ProjectID != projStr {
+			return errs.Validation(op, "objective belongs to a different project", errs.FieldViolation{
+				Field:       "objective_id",
+				Description: "objective_id must belong to the same project_id",
+			})
+		}
+		s := t.ObjectiveID.String()
+		objPtr = &s
 	}
-	usedSeqs := make(map[int64]bool, len(existingTasks))
-	for _, ex := range existingTasks {
-		usedSeqs[ex.SequenceNumber] = true
+	if t.ParentTaskID != nil && *t.ParentTaskID != uuid.Nil {
+		s := t.ParentTaskID.String()
+		parentPtr = &s
 	}
 
 	key := strings.TrimSpace(t.Key)
 	var seqNum int64
-	if key == "" {
+	reallocate := key == ""
+	keepCustomKey := false
+
+	if !reallocate {
+		if parsedSeq, ok := db.ParseTrailingSequence(key); ok {
+			conflict, cErr := q.CheckTaskSequenceOrIdentifierConflict(ctx, sqlcgen.CheckTaskSequenceOrIdentifierConflictParams{
+				WorkspaceID:    wsStr,
+				ProjectID:      projStr,
+				SequenceNumber: parsedSeq,
+				Identifier:     key,
+			})
+			if cErr != nil {
+				return db.MapSQLDriverError(op, cErr)
+			}
+			if !conflict {
+				seqNum = parsedSeq
+			} else {
+				reallocate = true
+			}
+		} else {
+			idConflict, cErr := q.CheckTaskSequenceOrIdentifierConflict(ctx, sqlcgen.CheckTaskSequenceOrIdentifierConflictParams{
+				WorkspaceID:    wsStr,
+				ProjectID:      projStr,
+				SequenceNumber: -1,
+				Identifier:     key,
+			})
+			if cErr != nil {
+				return db.MapSQLDriverError(op, cErr)
+			}
+			keepCustomKey = !idConflict
+			reallocate = true
+		}
+	}
+
+	if reallocate {
 		for {
 			incProj, incErr := q.IncrementProjectIssueCounter(ctx, sqlcgen.IncrementProjectIssueCounterParams{
-				WorkspaceID: t.WorkspaceID.String(),
-				ID:          t.ProjectID.String(),
+				WorkspaceID: wsStr,
+				ID:          projStr,
 			})
 			if incErr != nil {
 				return db.MapSQLDriverError(op, incErr)
 			}
-			if !usedSeqs[incProj.IssueCounter] {
-				seqNum = incProj.IssueCounter
-				key = fmt.Sprintf("%s-%d", incProj.KeyPrefix, seqNum)
-				break
+			candidateSeq := incProj.IssueCounter
+			candidateKey := fmt.Sprintf("%s-%d", incProj.KeyPrefix, candidateSeq)
+			if keepCustomKey {
+				candidateKey = key
 			}
-		}
-	} else {
-		if parsedSeq, ok := db.ParseTrailingSequence(key); ok && !usedSeqs[parsedSeq] {
-			seqNum = parsedSeq
-		} else {
-			for {
-				incProj, incErr := q.IncrementProjectIssueCounter(ctx, sqlcgen.IncrementProjectIssueCounterParams{
-					WorkspaceID: t.WorkspaceID.String(),
-					ID:          t.ProjectID.String(),
-				})
-				if incErr != nil {
-					return db.MapSQLDriverError(op, incErr)
-				}
-				if !usedSeqs[incProj.IssueCounter] {
-					seqNum = incProj.IssueCounter
-					break
-				}
+			conflict, cErr := q.CheckTaskSequenceOrIdentifierConflict(ctx, sqlcgen.CheckTaskSequenceOrIdentifierConflictParams{
+				WorkspaceID:    wsStr,
+				ProjectID:      projStr,
+				SequenceNumber: candidateSeq,
+				Identifier:     candidateKey,
+			})
+			if cErr != nil {
+				return db.MapSQLDriverError(op, cErr)
+			}
+			if !conflict {
+				seqNum = candidateSeq
+				key = candidateKey
+				break
 			}
 		}
 	}
@@ -1614,16 +2067,6 @@ func (r *TaskRepository) Create(ctx context.Context, t task.Task) error {
 	stateID, err := resolveSQLiteWorkflowStateID(ctx, q, t.WorkspaceID, t.ProjectID, status)
 	if err != nil {
 		return db.MapSQLDriverError(op, err)
-	}
-
-	var objPtr, parentPtr *string
-	if t.ObjectiveID != nil && *t.ObjectiveID != uuid.Nil {
-		s := t.ObjectiveID.String()
-		objPtr = &s
-	}
-	if t.ParentTaskID != nil && *t.ParentTaskID != uuid.Nil {
-		s := t.ParentTaskID.String()
-		parentPtr = &s
 	}
 
 	reporterPtr, err := ensureSQLiteActorRow(ctx, q, t.WorkspaceID, t.CreatedBy, "", "")
@@ -1656,6 +2099,11 @@ func (r *TaskRepository) Create(ctx context.Context, t task.Task) error {
 	if trimmedExt := strings.TrimSpace(t.ExternalID); trimmedExt != "" {
 		extPtr = &trimmedExt
 	}
+	var lastSignalPtr *string
+	if t.LastSignalAt != nil && !t.LastSignalAt.IsZero() {
+		s := db.FormatSQLiteTime(t.LastSignalAt.UTC())
+		lastSignalPtr = &s
+	}
 
 	_, err = q.CreateTask(ctx, sqlcgen.CreateTaskParams{
 		ID:                 taskID.String(),
@@ -1675,6 +2123,7 @@ func (r *TaskRepository) Create(ctx context.Context, t task.Task) error {
 		ReporterActorID:    reporterPtr,
 		AssigneeActorID:    assigneePtr,
 		CompletedAt:        completedPtr,
+		LastSignalAt:       lastSignalPtr,
 	})
 	return db.MapSQLDriverError(op, err)
 }
@@ -1795,6 +2244,22 @@ func (r *TaskRepository) Update(ctx context.Context, t task.Task, expectedVersio
 
 	var objPtr, parentPtr, assigneePtr *string
 	if t.ObjectiveID != nil && *t.ObjectiveID != uuid.Nil {
+		objRow, objErr := q.GetObjectiveByID(ctx, sqlcgen.GetObjectiveByIDParams{
+			WorkspaceID: t.WorkspaceID.String(),
+			ID:          t.ObjectiveID.String(),
+		})
+		if objErr != nil {
+			if errors.Is(objErr, sql.ErrNoRows) {
+				return errs.New(errs.ErrNotFound, op, "objective not found in workspace")
+			}
+			return db.MapSQLDriverError(op, objErr)
+		}
+		if objRow.ProjectID != existing.ProjectID {
+			return errs.Validation(op, "objective belongs to a different project", errs.FieldViolation{
+				Field:       "objective_id",
+				Description: "objective_id must belong to the same project_id",
+			})
+		}
 		s := t.ObjectiveID.String()
 		objPtr = &s
 	}
@@ -1814,6 +2279,12 @@ func (r *TaskRepository) Update(ctx context.Context, t task.Task, expectedVersio
 	encodedDesc := db.EncodeTaskDescription(t, nextVersion)
 	encodedAC := db.EncodeAcceptanceCriteria(t.AcceptanceCriteria)
 
+	var lastSignalPtr *string
+	if t.LastSignalAt != nil && !t.LastSignalAt.IsZero() {
+		s := db.FormatSQLiteTime(t.LastSignalAt.UTC())
+		lastSignalPtr = &s
+	}
+
 	if _, err := q.UpdateTask(ctx, sqlcgen.UpdateTaskParams{
 		ObjectiveID:        objPtr,
 		ParentTaskID:       parentPtr,
@@ -1822,7 +2293,9 @@ func (r *TaskRepository) Update(ctx context.Context, t task.Task, expectedVersio
 		Title:              &t.Title,
 		Description:        &encodedDesc,
 		AcceptanceCriteria: &encodedAC,
+		EstimatePoints:     existing.EstimatePoints,
 		AssigneeActorID:    assigneePtr,
+		LastSignalAt:       lastSignalPtr,
 		WorkspaceID:        t.WorkspaceID.String(),
 		ID:                 t.ID.String(),
 	}); err != nil {
@@ -1948,6 +2421,36 @@ func (r *TaskRepository) SetHasMarkdownDoc(ctx context.Context, workspaceID, tas
 	return mapped, db.MapSQLDriverError(op, err)
 }
 
+// TouchSignal updates last_signal_at on (workspaceID, taskID) without changing updated_at and returns the updated Task.
+func (r *TaskRepository) TouchSignal(ctx context.Context, workspaceID, taskID uuid.UUID, signalAt time.Time) (task.Task, error) {
+	const op = "sqlite.TaskRepository.TouchSignal"
+	if err := ctx.Err(); err != nil {
+		return task.Task{}, fmt.Errorf("%s: %w", op, err)
+	}
+	q, release, err := resolveWriteQuerier(ctx, op, r.adapter, r.scoped, r.scope)
+	if err != nil {
+		return task.Task{}, err
+	}
+	defer release()
+
+	var sigPtr *string
+	if !signalAt.IsZero() {
+		formatted := db.FormatSQLiteTime(signalAt.UTC())
+		sigPtr = &formatted
+	}
+	row, err := q.TouchTaskLastSignal(ctx, sqlcgen.TouchTaskLastSignalParams{
+		LastSignalAt: sigPtr,
+		WorkspaceID:  workspaceID.String(),
+		ID:           taskID.String(),
+	})
+	if err != nil {
+		return task.Task{}, db.MapSQLDriverError(op, err)
+	}
+	actorMap := buildSQLiteActorLookup(ctx, q, workspaceID)
+	mapped, _, err := mapSQLiteTaskRow(ctx, q, row, actorMap, make(map[string]map[string]task.Status), time.Now().UTC())
+	return mapped, db.MapSQLDriverError(op, err)
+}
+
 // HardDelete detaches child subtasks and permanently deletes (workspaceID, taskID).
 func (r *TaskRepository) HardDelete(ctx context.Context, workspaceID, taskID uuid.UUID) error {
 	const op = "sqlite.TaskRepository.HardDelete"
@@ -1960,15 +2463,33 @@ func (r *TaskRepository) HardDelete(ctx context.Context, workspaceID, taskID uui
 	}
 	defer release()
 
+	wsStr := workspaceID.String()
 	taskIDStr := taskID.String()
+	rels, err := q.ListTaskRelations(ctx, sqlcgen.ListTaskRelationsParams{
+		WorkspaceID: wsStr,
+		TaskID:      taskIDStr,
+	})
+	if err != nil {
+		return db.MapSQLDriverError(op, err)
+	}
+	for _, rel := range rels {
+		if relID, pErr := uuid.Parse(rel.ID); pErr == nil {
+			if dErr := q.DeleteDSLExecutionBatchByIdempotencyKey(ctx, sqlcgen.DeleteDSLExecutionBatchByIdempotencyKeyParams{
+				WorkspaceID:    wsStr,
+				IdempotencyKey: db.RelationMetaIdempotencyKey(relID),
+			}); dErr != nil {
+				return db.MapSQLDriverError(op, dErr)
+			}
+		}
+	}
 	if err := q.DetachSubtasksFromParent(ctx, sqlcgen.DetachSubtasksFromParentParams{
-		WorkspaceID:  workspaceID.String(),
+		WorkspaceID:  wsStr,
 		ParentTaskID: &taskIDStr,
 	}); err != nil {
 		return db.MapSQLDriverError(op, err)
 	}
 	rows, err := q.HardDeleteTask(ctx, sqlcgen.HardDeleteTaskParams{
-		WorkspaceID: workspaceID.String(),
+		WorkspaceID: wsStr,
 		ID:          taskIDStr,
 	})
 	if err != nil {
@@ -2356,8 +2877,9 @@ func (r *TaskRepository) DeleteRelation(ctx context.Context, workspaceID, relati
 	}
 	defer release()
 
+	wsStr := workspaceID.String()
 	rows, err := q.DeleteTaskRelation(ctx, sqlcgen.DeleteTaskRelationParams{
-		WorkspaceID: workspaceID.String(),
+		WorkspaceID: wsStr,
 		ID:          relationID.String(),
 	})
 	if err != nil {
@@ -2365,6 +2887,12 @@ func (r *TaskRepository) DeleteRelation(ctx context.Context, workspaceID, relati
 	}
 	if rows == 0 {
 		return errs.New(errs.ErrNotFound, op, "task relation not found")
+	}
+	if err := q.DeleteDSLExecutionBatchByIdempotencyKey(ctx, sqlcgen.DeleteDSLExecutionBatchByIdempotencyKeyParams{
+		WorkspaceID:    wsStr,
+		IdempotencyKey: db.RelationMetaIdempotencyKey(relationID),
+	}); err != nil {
+		return db.MapSQLDriverError(op, err)
 	}
 	return nil
 }
@@ -2612,32 +3140,85 @@ func (r *AuditRepository) Query(ctx context.Context, filter audit.QueryFilter) (
 		return nil, err
 	}
 
-	const scanBatchSize = int64(10000)
-	var rows []sqlcgen.AuditLog
-	if filter.ResourceType != "" && filter.ResourceID != "" {
-		rows, err = q.ListAuditLogsByResource(ctx, sqlcgen.ListAuditLogsByResourceParams{
-			WorkspaceID:  filter.WorkspaceID.String(),
-			ResourceType: filter.ResourceType,
-			ResourceID:   filter.ResourceID,
-			Offset:       0,
-			Limit:        scanBatchSize,
-		})
-	} else {
-		rows, err = q.ListAuditLogsByWorkspace(ctx, sqlcgen.ListAuditLogsByWorkspaceParams{
-			WorkspaceID: filter.WorkspaceID.String(),
-			Offset:      0,
-			Limit:       scanBatchSize,
-		})
-	}
-	if err != nil {
-		return nil, db.MapSQLDriverError(op, err)
+	wsStr := filter.WorkspaceID.String()
+	actorMap := buildSQLiteActorLookup(ctx, q, filter.WorkspaceID)
+	hasBothResource := filter.ResourceType != "" && filter.ResourceID != ""
+	effectiveLimit := filter.Limit
+	if effectiveLimit <= 0 {
+		effectiveLimit = 100
 	}
 
-	actorMap := buildSQLiteActorLookup(ctx, q, filter.WorkspaceID)
-	mapped := make([]audit.Record, 0, len(rows))
-	for _, row := range rows {
-		if rec, mErr := mapSQLiteAuditRecord(row, actorMap); mErr == nil {
-			mapped = append(mapped, rec)
+	if !db.AuditQueryNeedsPostFilter(filter) {
+		sqlOffset := int64(max(filter.Offset, 0))
+		sqlLimit := int64(effectiveLimit)
+		var rows []sqlcgen.AuditLog
+		if hasBothResource {
+			rows, err = q.ListAuditLogsByResource(ctx, sqlcgen.ListAuditLogsByResourceParams{
+				WorkspaceID:  wsStr,
+				ResourceType: filter.ResourceType,
+				ResourceID:   filter.ResourceID,
+				Offset:       sqlOffset,
+				Limit:        sqlLimit,
+			})
+		} else {
+			rows, err = q.ListAuditLogsByWorkspace(ctx, sqlcgen.ListAuditLogsByWorkspaceParams{
+				WorkspaceID: wsStr,
+				Offset:      sqlOffset,
+				Limit:       sqlLimit,
+			})
+		}
+		if err != nil {
+			return nil, db.MapSQLDriverError(op, err)
+		}
+		mapped := make([]audit.Record, 0, len(rows))
+		for _, row := range rows {
+			if rec, mErr := mapSQLiteAuditRecord(row, actorMap); mErr == nil {
+				mapped = append(mapped, rec)
+			}
+		}
+		sliceFilter := filter
+		sliceFilter.Offset = 0
+		sliceFilter.Limit = effectiveLimit
+		return db.FilterSortAndSliceAuditRecords(mapped, sliceFilter), nil
+	}
+
+	want := int64(max(filter.Offset, 0)) + int64(effectiveLimit)
+	batchSize := max(int64(10000), want*4)
+	var mapped []audit.Record
+	probeFilter := filter
+	probeFilter.Offset = 0
+	probeFilter.Limit = int32(min(want+64, 1<<30))
+
+	for sqlOffset := int64(0); ; sqlOffset += batchSize {
+		var rows []sqlcgen.AuditLog
+		if hasBothResource {
+			rows, err = q.ListAuditLogsByResource(ctx, sqlcgen.ListAuditLogsByResourceParams{
+				WorkspaceID:  wsStr,
+				ResourceType: filter.ResourceType,
+				ResourceID:   filter.ResourceID,
+				Offset:       sqlOffset,
+				Limit:        batchSize,
+			})
+		} else {
+			rows, err = q.ListAuditLogsByWorkspace(ctx, sqlcgen.ListAuditLogsByWorkspaceParams{
+				WorkspaceID: wsStr,
+				Offset:      sqlOffset,
+				Limit:       batchSize,
+			})
+		}
+		if err != nil {
+			return nil, db.MapSQLDriverError(op, err)
+		}
+		for _, row := range rows {
+			if rec, mErr := mapSQLiteAuditRecord(row, actorMap); mErr == nil {
+				mapped = append(mapped, rec)
+			}
+		}
+		if int64(len(rows)) < batchSize {
+			break
+		}
+		if int64(len(db.FilterSortAndSliceAuditRecords(mapped, probeFilter))) >= want+64 {
+			break
 		}
 	}
 	return db.FilterSortAndSliceAuditRecords(mapped, filter), nil

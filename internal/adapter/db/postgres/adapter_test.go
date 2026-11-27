@@ -186,4 +186,38 @@ func TestLivePostgresIntegration(t *testing.T) {
 	if err != nil || gotTask.Kind != task.KindChore || gotTask.Key == "" {
 		t.Fatalf("postgres GetByID task mismatch: %+v (err=%v)", gotTask, err)
 	}
+
+	// Verify multi-workspace actor enrollment inside a single pgx.Tx never aborts with SQLSTATE 25P02.
+	ws2 := workspace.Workspace{
+		ID:   uuid.New(),
+		Slug: "pg-ws2-" + slugSuffix,
+		Name: "Postgres Second Workspace",
+	}
+	proj2 := project.Project{
+		ID:          uuid.New(),
+		WorkspaceID: ws2.ID,
+		Slug:        "pg-proj2-" + slugSuffix,
+		KeyPrefix:   "P2" + slugSuffix[:3],
+		Name:        "Second Project",
+		Status:      project.StatusActive,
+		CreatedBy:   actorID,
+	}
+	if err := adapter.TxManager().WithNoAuditTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		if err := adapter.WorkspaceRepository().WithScope(scope).Create(txCtx, ws2); err != nil {
+			return err
+		}
+		if err := adapter.ProjectRepository().WithScope(scope).Create(txCtx, proj2); err != nil {
+			return err
+		}
+		return adapter.WorkspaceRepository().WithScope(scope).UpsertMember(txCtx, workspace.WorkspaceMember{
+			WorkspaceID: ws2.ID,
+			ActorID:     actorID,
+			Kind:        authctx.ActorKindHuman,
+			Handle:      "pg-operator",
+			DisplayName: "PG Operator",
+			Role:        workspace.MemberRoleOwner,
+		})
+	}); err != nil {
+		t.Fatalf("multi-workspace actor transaction failed (25P02 regression): %v", err)
+	}
 }

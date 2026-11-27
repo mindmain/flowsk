@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/mindmain/flowsk/internal/adapter/db"
 	"github.com/mindmain/flowsk/internal/adapter/db/sqlite"
+	"github.com/mindmain/flowsk/internal/adapter/db/sqlite/sqlcgen"
 	"github.com/mindmain/flowsk/internal/domain/audit"
 	"github.com/mindmain/flowsk/internal/domain/authctx"
 	"github.com/mindmain/flowsk/internal/domain/errs"
@@ -1067,5 +1068,508 @@ func TestConcurrentMultiAgentStressSQLiteWAL(t *testing.T) {
 	}
 	if len(claimedWinner) != numTasks {
 		t.Fatalf("claimed tasks count = %d, want all %d tasks claimed exactly once", len(claimedWinner), numTasks)
+	}
+}
+
+// TestRepositoryStabilizationInvariants verifies FLOWSK-14 persistence invariants:
+//   - Clearing nullable Task (ObjectiveID, ParentTaskID, AssigneeActorID) and Objective (TargetDate)
+//     clears both domain fields and underlying SQL columns while preserving EstimatePoints;
+//   - Cross-project and cross-tenant ObjectiveID validation on TaskRepository.Create and Update;
+//   - ProjectRepository.SoftDelete cascading soft-delete to tasks/objectives and KeyPrefix reuse;
+//   - TaskRepository.Create O(1) sequence/identifier conflict reallocation and sidecar cleanup;
+//   - BoardMetadataRepository & BoardMetadataService custom workflow states ("archived" mapping,
+//     single-default invariant) and project labels CRUD;
+//   - AuditRepository.Query SQL Offset/Limit pushdown and filtered pagination.
+func TestRepositoryStabilizationInvariants(t *testing.T) {
+	t.Parallel()
+
+	adapter := openMigratedSQLiteAdapter(t)
+	ctx := context.Background()
+
+	wsRepo := adapter.WorkspaceRepository()
+	projRepo := adapter.ProjectRepository()
+	objRepo := adapter.ObjectiveRepository()
+	taskRepo := adapter.TaskRepository()
+	auditRepo := adapter.AuditRepository()
+	txMgr := adapter.TxManager()
+	readQ := adapter.SQLCBridge().ReadQueries()
+
+	wsA := workspace.Workspace{ID: uuid.New(), Slug: "stab-ws-a", Name: "Stabilization A"}
+	wsB := workspace.Workspace{ID: uuid.New(), Slug: "stab-ws-b", Name: "Stabilization B"}
+	actorID := uuid.New()
+	assigneeID := uuid.New()
+
+	proj1 := project.Project{ID: uuid.New(), WorkspaceID: wsA.ID, Slug: "proj-one", KeyPrefix: "ONE", Name: "Project One", Status: project.StatusActive, CreatedBy: actorID}
+	proj2 := project.Project{ID: uuid.New(), WorkspaceID: wsA.ID, Slug: "proj-two", KeyPrefix: "TWO", Name: "Project Two", Status: project.StatusActive, CreatedBy: actorID}
+	projB := project.Project{ID: uuid.New(), WorkspaceID: wsB.ID, Slug: "proj-b", KeyPrefix: "PRB", Name: "Project B", Status: project.StatusActive, CreatedBy: actorID}
+
+	deadline := time.Now().UTC().Add(48 * time.Hour).Truncate(time.Millisecond)
+	obj1 := objective.Objective{
+		ID:          uuid.New(),
+		WorkspaceID: wsA.ID,
+		ProjectID:   proj1.ID,
+		Slug:        "obj-one",
+		Title:       "Objective One",
+		Status:      objective.StatusActive,
+		TargetDate:  &deadline,
+		CreatedBy:   actorID,
+	}
+	objB := objective.Objective{
+		ID:          uuid.New(),
+		WorkspaceID: wsB.ID,
+		ProjectID:   projB.ID,
+		Slug:        "obj-b",
+		Title:       "Objective B",
+		Status:      objective.StatusActive,
+		CreatedBy:   actorID,
+	}
+
+	parentTask := task.Task{
+		ID:          uuid.New(),
+		WorkspaceID: wsA.ID,
+		ProjectID:   proj1.ID,
+		Kind:        task.KindEpic,
+		Title:       "Parent Epic",
+		Status:      task.StatusReady,
+		Priority:    task.PriorityHigh,
+		CreatedBy:   actorID,
+	}
+	childTask := task.Task{
+		ID:              uuid.New(),
+		WorkspaceID:     wsA.ID,
+		ProjectID:       proj1.ID,
+		ObjectiveID:     &obj1.ID,
+		ParentTaskID:    &parentTask.ID,
+		AssigneeActorID: &assigneeID,
+		Kind:            task.KindFeature,
+		Title:           "Child Feature",
+		Status:          task.StatusReady,
+		Priority:        task.PriorityCritical,
+		CreatedBy:       actorID,
+	}
+
+	if err := txMgr.WithNoAuditTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		if err := wsRepo.WithScope(scope).Create(txCtx, wsA); err != nil {
+			return err
+		}
+		if err := wsRepo.WithScope(scope).Create(txCtx, wsB); err != nil {
+			return err
+		}
+		for _, p := range []project.Project{proj1, proj2, projB} {
+			if err := projRepo.WithScope(scope).Create(txCtx, p); err != nil {
+				return err
+			}
+		}
+		if err := objRepo.WithScope(scope).Create(txCtx, obj1); err != nil {
+			return err
+		}
+		if err := objRepo.WithScope(scope).Create(txCtx, objB); err != nil {
+			return err
+		}
+		if err := taskRepo.WithScope(scope).Create(txCtx, parentTask); err != nil {
+			return err
+		}
+		return taskRepo.WithScope(scope).Create(txCtx, childTask)
+	}); err != nil {
+		t.Fatalf("seed stabilization fixtures: %v", err)
+	}
+
+	// 1. Cross-project and cross-tenant ObjectiveID validation on Create & Update.
+	if err := txMgr.WithNoAuditTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		return taskRepo.WithScope(scope).Create(txCtx, task.Task{
+			ID:          uuid.New(),
+			WorkspaceID: wsA.ID,
+			ProjectID:   proj2.ID,
+			ObjectiveID: &obj1.ID, // belongs to proj1, not proj2!
+			Title:       "Cross-project objective task",
+			Status:      task.StatusReady,
+		})
+	}); !errors.Is(err, errs.ErrValidation) {
+		t.Fatalf("expected ErrValidation for cross-project ObjectiveID on Create, got %v", err)
+	}
+	if err := txMgr.WithNoAuditTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		return taskRepo.WithScope(scope).Create(txCtx, task.Task{
+			ID:          uuid.New(),
+			WorkspaceID: wsA.ID,
+			ProjectID:   proj1.ID,
+			ObjectiveID: &objB.ID, // belongs to wsB!
+			Title:       "Cross-tenant objective task",
+			Status:      task.StatusReady,
+		})
+	}); !errors.Is(err, errs.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for cross-tenant ObjectiveID on Create, got %v", err)
+	}
+
+	proj2Task := task.Task{
+		ID:          uuid.New(),
+		WorkspaceID: wsA.ID,
+		ProjectID:   proj2.ID,
+		Title:       "Proj2 Task",
+		Status:      task.StatusReady,
+	}
+	if err := txMgr.WithNoAuditTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		return taskRepo.WithScope(scope).Create(txCtx, proj2Task)
+	}); err != nil {
+		t.Fatalf("Create proj2Task: %v", err)
+	}
+	if err := txMgr.WithNoAuditTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		badUpd := proj2Task.Clone()
+		badUpd.ObjectiveID = &obj1.ID
+		return taskRepo.WithScope(scope).Update(txCtx, badUpd, nil)
+	}); !errors.Is(err, errs.ErrValidation) {
+		t.Fatalf("expected ErrValidation for cross-project ObjectiveID on Update, got %v", err)
+	}
+
+	// 2. Nullable field clearing on Task (ObjectiveID, ParentTaskID, AssigneeActorID) & Objective (TargetDate).
+	loadedChild, err := taskRepo.GetByID(ctx, wsA.ID, childTask.ID)
+	if err != nil {
+		t.Fatalf("GetByID(childTask): %v", err)
+	}
+	if loadedChild.ObjectiveID == nil || loadedChild.ParentTaskID == nil || loadedChild.AssigneeActorID == nil {
+		t.Fatalf("expected non-nil initial pointers on childTask: %+v", loadedChild)
+	}
+
+	loadedChild.ObjectiveID = nil
+	loadedChild.ParentTaskID = nil
+	loadedChild.AssigneeActorID = nil
+
+	loadedObj, err := objRepo.GetByID(ctx, wsA.ID, obj1.ID)
+	if err != nil || loadedObj.TargetDate == nil {
+		t.Fatalf("GetByID(obj1): %+v, err=%v", loadedObj, err)
+	}
+	loadedObj.TargetDate = nil
+
+	if err := txMgr.WithNoAuditTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		if err := taskRepo.WithScope(scope).Update(txCtx, loadedChild, nil); err != nil {
+			return err
+		}
+		return objRepo.WithScope(scope).Update(txCtx, loadedObj)
+	}); err != nil {
+		t.Fatalf("Update clearing nullable fields: %v", err)
+	}
+
+	clearedChild, err := taskRepo.GetByID(ctx, wsA.ID, childTask.ID)
+	if err != nil {
+		t.Fatalf("GetByID(clearedChild): %v", err)
+	}
+	if clearedChild.ObjectiveID != nil || clearedChild.ParentTaskID != nil || clearedChild.AssigneeActorID != nil {
+		t.Fatalf("expected nil domain pointers after clearing, got %+v", clearedChild)
+	}
+
+	// Verify underlying SQL columns in ListTasksByProject and ListAgentClaimableTasks are NULL!
+	wsAStr := wsA.ID.String()
+	proj1Str := proj1.ID.String()
+	obj1Str := obj1.ID.String()
+	sqlTasks, err := readQ.ListTasksByProject(ctx, sqliteSQLCListTasksParams(wsAStr, proj1Str, nil))
+	if err != nil {
+		t.Fatalf("readQ.ListTasksByProject: %v", err)
+	}
+	var foundChildSQL bool
+	for _, r := range sqlTasks {
+		if r.ID == childTask.ID.String() {
+			foundChildSQL = true
+			if r.ObjectiveID != nil || r.ParentTaskID != nil || r.AssigneeActorID != nil {
+				t.Fatalf("expected SQL NULL columns on cleared task, got obj=%v parent=%v assignee=%v",
+					r.ObjectiveID, r.ParentTaskID, r.AssigneeActorID)
+			}
+		}
+	}
+	if !foundChildSQL {
+		t.Fatal("childTask missing from ListTasksByProject")
+	}
+	byOldObj, err := readQ.ListTasksByProject(ctx, sqliteSQLCListTasksParams(wsAStr, proj1Str, &obj1Str))
+	if err != nil || len(byOldObj) != 0 {
+		t.Fatalf("expected 0 SQL tasks still linked to cleared ObjectiveID, got %d (err=%v)", len(byOldObj), err)
+	}
+	otherActorStr := uuid.NewString()
+	claimable, err := readQ.ListAgentClaimableTasks(ctx, sqliteSQLCClaimableParams(wsAStr, &proj1Str, &otherActorStr, 20))
+	if err != nil {
+		t.Fatalf("ListAgentClaimableTasks: %v", err)
+	}
+	var childClaimable bool
+	for _, c := range claimable {
+		if c.ID == childTask.ID.String() && c.AssigneeActorID == nil {
+			childClaimable = true
+		}
+	}
+	if !childClaimable {
+		t.Fatalf("expected cleared-assignee childTask to appear in ListAgentClaimableTasks for another actor")
+	}
+
+	clearedObj, err := objRepo.GetByID(ctx, wsA.ID, obj1.ID)
+	if err != nil || clearedObj.TargetDate != nil {
+		t.Fatalf("expected nil TargetDate on clearedObj, got %+v (err=%v)", clearedObj, err)
+	}
+	rawObj, err := readQ.GetObjectiveByID(ctx, sqliteSQLCGetObjParams(wsAStr, obj1Str))
+	if err != nil || rawObj.TargetDate != nil {
+		t.Fatalf("expected SQL NULL target_date on objective, got %v (err=%v)", rawObj.TargetDate, err)
+	}
+
+	// 3. TaskRepository.Create collision reallocation & relation sidecar cleanup on DeleteRelation + HardDelete.
+	seqProj := project.Project{ID: uuid.New(), WorkspaceID: wsA.ID, Slug: "seq-proj", KeyPrefix: "SEQ", Name: "Seq Project", Status: project.StatusActive}
+	manualSeq1 := task.Task{ID: uuid.New(), WorkspaceID: wsA.ID, ProjectID: seqProj.ID, Key: "SEQ-1", Title: "Manual SEQ-1", Status: task.StatusReady}
+	collidingKey := task.Task{ID: uuid.New(), WorkspaceID: wsA.ID, ProjectID: seqProj.ID, Key: "SEQ-1", Title: "Colliding SEQ-1", Status: task.StatusArchived}
+	rel1ID := uuid.New()
+	rel2ID := uuid.New()
+
+	if err := txMgr.WithNoAuditTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		if err := projRepo.WithScope(scope).Create(txCtx, seqProj); err != nil {
+			return err
+		}
+		tTx := taskRepo.WithScope(scope)
+		if err := tTx.Create(txCtx, manualSeq1); err != nil {
+			return err
+		}
+		if err := tTx.Create(txCtx, collidingKey); err != nil {
+			return err
+		}
+		if err := tTx.CreateRelation(txCtx, task.TaskRelation{
+			ID:           rel1ID,
+			WorkspaceID:  wsA.ID,
+			SourceTaskID: manualSeq1.ID,
+			TargetTaskID: collidingKey.ID,
+			Type:         task.RelationBlocks,
+			Note:         "sidecar-1",
+			CreatedBy:    actorID,
+		}); err != nil {
+			return err
+		}
+		return tTx.CreateRelation(txCtx, task.TaskRelation{
+			ID:           rel2ID,
+			WorkspaceID:  wsA.ID,
+			SourceTaskID: collidingKey.ID,
+			TargetTaskID: manualSeq1.ID,
+			Type:         task.RelationSubtaskOf,
+			Note:         "sidecar-2",
+			CreatedBy:    actorID,
+		})
+	}); err != nil {
+		t.Fatalf("seed colliding task & sidecar relations: %v", err)
+	}
+	reallocated, err := taskRepo.GetByID(ctx, wsA.ID, collidingKey.ID)
+	if err != nil || reallocated.Key != "SEQ-2" {
+		t.Fatalf("expected colliding SEQ-1 to reallocate to SEQ-2, got %+v (err=%v)", reallocated, err)
+	}
+
+	if err := txMgr.WithNoAuditTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		if err := taskRepo.WithScope(scope).DeleteRelation(txCtx, wsA.ID, rel1ID); err != nil {
+			return err
+		}
+		return taskRepo.WithScope(scope).HardDelete(txCtx, wsA.ID, collidingKey.ID)
+	}); err != nil {
+		t.Fatalf("DeleteRelation + HardDelete: %v", err)
+	}
+	for _, rid := range []uuid.UUID{rel1ID, rel2ID} {
+		if _, bErr := readQ.GetDSLExecutionBatchByIdempotencyKey(ctx, sqliteSQLCBatchByKeyParams(wsAStr, db.RelationMetaIdempotencyKey(rid))); bErr == nil {
+			t.Fatalf("expected relation sidecar %s to be deleted from dsl_execution_batches", rid)
+		}
+	}
+
+	// 4. DeleteProject cascade soft-deletes tasks + objectives so KeyPrefix can be reused cleanly!
+	if err := txMgr.WithNoAuditTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		return taskRepo.WithScope(scope).UpsertLease(txCtx, task.ClaimLease{
+			TaskID:        manualSeq1.ID,
+			WorkspaceID:   wsA.ID,
+			LeaseToken:    "lease-before-proj-del",
+			HolderActorID: actorID,
+			HolderKind:    authctx.ActorKindHuman,
+			HolderHandle:  "alice",
+			AcquiredAt:    time.Now().UTC(),
+			HeartbeatAt:   time.Now().UTC(),
+			ExpiresAt:     time.Now().UTC().Add(10 * time.Minute),
+		})
+	}); err != nil {
+		t.Fatalf("UpsertLease before project delete: %v", err)
+	}
+	if err := txMgr.WithNoAuditTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		return projRepo.WithScope(scope).SoftDelete(txCtx, wsA.ID, seqProj.ID)
+	}); err != nil {
+		t.Fatalf("SoftDelete(seqProj): %v", err)
+	}
+	if _, err := taskRepo.GetByID(ctx, wsA.ID, manualSeq1.ID); !errors.Is(err, errs.ErrNotFound) {
+		t.Fatalf("expected task of deleted project to return ErrNotFound, got %v", err)
+	}
+	reusedSeqProj := project.Project{ID: uuid.New(), WorkspaceID: wsA.ID, Slug: "seq-proj-reborn", KeyPrefix: "SEQ", Name: "Seq Reborn", Status: project.StatusActive}
+	rebornSeq1 := task.Task{ID: uuid.New(), WorkspaceID: wsA.ID, ProjectID: reusedSeqProj.ID, Title: "Fresh SEQ-1", Status: task.StatusReady}
+	if err := txMgr.WithNoAuditTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		if err := projRepo.WithScope(scope).Create(txCtx, reusedSeqProj); err != nil {
+			return err
+		}
+		return taskRepo.WithScope(scope).Create(txCtx, rebornSeq1)
+	}); err != nil {
+		t.Fatalf("reuse KeyPrefix SEQ and mint SEQ-1 after project SoftDelete failed: %v", err)
+	}
+	gotRebornSeq1, err := taskRepo.GetByID(ctx, wsA.ID, rebornSeq1.ID)
+	if err != nil || gotRebornSeq1.Key != "SEQ-1" {
+		t.Fatalf("expected reborn project first task key SEQ-1, got %+v (err=%v)", gotRebornSeq1, err)
+	}
+
+	// 5. BoardMetadataService (WorkflowStates & ProjectLabels) end-to-end over SQLite.
+	projSvc := project.NewService(projRepo, txMgr)
+	authCtx := authctx.WithIdentity(ctx, authctx.Identity{
+		WorkspaceID: wsA.ID,
+		ActorID:     actorID,
+		Kind:        authctx.ActorKindHuman,
+		Handle:      "alice",
+	})
+	states, err := projSvc.ListWorkflowStates(authCtx, wsA.ID, proj1.ID)
+	if err != nil || len(states) != 8 {
+		t.Fatalf("ListWorkflowStates = %d states (err=%v), want 8", len(states), err)
+	}
+	var sawArchivedCat bool
+	for _, st := range states {
+		if st.Name == "Archived" && st.Category == "archived" {
+			sawArchivedCat = true
+		}
+	}
+	if !sawArchivedCat {
+		t.Fatalf("expected seeded Archived state to expose Category='archived', got %+v", states)
+	}
+
+	qaState, err := projSvc.CreateWorkflowState(authCtx, project.CreateWorkflowStateInput{
+		WorkspaceID: wsA.ID,
+		ProjectID:   proj1.ID,
+		Name:        "QA Verification",
+		Category:    "started",
+		ColorHex:    "#14B8A6",
+		Position:    45,
+		IsDefault:   true,
+	})
+	if err != nil || !qaState.IsDefault || qaState.ColorHex != "#14B8A6" {
+		t.Fatalf("CreateWorkflowState failed: %+v, err=%v", qaState, err)
+	}
+	newStateName := "Staging QA"
+	updatedQA, err := projSvc.UpdateWorkflowState(authCtx, project.UpdateWorkflowStateInput{
+		WorkspaceID: wsA.ID,
+		ProjectID:   proj1.ID,
+		StateID:     qaState.ID,
+		Name:        &newStateName,
+	})
+	if err != nil || updatedQA.Name != "Staging QA" {
+		t.Fatalf("UpdateWorkflowState failed: %+v, err=%v", updatedQA, err)
+	}
+	statesAfter, err := projSvc.ListWorkflowStates(authCtx, wsA.ID, proj1.ID)
+	if err != nil {
+		t.Fatalf("ListWorkflowStates after update: %v", err)
+	}
+	defaultCount := 0
+	for _, st := range statesAfter {
+		if st.IsDefault {
+			defaultCount++
+		}
+	}
+	if defaultCount != 1 {
+		t.Fatalf("expected exactly 1 default workflow state in project, got %d", defaultCount)
+	}
+
+	lbl, err := projSvc.CreateLabel(authCtx, project.CreateProjectLabelInput{
+		WorkspaceID: wsA.ID,
+		ProjectID:   proj1.ID,
+		Name:        "security",
+		ColorHex:    "#EF4444",
+		Description: "Security-sensitive change",
+	})
+	if err != nil || lbl.Name != "security" {
+		t.Fatalf("CreateLabel failed: %+v, err=%v", lbl, err)
+	}
+	labels, err := projSvc.ListLabels(authCtx, wsA.ID, proj1.ID)
+	if err != nil || len(labels) != 1 || labels[0].ID != lbl.ID {
+		t.Fatalf("ListLabels = %+v, err=%v", labels, err)
+	}
+	if err := projSvc.DeleteLabel(authCtx, wsA.ID, proj1.ID, lbl.ID); err != nil {
+		t.Fatalf("DeleteLabel failed: %v", err)
+	}
+	labelsAfterDel, err := projSvc.ListLabels(authCtx, wsA.ID, proj1.ID)
+	if err != nil || len(labelsAfterDel) != 0 {
+		t.Fatalf("expected 0 labels after DeleteLabel, got %+v (err=%v)", labelsAfterDel, err)
+	}
+	if err := projSvc.DeleteLabel(authCtx, wsA.ID, proj1.ID, lbl.ID); !errors.Is(err, errs.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound deleting already-deleted label, got %v", err)
+	}
+
+	// 6. AuditRepository.Query Offset/Limit pagination (both pushdown and post-filtered).
+	page1, err := auditRepo.Query(ctx, audit.QueryFilter{WorkspaceID: wsA.ID, Offset: 0, Limit: 2})
+	if err != nil || len(page1) != 2 {
+		t.Fatalf("auditRepo.Query page1 = %+v (err=%v)", page1, err)
+	}
+	page2, err := auditRepo.Query(ctx, audit.QueryFilter{WorkspaceID: wsA.ID, Offset: 2, Limit: 2})
+	if err != nil || len(page2) != 2 || page1[0].ID == page2[0].ID {
+		t.Fatalf("auditRepo.Query page2 = %+v (err=%v)", page2, err)
+	}
+	filteredCreate, err := auditRepo.Query(ctx, audit.QueryFilter{
+		WorkspaceID: wsA.ID,
+		Action:      tx.AuditActionCreate,
+		Offset:      1,
+		Limit:       1,
+	})
+	if err != nil || len(filteredCreate) != 1 || filteredCreate[0].Action != tx.AuditActionCreate {
+		t.Fatalf("auditRepo.Query filteredCreate = %+v (err=%v)", filteredCreate, err)
+	}
+
+	// 7. TaskRepository LastSignalAt default NULL and TouchSignal round-trip.
+	nullSigTask := task.Task{
+		ID:          uuid.New(),
+		WorkspaceID: wsA.ID,
+		ProjectID:   proj1.ID,
+		Kind:        task.KindChore,
+		Title:       "Nullable Signal Task",
+		Status:      task.StatusReady,
+		Priority:    task.PriorityMedium,
+		CreatedBy:   actorID,
+	}
+	if err := txMgr.WithNoAuditTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		return adapter.TaskRepository().WithScope(scope).Create(txCtx, nullSigTask)
+	}); err != nil {
+		t.Fatalf("Create nullSigTask: %v", err)
+	}
+	gotNullSig, err := adapter.TaskRepository().GetByID(ctx, wsA.ID, nullSigTask.ID)
+	if err != nil || gotNullSig.LastSignalAt != nil {
+		t.Fatalf("expected default NULL LastSignalAt on SQLite task, got %v (err=%v)", gotNullSig.LastSignalAt, err)
+	}
+	touchTime := time.Now().UTC().Truncate(time.Millisecond)
+	var touchedTask task.Task
+	if err := txMgr.WithNoAuditTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		var tErr error
+		touchedTask, tErr = adapter.TaskRepository().WithScope(scope).TouchSignal(txCtx, wsA.ID, nullSigTask.ID, touchTime)
+		return tErr
+	}); err != nil {
+		t.Fatalf("TouchSignal: %v", err)
+	}
+	if touchedTask.LastSignalAt == nil || !touchedTask.LastSignalAt.Equal(touchTime) {
+		t.Fatalf("TouchSignal round-trip = %v, want %v", touchedTask.LastSignalAt, touchTime)
+	}
+	if !touchedTask.UpdatedAt.Equal(gotNullSig.UpdatedAt) {
+		t.Fatalf("expected TouchSignal not to mutate UpdatedAt (was %v, got %v)", gotNullSig.UpdatedAt, touchedTask.UpdatedAt)
+	}
+}
+
+func sqliteSQLCListTasksParams(wsID, projID string, objID *string) sqlcgen.ListTasksByProjectParams {
+	return sqlcgen.ListTasksByProjectParams{
+		WorkspaceID: wsID,
+		ProjectID:   projID,
+		ObjectiveID: objID,
+	}
+}
+
+func sqliteSQLCClaimableParams(wsID string, projID, actorID *string, limit int64) sqlcgen.ListAgentClaimableTasksParams {
+	return sqlcgen.ListAgentClaimableTasksParams{
+		WorkspaceID: wsID,
+		ProjectID:   projID,
+		ActorID:     actorID,
+		Limit:       limit,
+	}
+}
+
+func sqliteSQLCGetObjParams(wsID, objID string) sqlcgen.GetObjectiveByIDParams {
+	return sqlcgen.GetObjectiveByIDParams{
+		WorkspaceID: wsID,
+		ID:          objID,
+	}
+}
+
+func sqliteSQLCBatchByKeyParams(wsID, key string) sqlcgen.GetDSLExecutionBatchByIdempotencyKeyParams {
+	return sqlcgen.GetDSLExecutionBatchByIdempotencyKeyParams{
+		WorkspaceID:    wsID,
+		IdempotencyKey: key,
 	}
 }

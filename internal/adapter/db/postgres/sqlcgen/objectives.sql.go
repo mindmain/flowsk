@@ -94,11 +94,18 @@ func (q *Queries) CreateObjective(ctx context.Context, arg CreateObjectiveParams
 }
 
 const getObjectiveByID = `-- name: GetObjectiveByID :one
-SELECT id, workspace_id, project_id, parent_objective_id, title, description, kind, status, starts_at, target_date, created_by_actor_id, created_at, updated_at, deleted_at
-FROM objectives
-WHERE workspace_id = $1
-  AND id = $2
-  AND deleted_at IS NULL
+SELECT o.id, o.workspace_id, o.project_id, o.parent_objective_id, o.title, o.description, o.kind, o.status, o.starts_at, o.target_date, o.created_by_actor_id, o.created_at, o.updated_at, o.deleted_at
+FROM objectives o
+WHERE o.workspace_id = $1
+  AND o.id = $2
+  AND o.deleted_at IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM projects p
+      WHERE p.id = o.project_id
+        AND p.workspace_id = o.workspace_id
+        AND p.deleted_at IS NULL
+  )
 `
 
 type GetObjectiveByIDParams struct {
@@ -106,7 +113,7 @@ type GetObjectiveByIDParams struct {
 	ID          uuid.UUID `json:"id"`
 }
 
-// GetObjectiveByID retrieves an active objective within a workspace by its UUID.
+// GetObjectiveByID retrieves an active objective within an active project by its UUID.
 func (q *Queries) GetObjectiveByID(ctx context.Context, arg GetObjectiveByIDParams) (Objective, error) {
 	row := q.db.QueryRow(ctx, getObjectiveByID, arg.WorkspaceID, arg.ID)
 	var i Objective
@@ -217,16 +224,37 @@ func (q *Queries) SoftDeleteObjective(ctx context.Context, arg SoftDeleteObjecti
 	return result.RowsAffected(), nil
 }
 
+const softDeleteObjectivesByProject = `-- name: SoftDeleteObjectivesByProject :exec
+UPDATE objectives
+SET
+    deleted_at = NOW(),
+    updated_at = NOW()
+WHERE workspace_id = $1
+  AND project_id = $2
+  AND deleted_at IS NULL
+`
+
+type SoftDeleteObjectivesByProjectParams struct {
+	WorkspaceID uuid.UUID `json:"workspace_id"`
+	ProjectID   uuid.UUID `json:"project_id"`
+}
+
+// SoftDeleteObjectivesByProject soft-deletes all active objectives belonging to a project.
+func (q *Queries) SoftDeleteObjectivesByProject(ctx context.Context, arg SoftDeleteObjectivesByProjectParams) error {
+	_, err := q.db.Exec(ctx, softDeleteObjectivesByProject, arg.WorkspaceID, arg.ProjectID)
+	return err
+}
+
 const updateObjective = `-- name: UpdateObjective :one
 UPDATE objectives
 SET
-    parent_objective_id = COALESCE($1, parent_objective_id),
+    parent_objective_id = $1,
     title = COALESCE($2, title),
     description = COALESCE($3, description),
     kind = COALESCE($4, kind),
     status = COALESCE($5, status),
-    starts_at = COALESCE($6, starts_at),
-    target_date = COALESCE($7, target_date),
+    starts_at = $6,
+    target_date = $7,
     updated_at = NOW()
 WHERE workspace_id = $8
   AND id = $9
@@ -246,7 +274,7 @@ type UpdateObjectiveParams struct {
 	ID                uuid.UUID  `json:"id"`
 }
 
-// UpdateObjective performs an atomic partial update on an active objective within a workspace.
+// UpdateObjective performs an atomic update on an active objective (including nullable dates and parent_objective_id).
 func (q *Queries) UpdateObjective(ctx context.Context, arg UpdateObjectiveParams) (Objective, error) {
 	row := q.db.QueryRow(ctx, updateObjective,
 		arg.ParentObjectiveID,

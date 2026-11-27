@@ -167,3 +167,48 @@ func TestAuditService_OwnershipBoundsAndDefensiveCopies(t *testing.T) {
 		t.Fatalf("expected defensive byte copy on GetRecord, got old=%q new=%q", gotAgain.OldValues, gotAgain.NewValues)
 	}
 }
+
+// TestAuditRecord_ToProtoValidUUIDs verifies that Record.ToProto always emits valid
+// UUID strings for EntityId and ActorId across single-UUID, composite parent:child,
+// human key, and nil-actor records.
+func TestAuditRecord_ToProtoValidUUIDs(t *testing.T) {
+	t.Parallel()
+
+	wsID := uuid.New()
+	parentID := uuid.New()
+	childID := uuid.New()
+
+	// Composite parentID:childID resource ID (e.g. UnbindSubproject).
+	composite := (&audit.Record{
+		ID:           uuid.New(),
+		WorkspaceID:  wsID,
+		ActorID:      uuid.Nil,
+		Action:       tx.AuditActionDelete,
+		ResourceType: "project_binding",
+		ResourceID:   parentID.String() + ":" + childID.String(),
+		OccurredAt:   time.Now().UTC(),
+	}).ToProto()
+	if composite.GetEntityId() != parentID.String() {
+		t.Fatalf("composite EntityId = %q, want %q", composite.GetEntityId(), parentID.String())
+	}
+	if composite.GetEntityIdentifier() != parentID.String()+":"+childID.String() {
+		t.Fatalf("composite EntityIdentifier = %q", composite.GetEntityIdentifier())
+	}
+	if _, err := uuid.Parse(composite.GetActorId()); err != nil {
+		t.Fatalf("expected valid fallback ActorId UUID when uuid.Nil, got %q (%v)", composite.GetActorId(), err)
+	}
+
+	// Non-UUID human key falls back to WorkspaceID for EntityId while preserving EntityIdentifier.
+	byKey := (&audit.Record{
+		ID:           uuid.New(),
+		WorkspaceID:  wsID,
+		ActorID:      uuid.New(),
+		Action:       tx.AuditActionTransition,
+		ResourceType: "task",
+		ResourceID:   "FLW-42",
+		OccurredAt:   time.Now().UTC(),
+	}).ToProto()
+	if byKey.GetEntityId() != wsID.String() || byKey.GetEntityIdentifier() != "FLW-42" {
+		t.Fatalf("byKey ToProto = (%q, %q), want (%q, FLW-42)", byKey.GetEntityId(), byKey.GetEntityIdentifier(), wsID.String())
+	}
+}

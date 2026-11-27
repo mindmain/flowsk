@@ -58,18 +58,32 @@ func (r *Record) ToProto() *flowsk_audit_pb.AuditEvent {
 
 	var entityID string
 	var entityIdentifier string
-	if parsed, err := uuid.Parse(r.ResourceID); err == nil && parsed != uuid.Nil {
+	trimmedResID := strings.TrimSpace(r.ResourceID)
+	if parsed, err := uuid.Parse(trimmedResID); err == nil && parsed != uuid.Nil {
 		entityID = parsed.String()
 	} else {
 		entityIdentifier = r.ResourceID
+		leading := strings.TrimSpace(strings.Split(trimmedResID, ":")[0])
+		if parsedLead, leadErr := uuid.Parse(leading); leadErr == nil && parsedLead != uuid.Nil {
+			entityID = parsedLead.String()
+		} else if r.WorkspaceID != uuid.Nil {
+			entityID = r.WorkspaceID.String()
+		} else {
+			entityID = uuid.Nil.String()
+		}
+	}
+
+	actorID := uuid.Nil.String()
+	if r.ActorID != uuid.Nil {
+		actorID = r.ActorID.String()
 	}
 
 	summary := strings.TrimSpace(fmt.Sprintf("%s %s %s", r.Action, r.ResourceType, r.ResourceID))
 
 	return &flowsk_audit_pb.AuditEvent{
-		Id:               uuidToString(r.ID),
-		WorkspaceId:      uuidToString(r.WorkspaceID),
-		ActorId:          uuidToString(r.ActorID),
+		Id:               uuidOrNilString(r.ID),
+		WorkspaceId:      uuidOrNilString(r.WorkspaceID),
+		ActorId:          actorID,
 		Action:           ActionToProto(r.Action),
 		EntityType:       r.ResourceType,
 		EntityId:         entityID,
@@ -105,9 +119,9 @@ func encodeAuditPayloadJSON(oldVals, newVals []byte) string {
 	return string(encoded)
 }
 
-func uuidToString(id uuid.UUID) string {
+func uuidOrNilString(id uuid.UUID) string {
 	if id == uuid.Nil {
-		return ""
+		return uuid.Nil.String()
 	}
 	return id.String()
 }

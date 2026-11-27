@@ -135,6 +135,29 @@ func TaskStatusFromWorkflowState(name, category string) task.Status {
 	}
 }
 
+// SQLWorkflowStateCategory maps a domain workflow state category onto SQL's CHECK-valid
+// `workflow_states.category` values (`'triage'`, `'backlog'`, `'unstarted'`, `'started'`,
+// `'completed'`, `'canceled'`), mapping `"archived"` and `"cancelled"` onto `"canceled"`.
+func SQLWorkflowStateCategory(category string) string {
+	switch strings.ToLower(strings.TrimSpace(category)) {
+	case "archived", "cancelled":
+		return "canceled"
+	case "":
+		return "unstarted"
+	default:
+		return strings.ToLower(strings.TrimSpace(category))
+	}
+}
+
+// DomainWorkflowStateCategory maps a persisted SQL `(name, category)` pair onto a domain
+// workflow state category, restoring `"archived"` when the state is named `"Archived"`.
+func DomainWorkflowStateCategory(name, sqlCategory string) string {
+	if strings.EqualFold(strings.TrimSpace(name), "archived") && sqlCategory == "canceled" {
+		return "archived"
+	}
+	return sqlCategory
+}
+
 // FormatSQLiteTime formats t in UTC millisecond ISO-8601 format for SQLite storage.
 func FormatSQLiteTime(t time.Time) string {
 	return t.UTC().Format(SQLiteTimestampLayout)
@@ -849,23 +872,37 @@ func FilterAndSortCompactQueue(
 		}
 
 		var holderHandle string
+		var holderActorID *uuid.UUID
 		var leaseExp *time.Time
 		if l, ok := leases[t.ID]; ok && !l.IsExpiredAt(refNow) {
 			if filter.OnlyUnclaimed {
 				continue
 			}
 			holderHandle = l.HolderHandle
+			if l.HolderActorID != uuid.Nil {
+				hid := l.HolderActorID
+				holderActorID = &hid
+			}
 			expCopy := l.ExpiresAt
 			leaseExp = &expCopy
 		}
 
+		var objID *uuid.UUID
 		objSlug := ""
-		if t.ObjectiveID != nil {
-			objSlug = objectiveSlugs[*t.ObjectiveID]
+		if t.ObjectiveID != nil && *t.ObjectiveID != uuid.Nil {
+			oid := *t.ObjectiveID
+			objID = &oid
+			objSlug = objectiveSlugs[oid]
 		}
 		parentKey := ""
 		if t.ParentTaskID != nil {
 			parentKey = parentKeys[*t.ParentTaskID]
+		}
+
+		var lastSignalCopy *time.Time
+		if t.LastSignalAt != nil {
+			sig := t.LastSignalAt.UTC()
+			lastSignalCopy = &sig
 		}
 
 		out = append(out, task.CompactTaskSummary{
@@ -876,13 +913,16 @@ func FilterAndSortCompactQueue(
 			Title:                  t.Title,
 			Status:                 t.Status,
 			Priority:               t.Priority,
+			ObjectiveID:            objID,
 			ObjectiveSlug:          objSlug,
 			ParentKey:              parentKey,
+			HolderActorID:          holderActorID,
 			HolderHandle:           holderHandle,
 			LeaseExpiresAt:         leaseExp,
 			UnresolvedBlockerCount: t.UnresolvedBlockerCount,
 			HasMarkdownDoc:         t.HasMarkdownDoc,
 			Tags:                   t.TagsCopy(),
+			LastSignalAt:           lastSignalCopy,
 			UpdatedAt:              t.UpdatedAt,
 		})
 	}
@@ -1010,6 +1050,18 @@ func AssembleProjectDigest(
 		ActiveLeases:     activeLeaseItems,
 		BlockedTasks:     blockedItems,
 	}
+}
+
+// AuditQueryNeedsPostFilter reports whether filter carries predicates not evaluated
+// directly inside SQL's ListAuditLogsByWorkspace or ListAuditLogsByResource queries.
+func AuditQueryNeedsPostFilter(filter audit.QueryFilter) bool {
+	hasBothResource := filter.ResourceType != "" && filter.ResourceID != ""
+	hasPartialResource := (filter.ResourceType != "" || filter.ResourceID != "") && !hasBothResource
+	return filter.ActorID != uuid.Nil ||
+		filter.Action != "" ||
+		filter.Since != nil ||
+		filter.Until != nil ||
+		hasPartialResource
 }
 
 // FilterSortAndSliceAuditRecords applies QueryFilter predicates and reverse-chronological sorting.

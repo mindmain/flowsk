@@ -65,3 +65,27 @@ type Repository interface {
 	// and returns the updated Project aggregate.
 	SetHasMarkdownDoc(ctx context.Context, workspaceID, projectID uuid.UUID, hasDoc bool) (Project, error)
 }
+
+// BoardMetadataRepository is an optional segregated persistence interface implemented by
+// concrete SQLite and PostgreSQL ProjectRepository adapters to persist custom per-project
+// Kanban workflow states and labels without breaking lightweight Repository test doubles.
+type BoardMetadataRepository interface {
+	// ListWorkflowStates returns all active WorkflowStates for (workspaceID, projectID)
+	// ordered deterministically by Position ascending.
+	ListWorkflowStates(ctx context.Context, workspaceID, projectID uuid.UUID) ([]WorkflowState, error)
+
+	// CreateWorkflowState inserts a new WorkflowState scoped to (st.WorkspaceID, st.ProjectID).
+	CreateWorkflowState(ctx context.Context, st WorkflowState) (WorkflowState, error)
+
+	// UpdateWorkflowState applies partial updates to an active WorkflowState in (in.WorkspaceID, in.ProjectID).
+	UpdateWorkflowState(ctx context.Context, in UpdateWorkflowStateInput) (WorkflowState, error)
+
+	// ListLabels returns all active ProjectLabels visible to (workspaceID, projectID).
+	ListLabels(ctx context.Context, workspaceID, projectID uuid.UUID) ([]ProjectLabel, error)
+
+	// CreateLabel inserts a new ProjectLabel scoped to (lbl.WorkspaceID, lbl.ProjectID).
+	CreateLabel(ctx context.Context, lbl ProjectLabel) (ProjectLabel, error)
+
+	// DeleteLabel soft-deletes an active ProjectLabel matching (workspaceID, projectID, labelID).
+	DeleteLabel(ctx context.Context, workspaceID, projectID, labelID uuid.UUID) error
+}

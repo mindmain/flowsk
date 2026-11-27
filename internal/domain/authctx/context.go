@@ -109,6 +109,33 @@ func (id Identity) Validate() error {
 // with external or transport packages.
 type contextKey struct{}
 
+// suppressTaskSignalKey is an unexported empty struct marking contexts that
+// must not emit or advance task `last_signal_at` timestamps (for example,
+// browser Web UI requests and internal list/relation hydration lookups).
+type suppressTaskSignalKey struct{}
+
+// WithSuppressTaskSignal derives a child context instructing task domain services
+// not to initialize or update `Task.LastSignalAt` during reads or mutations.
+// Browser Web UI interceptors and internal hydration helpers invoke this helper
+// so `last_signal_at` strictly reflects CLI, MCP, and autonomous agent activity.
+func WithSuppressTaskSignal(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, suppressTaskSignalKey{}, true)
+}
+
+// ShouldEmitTaskSignal reports whether domain task operations executed under ctx
+// should record an activity signal on `Task.LastSignalAt`.
+// Returns true by default for non-nil contexts unless suppressed via WithSuppressTaskSignal.
+func ShouldEmitTaskSignal(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	suppressed, ok := ctx.Value(suppressTaskSignalKey{}).(bool)
+	return !ok || !suppressed
+}
+
 // WithIdentity derives a child context carrying the verified caller Identity.
 // Transport authentication interceptors, MCP session handlers, and local CLI
 // bootstraps invoke this helper prior to calling any domain service.

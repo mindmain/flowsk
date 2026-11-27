@@ -67,6 +67,35 @@ func (s Status) IsTerminal() bool {
 	return s == StatusDone || s == StatusCancelled || s == StatusArchived
 }
 
+// SignalGlowWindow is the live activity duration (10 minutes) during which a task
+// in an active execution/review column illuminates its pulsing green signal glow.
+const SignalGlowWindow = 10 * time.Minute
+
+// AcceptsSignal reports whether a task in Status s updates `LastSignalAt` upon
+// agent/CLI/MCP creation, point-reads, updates, leases, comments, docs, or transitions.
+// Signals are recorded across `backlog`, `ready`, `in_progress`, and `in_review`,
+// and stop once a task enters `blocked`, `done`, `cancelled`, or `archived`.
+func (s Status) AcceptsSignal() bool {
+	switch s {
+	case StatusBacklog, StatusReady, StatusInProgress, StatusInReview:
+		return true
+	default:
+		return false
+	}
+}
+
+// IlluminatesSignalGlow reports whether Status s is eligible to display the live
+// pulsing green agent-activity glow (`ready`, `in_progress`, or `in_review`).
+// Tasks in `backlog`, `blocked`, `done`, `cancelled`, or `archived` never glow.
+func (s Status) IlluminatesSignalGlow() bool {
+	switch s {
+	case StatusReady, StatusInProgress, StatusInReview:
+		return true
+	default:
+		return false
+	}
+}
+
 // Priority defines deterministic urgency tiers for ordering agent work queues.
 type Priority int32
 
@@ -183,8 +212,22 @@ type Task struct {
 	// CompletedAt is non-nil when Status transitioned into a terminal state.
 	CompletedAt *time.Time
 
+	// LastSignalAt is the optional UTC timestamp of the most recent agent/CLI/MCP
+	// signal recorded while the task was in an active signal-accepting state (nil by default).
+	LastSignalAt *time.Time
+
 	// DeletedAt is non-nil if the task has been soft-deleted.
 	DeletedAt *time.Time
+}
+
+// HasActiveSignalGlow reports whether the task should display the live pulsing green
+// activity glow at reference timestamp `now` (status in `ready`/`in_progress`/`in_review`
+// and `LastSignalAt` non-nil within `SignalGlowWindow`).
+func (t Task) HasActiveSignalGlow(now time.Time) bool {
+	if !t.Status.IlluminatesSignalGlow() || t.LastSignalAt == nil || t.LastSignalAt.IsZero() {
+		return false
+	}
+	return now.UTC().Sub(t.LastSignalAt.UTC()) <= SignalGlowWindow
 }
 
 // AcceptanceCriteriaCopy returns a defensive copy of AcceptanceCriteria.
@@ -244,6 +287,10 @@ func (t Task) Clone() Task {
 	if t.CompletedAt != nil {
 		completed := *t.CompletedAt
 		out.CompletedAt = &completed
+	}
+	if t.LastSignalAt != nil {
+		sig := *t.LastSignalAt
+		out.LastSignalAt = &sig
 	}
 	if t.DeletedAt != nil {
 		deleted := *t.DeletedAt
@@ -436,11 +483,17 @@ type CompactTaskSummary struct {
 	// Priority is the numeric urgency rank (0..3).
 	Priority Priority
 
+	// ObjectiveID is the optional UUID of the linked Objective (nil if unlinked).
+	ObjectiveID *uuid.UUID
+
 	// ObjectiveSlug is the optional short slug of the linked Objective (empty if unlinked).
 	ObjectiveSlug string
 
 	// ParentKey is the optional short key of the parent epic/task (empty if top-level).
 	ParentKey string
+
+	// HolderActorID is the optional principal UUID of the active non-expired lease holder (nil if unclaimed).
+	HolderActorID *uuid.UUID
 
 	// HolderHandle is the actor handle of the active non-expired lease holder (empty if unclaimed).
 	HolderHandle string
@@ -457,6 +510,9 @@ type CompactTaskSummary struct {
 	// Tags lists compact routing tags.
 	Tags []string
 
+	// LastSignalAt is the optional UTC timestamp of the most recent agent/CLI/MCP signal (nil if unset).
+	LastSignalAt *time.Time
+
 	// UpdatedAt is the UTC timestamp of the most recent change.
 	UpdatedAt time.Time
 }
@@ -468,9 +524,21 @@ func (c CompactTaskSummary) Clone() CompactTaskSummary {
 		out.Tags = make([]string, len(c.Tags))
 		copy(out.Tags, c.Tags)
 	}
+	if c.ObjectiveID != nil {
+		oid := *c.ObjectiveID
+		out.ObjectiveID = &oid
+	}
+	if c.HolderActorID != nil {
+		hid := *c.HolderActorID
+		out.HolderActorID = &hid
+	}
 	if c.LeaseExpiresAt != nil {
 		exp := *c.LeaseExpiresAt
 		out.LeaseExpiresAt = &exp
+	}
+	if c.LastSignalAt != nil {
+		sig := *c.LastSignalAt
+		out.LastSignalAt = &sig
 	}
 	return out
 }

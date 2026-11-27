@@ -120,6 +120,32 @@ func (t *Task) ToProto() *flowsk_task_pb.Task {
 		claimExpiresAt = timeToProto(t.ActiveLease.ExpiresAt)
 	}
 
+	var workflowStateID string
+	if t.ProjectID != uuid.Nil {
+		slug := strings.TrimSpace(string(t.Status))
+		if slug == "" {
+			slug = string(StatusReady)
+		}
+		workflowStateID = uuid.NewSHA1(
+			uuid.NameSpaceOID,
+			[]byte("flowsk:workflow-state:"+t.ProjectID.String()+":"+slug),
+		).String()
+	}
+
+	var labelIDs []string
+	if len(t.Labels) > 0 {
+		keys := make([]string, 0, len(t.Labels))
+		for k := range t.Labels {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if parsed, err := uuid.Parse(strings.TrimSpace(k)); err == nil && parsed != uuid.Nil {
+				labelIDs = append(labelIDs, parsed.String())
+			}
+		}
+	}
+
 	return &flowsk_task_pb.Task{
 		Id:                 uuidToString(t.ID),
 		WorkspaceId:        uuidToString(t.WorkspaceID),
@@ -128,6 +154,7 @@ func (t *Task) ToProto() *flowsk_task_pb.Task {
 		SequenceNumber:     parseSequenceFromKey(t.Key),
 		Kind:               t.Kind.ToProto(),
 		Priority:           t.Priority.ToProto(),
+		WorkflowStateId:    workflowStateID,
 		StateCategory:      t.Status.ToProtoStateCategory(),
 		Title:              t.Title,
 		Description:        t.Description,
@@ -137,6 +164,8 @@ func (t *Task) ToProto() *flowsk_task_pb.Task {
 		AssigneeActorId:    uuidPtrToStringPtr(t.AssigneeActorID),
 		ClaimedByActorId:   claimedBy,
 		ClaimExpiresAt:     claimExpiresAt,
+		LabelIds:           labelIDs,
+		Tags:               t.TagsCopy(),
 		CompletedAt:        timePtrToProto(t.CompletedAt),
 		CreatedByActorId:   uuidToString(t.CreatedBy),
 		CreatedAt:          timeToProto(t.CreatedAt),
@@ -144,6 +173,7 @@ func (t *Task) ToProto() *flowsk_task_pb.Task {
 		HasMarkdownDoc:     t.HasMarkdownDoc,
 		Status:             string(t.Status),
 		ExternalId:         t.ExternalID,
+		LastSignalAt:       timePtrToProto(t.LastSignalAt),
 	}
 }
 
@@ -193,17 +223,20 @@ func (c *CompactTaskSummary) ToProto() *flowsk_task_pb.CompactTaskSummary {
 		return nil
 	}
 	return &flowsk_task_pb.CompactTaskSummary{
-		Id:             uuidToString(c.ID),
-		Identifier:     c.Key,
-		Kind:           c.Kind.ToProto(),
-		Priority:       c.Priority.ToProto(),
-		StateCategory:  c.Status.ToProtoStateCategory(),
-		StateName:      string(c.Status),
-		Title:          c.Title,
-		IsBlocked:      c.UnresolvedBlockerCount > 0,
-		ClaimExpiresAt: timePtrToProto(c.LeaseExpiresAt),
-		HasMarkdownDoc: c.HasMarkdownDoc,
-		ExternalId:     c.ExternalID,
+		Id:               uuidToString(c.ID),
+		Identifier:       c.Key,
+		Kind:             c.Kind.ToProto(),
+		Priority:         c.Priority.ToProto(),
+		StateCategory:    c.Status.ToProtoStateCategory(),
+		StateName:        string(c.Status),
+		Title:            c.Title,
+		IsBlocked:        c.UnresolvedBlockerCount > 0,
+		ClaimedByActorId: uuidPtrToStringPtr(c.HolderActorID),
+		ClaimExpiresAt:   timePtrToProto(c.LeaseExpiresAt),
+		ObjectiveId:      uuidPtrToStringPtr(c.ObjectiveID),
+		HasMarkdownDoc:   c.HasMarkdownDoc,
+		ExternalId:       c.ExternalID,
+		LastSignalAt:     timePtrToProto(c.LastSignalAt),
 	}
 }
 

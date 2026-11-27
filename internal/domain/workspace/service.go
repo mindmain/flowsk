@@ -33,7 +33,7 @@ const (
 
 var (
 	workspaceSlugPattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
-	memberHandlePattern  = regexp.MustCompile(`^[a-zA-Z0-9_]+([.-][a-zA-Z0-9_]+)*$`)
+	memberHandlePattern  = regexp.MustCompile(`^[a-z0-9_]+(-[a-z0-9_]+)*$`)
 )
 
 // Service defines the pure domain application operations for managing Workspaces
@@ -160,12 +160,17 @@ func (s *ServiceSkeleton) CreateWorkspace(ctx context.Context, in CreateWorkspac
 		UpdatedAt:              now,
 	}
 
+	ownerHandle := normalizeOwnerHandle(caller.Handle)
+	ownerDisplay := strings.TrimSpace(caller.Handle)
+	if ownerDisplay == "" {
+		ownerDisplay = ownerHandle
+	}
 	owner := WorkspaceMember{
 		WorkspaceID: ws.ID,
 		ActorID:     caller.ActorID,
 		Kind:        caller.Kind,
-		Handle:      caller.Handle,
-		DisplayName: caller.Handle,
+		Handle:      ownerHandle,
+		DisplayName: ownerDisplay,
 		Role:        MemberRoleOwner,
 		CreatedAt:   now,
 	}
@@ -466,10 +471,13 @@ func (s *ServiceSkeleton) UpsertMember(ctx context.Context, in UpsertMemberInput
 		return WorkspaceMember{}, err
 	}
 
-	handle := strings.TrimSpace(in.Handle)
+	handle := strings.ToLower(strings.TrimSpace(in.Handle))
 	displayName := strings.TrimSpace(in.DisplayName)
 	if displayName == "" {
-		displayName = handle
+		displayName = strings.TrimSpace(in.Handle)
+		if displayName == "" {
+			displayName = handle
+		}
 	}
 
 	var violations []errs.FieldViolation
@@ -482,7 +490,7 @@ func (s *ServiceSkeleton) UpsertMember(ctx context.Context, in UpsertMemberInput
 	if len(handle) < 2 || len(handle) > 64 || !memberHandlePattern.MatchString(handle) {
 		violations = append(violations, errs.FieldViolation{
 			Field:       "handle",
-			Description: "handle must be 2-64 alphanumeric, underscore, dot, or hyphen characters",
+			Description: "handle must be 2-64 lowercase ASCII alphanumeric or underscore characters separated by single hyphens",
 		})
 	}
 	if utf8.RuneCountInString(displayName) > maxMemberDisplayNameRunes {
@@ -518,14 +526,26 @@ func (s *ServiceSkeleton) UpsertMember(ctx context.Context, in UpsertMemberInput
 			return err
 		}
 
+		var callerMember *WorkspaceMember
+		for i := range existingMembers {
+			if existingMembers[i].ActorID == caller.ActorID {
+				cm := existingMembers[i]
+				callerMember = &cm
+				break
+			}
+		}
+
 		now := time.Now().UTC()
 		createdAt := now
 		action := tx.AuditActionCreate
 		effectiveRole := in.Role
 		var oldSnapshot []byte
+		var targetExisting *WorkspaceMember
 
 		for _, existing := range existingMembers {
 			if existing.ActorID == actorID || (in.ActorID == uuid.Nil && strings.EqualFold(existing.Handle, handle)) {
+				exCopy := existing
+				targetExisting = &exCopy
 				actorID = existing.ActorID
 				action = tx.AuditActionUpdate
 				if !existing.CreatedAt.IsZero() {
@@ -539,6 +559,29 @@ func (s *ServiceSkeleton) UpsertMember(ctx context.Context, in UpsertMemberInput
 					return err
 				}
 				break
+			}
+		}
+
+		if len(existingMembers) > 0 && callerMember != nil {
+			switch callerMember.Role {
+			case MemberRoleReader:
+				if actorID != caller.ActorID || effectiveRole != MemberRoleReader {
+					return errs.New(errs.ErrPermissionDenied, op, "workspace readers cannot grant elevated roles or modify other members")
+				}
+			case MemberRoleContributor:
+				if effectiveRole == MemberRoleOwner || effectiveRole == MemberRoleMaintainer {
+					return errs.New(errs.ErrPermissionDenied, op, "workspace contributors cannot grant owner or maintainer roles")
+				}
+				if targetExisting != nil && targetExisting.ActorID != caller.ActorID {
+					return errs.New(errs.ErrPermissionDenied, op, "workspace contributors cannot modify another member's role")
+				}
+			case MemberRoleMaintainer:
+				if effectiveRole == MemberRoleOwner {
+					return errs.New(errs.ErrPermissionDenied, op, "only workspace owners may grant the owner role")
+				}
+				if targetExisting != nil && targetExisting.Role == MemberRoleOwner && targetExisting.ActorID != caller.ActorID {
+					return errs.New(errs.ErrPermissionDenied, op, "workspace maintainers cannot modify an owner's membership")
+				}
 			}
 		}
 
@@ -637,6 +680,35 @@ func isValidRole(r MemberRole) bool {
 	default:
 		return false
 	}
+}
+
+func normalizeOwnerHandle(raw string) string {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	if len(lower) >= 2 && len(lower) <= 64 && memberHandlePattern.MatchString(lower) {
+		return lower
+	}
+	var b strings.Builder
+	prevHyphen := false
+	for _, r := range lower {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_':
+			b.WriteRune(r)
+			prevHyphen = false
+		case r == '-' || r == '.' || r == ' ':
+			if b.Len() > 0 && !prevHyphen {
+				b.WriteByte('-')
+				prevHyphen = true
+			}
+		}
+	}
+	cleaned := strings.Trim(b.String(), "-")
+	if len(cleaned) > 64 {
+		cleaned = strings.TrimRight(cleaned[:64], "-")
+	}
+	if len(cleaned) < 2 || !memberHandlePattern.MatchString(cleaned) {
+		return "owner"
+	}
+	return cleaned
 }
 
 func validateLabels(labels map[string]string) error {

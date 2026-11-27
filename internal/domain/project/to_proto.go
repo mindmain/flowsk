@@ -3,6 +3,7 @@
 package project
 
 import (
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -51,6 +52,68 @@ func (p *Project) ToProto() *flowsk_project_pb.Project {
 		CreatedAt:        timeToProto(p.CreatedAt),
 		UpdatedAt:        timeToProto(p.UpdatedAt),
 		HasMarkdownDoc:   p.HasMarkdownDoc,
+	}
+}
+
+// WorkflowStateCategoryToProto maps a canonical workflow state category string
+// onto its wire-level flowsk.project.v1.WorkflowStateCategory enum value.
+func WorkflowStateCategoryToProto(category string) flowsk_project_pb.WorkflowStateCategory {
+	switch strings.ToLower(strings.TrimSpace(category)) {
+	case "triage":
+		return flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_TRIAGE
+	case "backlog":
+		return flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_BACKLOG
+	case "unstarted":
+		return flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_UNSTARTED
+	case "started":
+		return flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_STARTED
+	case "completed":
+		return flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_COMPLETED
+	case "canceled", "cancelled":
+		return flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_CANCELED
+	case "archived":
+		return flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_ARCHIVED
+	default:
+		return flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_UNSPECIFIED
+	}
+}
+
+// ToProto serializes a domain WorkflowState into its wire-level
+// flowsk.project.v1.WorkflowState Protobuf representation.
+func (s *WorkflowState) ToProto() *flowsk_project_pb.WorkflowState {
+	if s == nil {
+		return nil
+	}
+	return &flowsk_project_pb.WorkflowState{
+		Id:          uuidToString(s.ID),
+		WorkspaceId: uuidToString(s.WorkspaceID),
+		ProjectId:   uuidToString(s.ProjectID),
+		Name:        s.Name,
+		Description: s.Description,
+		Category:    WorkflowStateCategoryToProto(s.Category),
+		ColorHex:    s.ColorHex,
+		Position:    s.Position,
+		IsDefault:   s.IsDefault,
+		CreatedAt:   timeToProto(s.CreatedAt),
+		UpdatedAt:   timeToProto(s.UpdatedAt),
+	}
+}
+
+// ToProto serializes a domain ProjectLabel into its wire-level
+// flowsk.project.v1.Label Protobuf representation.
+func (l *ProjectLabel) ToProto() *flowsk_project_pb.Label {
+	if l == nil {
+		return nil
+	}
+	return &flowsk_project_pb.Label{
+		Id:          uuidToString(l.ID),
+		WorkspaceId: uuidToString(l.WorkspaceID),
+		ProjectId:   uuidToString(l.ProjectID),
+		Name:        l.Name,
+		Description: l.Description,
+		ColorHex:    l.ColorHex,
+		CreatedAt:   timeToProto(l.CreatedAt),
+		UpdatedAt:   timeToProto(l.UpdatedAt),
 	}
 }
 

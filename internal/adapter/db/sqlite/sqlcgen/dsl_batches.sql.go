@@ -78,6 +78,23 @@ func (q *Queries) CreateDSLExecutionBatch(ctx context.Context, arg CreateDSLExec
 	return i, err
 }
 
+const deleteDSLExecutionBatchByIdempotencyKey = `-- name: DeleteDSLExecutionBatchByIdempotencyKey :exec
+DELETE FROM dsl_execution_batches
+WHERE workspace_id = ?1
+  AND idempotency_key = ?2
+`
+
+type DeleteDSLExecutionBatchByIdempotencyKeyParams struct {
+	WorkspaceID    string `json:"workspace_id"`
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
+// DeleteDSLExecutionBatchByIdempotencyKey deletes a sidecar metadata row keyed by workspace_id and idempotency_key.
+func (q *Queries) DeleteDSLExecutionBatchByIdempotencyKey(ctx context.Context, arg DeleteDSLExecutionBatchByIdempotencyKeyParams) error {
+	_, err := q.db.ExecContext(ctx, deleteDSLExecutionBatchByIdempotencyKey, arg.WorkspaceID, arg.IdempotencyKey)
+	return err
+}
+
 const getDSLExecutionBatchByIdempotencyKey = `-- name: GetDSLExecutionBatchByIdempotencyKey :one
 SELECT id, workspace_id, actor_id, idempotency_key, mode, script_hash, statement_count, status, summary_json, created_at
 FROM dsl_execution_batches
@@ -114,6 +131,7 @@ const listDSLExecutionBatchesByWorkspace = `-- name: ListDSLExecutionBatchesByWo
 SELECT id, workspace_id, actor_id, idempotency_key, mode, script_hash, statement_count, status, summary_json, created_at
 FROM dsl_execution_batches
 WHERE workspace_id = ?1
+  AND mode <> 'relation_meta'
 ORDER BY created_at DESC, id DESC
 LIMIT ?3 OFFSET ?2
 `

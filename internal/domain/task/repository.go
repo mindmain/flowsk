@@ -98,6 +98,10 @@ type Repository interface {
 	// and returns the updated Task aggregate.
 	SetHasMarkdownDoc(ctx context.Context, workspaceID, taskID uuid.UUID, hasDoc bool) (Task, error)
 
+	// TouchSignal updates `last_signal_at` on an active task `(workspaceID, taskID)` without
+	// altering `updated_at`, returning the refreshed Task aggregate.
+	TouchSignal(ctx context.Context, workspaceID, taskID uuid.UUID, signalAt time.Time) (Task, error)
+
 	// HardDelete permanently deletes (workspaceID, taskID) and detaches any child subtasks
 	// (used exclusively when purging archived tasks).
 	HardDelete(ctx context.Context, workspaceID, taskID uuid.UUID) error

@@ -288,3 +288,153 @@ type ListBindingsFilter struct {
 	// ChildProjectID filters bindings to parents of this child when non-nil.
 	ChildProjectID *uuid.UUID
 }
+
+// WorkflowState represents a persisted per-project Kanban workflow column paired
+// with a canonical lifecycle category.
+type WorkflowState struct {
+	// ID is the immutable UUID of the workflow state.
+	ID uuid.UUID
+
+	// WorkspaceID is the mandatory owning tenant workspace UUID.
+	WorkspaceID uuid.UUID
+
+	// ProjectID identifies the owning Project within WorkspaceID.
+	ProjectID uuid.UUID
+
+	// Name is the project-unique display label (for example, "Todo" or "QA Review").
+	Name string
+
+	// Description provides optional guidance on entry/exit criteria for this column.
+	Description string
+
+	// Category is the canonical workflow state category ("triage", "backlog", "unstarted",
+	// "started", "completed", "canceled", or "archived").
+	Category string
+
+	// ColorHex is the 6-digit '#' prefixed hex color code (for example, "#3B82F6").
+	ColorHex string
+
+	// Position orders columns deterministically from left to right on the project board.
+	Position int32
+
+	// IsDefault marks whether newly created tasks in this project default to this state.
+	IsDefault bool
+
+	// CreatedAt is the UTC creation timestamp.
+	CreatedAt time.Time
+
+	// UpdatedAt is the UTC last-modified timestamp.
+	UpdatedAt time.Time
+}
+
+// Clone returns a value copy of WorkflowState.
+func (s WorkflowState) Clone() WorkflowState {
+	return s
+}
+
+// CreateWorkflowStateInput carries parameters for creating a custom WorkflowState in a Project.
+type CreateWorkflowStateInput struct {
+	// WorkspaceID is the mandatory owning workspace UUID.
+	WorkspaceID uuid.UUID
+
+	// ProjectID identifies the target Project inside WorkspaceID.
+	ProjectID uuid.UUID
+
+	// Name is the project-unique column display label.
+	Name string
+
+	// Description holds optional entry/exit guidance for the state.
+	Description string
+
+	// Category specifies the canonical lifecycle category.
+	Category string
+
+	// ColorHex specifies an optional '#' prefixed 6-digit hex color code.
+	ColorHex string
+
+	// Position sets the zero-based board ordering index.
+	Position int32
+
+	// IsDefault marks whether this state becomes the project's default state.
+	IsDefault bool
+}
+
+// UpdateWorkflowStateInput carries partial updates for an existing project WorkflowState.
+type UpdateWorkflowStateInput struct {
+	// WorkspaceID is the mandatory owning workspace UUID.
+	WorkspaceID uuid.UUID
+
+	// ProjectID identifies the owning Project inside WorkspaceID.
+	ProjectID uuid.UUID
+
+	// StateID identifies the target WorkflowState UUID to update.
+	StateID uuid.UUID
+
+	// Name updates the column display name when non-nil.
+	Name *string
+
+	// Description updates the column guidance description when non-nil.
+	Description *string
+
+	// Category updates the canonical lifecycle category when non-nil.
+	Category *string
+
+	// ColorHex updates the '#' prefixed 6-digit hex color code when non-nil.
+	ColorHex *string
+
+	// Position updates the board ordering index when non-nil.
+	Position *int32
+
+	// IsDefault updates whether this column is the project's default workflow state when non-nil.
+	IsDefault *bool
+}
+
+// ProjectLabel represents a color-coded categorization label scoped to a Project.
+type ProjectLabel struct {
+	// ID is the immutable UUID of the label.
+	ID uuid.UUID
+
+	// WorkspaceID is the mandatory owning tenant workspace UUID.
+	WorkspaceID uuid.UUID
+
+	// ProjectID identifies the owning Project within WorkspaceID (or uuid.Nil for workspace-global labels).
+	ProjectID uuid.UUID
+
+	// Name is the project-unique label name (for example, "security" or "tech-debt").
+	Name string
+
+	// ColorHex is the 6-digit '#' prefixed hex color code (for example, "#EF4444").
+	ColorHex string
+
+	// Description clarifies when this label should be applied.
+	Description string
+
+	// CreatedAt is the UTC creation timestamp.
+	CreatedAt time.Time
+
+	// UpdatedAt is the UTC last-modified timestamp.
+	UpdatedAt time.Time
+}
+
+// Clone returns a value copy of ProjectLabel.
+func (l ProjectLabel) Clone() ProjectLabel {
+	return l
+}
+
+// CreateProjectLabelInput carries parameters for creating a ProjectLabel inside a Project.
+type CreateProjectLabelInput struct {
+	// WorkspaceID is the mandatory owning workspace UUID.
+	WorkspaceID uuid.UUID
+
+	// ProjectID identifies the target Project inside WorkspaceID.
+	ProjectID uuid.UUID
+
+	// Name is the project-unique label name.
+	Name string
+
+	// ColorHex specifies an optional '#' prefixed 6-digit hex color code.
+	ColorHex string
+
+	// Description provides optional usage context for the label.
+	Description string
+}

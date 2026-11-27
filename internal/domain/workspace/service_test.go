@@ -559,3 +559,134 @@ func TestWorkspaceService_LifecycleAndAuditRollback(t *testing.T) {
 		t.Fatalf("expected archived workspace to return ErrNotFound, got %v", err)
 	}
 }
+
+// TestWorkspaceService_HandleNormalizationAndUpsertMemberRBAC verifies lowercase handle
+// normalization matching workspace.proto, rejection of invalid handle syntax, and RBAC
+// guards preventing readers/contributors from escalating privileges or modifying peers.
+func TestWorkspaceService_HandleNormalizationAndUpsertMemberRBAC(t *testing.T) {
+	t.Parallel()
+
+	env := newMemWorkspaceEnv()
+	repo := newMemWorkspaceRepo(env)
+	svc := workspace.NewService(repo, env)
+
+	ownerID := uuid.New()
+	bootCtx := authctx.WithIdentity(context.Background(), authctx.Identity{
+		WorkspaceID: uuid.New(),
+		ActorID:     ownerID,
+		Kind:        authctx.ActorKindHuman,
+		Handle:      "Alice.Owner",
+	})
+	ws, err := svc.CreateWorkspace(bootCtx, workspace.CreateWorkspaceInput{
+		Slug: "rbac-ws",
+		Name: "RBAC Workspace",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+
+	ownerCtx := authctx.WithIdentity(context.Background(), authctx.Identity{
+		WorkspaceID: ws.ID,
+		ActorID:     ownerID,
+		Kind:        authctx.ActorKindHuman,
+		Handle:      "alice-owner",
+	})
+
+	// Uppercase handle normalizes to lowercase; dots are rejected.
+	contrib, err := svc.UpsertMember(ownerCtx, workspace.UpsertMemberInput{
+		WorkspaceID: ws.ID,
+		Kind:        authctx.ActorKindAgent,
+		Handle:      "Coder_Agent-01",
+		DisplayName: "Coder Agent 01",
+		Role:        workspace.MemberRoleContributor,
+	})
+	if err != nil {
+		t.Fatalf("UpsertMember uppercase handle failed: %v", err)
+	}
+	if contrib.Handle != "coder_agent-01" {
+		t.Fatalf("Handle = %q, want %q", contrib.Handle, "coder_agent-01")
+	}
+
+	if _, err := svc.UpsertMember(ownerCtx, workspace.UpsertMemberInput{
+		WorkspaceID: ws.ID,
+		Kind:        authctx.ActorKindHuman,
+		Handle:      "invalid.dot",
+		Role:        workspace.MemberRoleReader,
+	}); !errors.Is(err, errs.ErrValidation) {
+		t.Fatalf("expected ErrValidation for dot in handle, got %v", err)
+	}
+
+	reader, err := svc.UpsertMember(ownerCtx, workspace.UpsertMemberInput{
+		WorkspaceID: ws.ID,
+		Kind:        authctx.ActorKindHuman,
+		Handle:      "bob-reader",
+		Role:        workspace.MemberRoleReader,
+	})
+	if err != nil {
+		t.Fatalf("UpsertMember reader: %v", err)
+	}
+
+	contribCtx := authctx.WithIdentity(context.Background(), authctx.Identity{
+		WorkspaceID: ws.ID,
+		ActorID:     contrib.ActorID,
+		Kind:        authctx.ActorKindAgent,
+		Handle:      contrib.Handle,
+	})
+	readerCtx := authctx.WithIdentity(context.Background(), authctx.Identity{
+		WorkspaceID: ws.ID,
+		ActorID:     reader.ActorID,
+		Kind:        authctx.ActorKindHuman,
+		Handle:      reader.Handle,
+	})
+
+	// Contributor cannot escalate self to Owner/Maintainer or modify another member's role.
+	for _, role := range []workspace.MemberRole{workspace.MemberRoleOwner, workspace.MemberRoleMaintainer} {
+		if _, err := svc.UpsertMember(contribCtx, workspace.UpsertMemberInput{
+			WorkspaceID: ws.ID,
+			ActorID:     contrib.ActorID,
+			Kind:        authctx.ActorKindAgent,
+			Handle:      contrib.Handle,
+			Role:        role,
+		}); !errors.Is(err, errs.ErrPermissionDenied) {
+			t.Fatalf("expected ErrPermissionDenied when contributor grants %s, got %v", role, err)
+		}
+	}
+	if _, err := svc.UpsertMember(contribCtx, workspace.UpsertMemberInput{
+		WorkspaceID: ws.ID,
+		ActorID:     ownerID,
+		Kind:        authctx.ActorKindHuman,
+		Handle:      "alice-owner",
+		Role:        workspace.MemberRoleReader,
+	}); !errors.Is(err, errs.ErrPermissionDenied) {
+		t.Fatalf("expected ErrPermissionDenied when contributor modifies owner role, got %v", err)
+	}
+
+	// Reader cannot escalate self or enroll/modify other members.
+	if _, err := svc.UpsertMember(readerCtx, workspace.UpsertMemberInput{
+		WorkspaceID: ws.ID,
+		ActorID:     reader.ActorID,
+		Kind:        authctx.ActorKindHuman,
+		Handle:      reader.Handle,
+		Role:        workspace.MemberRoleContributor,
+	}); !errors.Is(err, errs.ErrPermissionDenied) {
+		t.Fatalf("expected ErrPermissionDenied when reader escalates own role, got %v", err)
+	}
+
+	// Unregistered actor self-enrollment in the workspace continues to succeed.
+	selfEnrollID := uuid.New()
+	selfCtx := authctx.WithIdentity(context.Background(), authctx.Identity{
+		WorkspaceID: ws.ID,
+		ActorID:     selfEnrollID,
+		Kind:        authctx.ActorKindAgent,
+		Handle:      "auto-agent",
+	})
+	if _, err := svc.UpsertMember(selfCtx, workspace.UpsertMemberInput{
+		WorkspaceID: ws.ID,
+		ActorID:     selfEnrollID,
+		Kind:        authctx.ActorKindAgent,
+		Handle:      "auto-agent",
+		Role:        workspace.MemberRoleContributor,
+	}); err != nil {
+		t.Fatalf("expected unregistered self-enrollment to succeed, got %v", err)
+	}
+}

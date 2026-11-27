@@ -130,6 +130,7 @@ type Task struct {
 	DeletedAt          *time.Time `json:"deleted_at"`
 	HasMarkdownDoc     bool       `json:"has_markdown_doc"`
 	ExternalID         *string    `json:"external_id"`
+	LastSignalAt       *time.Time `json:"last_signal_at"`
 }
 
 type TaskComment struct {

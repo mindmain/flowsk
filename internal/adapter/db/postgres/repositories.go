@@ -29,11 +29,12 @@ import (
 
 // Compile-time repository interface checks.
 var (
-	_ workspace.Repository = (*WorkspaceRepository)(nil)
-	_ project.Repository   = (*ProjectRepository)(nil)
-	_ objective.Repository = (*ObjectiveRepository)(nil)
-	_ task.Repository      = (*TaskRepository)(nil)
-	_ audit.Repository     = (*AuditRepository)(nil)
+	_ workspace.Repository            = (*WorkspaceRepository)(nil)
+	_ project.Repository              = (*ProjectRepository)(nil)
+	_ project.BoardMetadataRepository = (*ProjectRepository)(nil)
+	_ objective.Repository            = (*ObjectiveRepository)(nil)
+	_ task.Repository                 = (*TaskRepository)(nil)
+	_ audit.Repository                = (*AuditRepository)(nil)
 )
 
 // resolvePostgresQuerier returns either the active `pgx.Tx` Querier or lazily opens the pool Querier.
@@ -93,6 +94,13 @@ func ensurePostgresActorRow(
 	})
 
 	for _, candidateID := range []uuid.UUID{principalActorID, scopedID, uuid.New()} {
+		exists, existsErr := q.CheckActorIDExists(ctx, candidateID)
+		if existsErr != nil {
+			return nil, existsErr
+		}
+		if exists {
+			continue
+		}
 		created, createErr := q.CreateActor(ctx, sqlcgen.CreateActorParams{
 			ID:               candidateID,
 			WorkspaceID:      workspaceID,
@@ -365,6 +373,13 @@ func (r *WorkspaceRepository) UpsertMember(ctx context.Context, m workspace.Work
 
 	scopedID := db.ScopedActorRowID(m.WorkspaceID, actorID)
 	for _, candidateID := range []uuid.UUID{actorID, scopedID, uuid.New()} {
+		exists, existsErr := q.CheckActorIDExists(ctx, candidateID)
+		if existsErr != nil {
+			return db.MapSQLDriverError(op, existsErr)
+		}
+		if exists {
+			continue
+		}
 		_, createErr := q.CreateActor(ctx, sqlcgen.CreateActorParams{
 			ID:               candidateID,
 			WorkspaceID:      m.WorkspaceID,
@@ -628,12 +643,31 @@ func (r *ProjectRepository) NextTaskSequence(ctx context.Context, workspaceID, p
 	return updated.KeyPrefix, updated.IssueCounter, nil
 }
 
-// SoftDelete marks (workspaceID, projectID) as soft-deleted.
+// SoftDelete marks (workspaceID, projectID) as soft-deleted after cascading soft-deletes
+// to its tasks (releasing active leases) and objectives inside the enclosing transaction.
 func (r *ProjectRepository) SoftDelete(ctx context.Context, workspaceID, projectID uuid.UUID) error {
 	const op = "postgres.ProjectRepository.SoftDelete"
 	q, err := resolvePostgresQuerier(ctx, op, r.adapter, r.scoped, r.scope)
 	if err != nil {
 		return err
+	}
+	if _, err := q.GetProjectByID(ctx, sqlcgen.GetProjectByIDParams{
+		WorkspaceID: workspaceID,
+		ID:          projectID,
+	}); err != nil {
+		return db.MapSQLDriverError(op, err)
+	}
+	if err := q.SoftDeleteTasksByProject(ctx, sqlcgen.SoftDeleteTasksByProjectParams{
+		WorkspaceID: workspaceID,
+		ProjectID:   projectID,
+	}); err != nil {
+		return db.MapSQLDriverError(op, err)
+	}
+	if err := q.SoftDeleteObjectivesByProject(ctx, sqlcgen.SoftDeleteObjectivesByProjectParams{
+		WorkspaceID: workspaceID,
+		ProjectID:   projectID,
+	}); err != nil {
+		return db.MapSQLDriverError(op, err)
 	}
 	rows, err := q.SoftDeleteProject(ctx, sqlcgen.SoftDeleteProjectParams{
 		WorkspaceID: workspaceID,
@@ -645,10 +679,12 @@ func (r *ProjectRepository) SoftDelete(ctx context.Context, workspaceID, project
 	if rows == 0 {
 		return errs.New(errs.ErrNotFound, op, "project not found or already soft-deleted")
 	}
-	_ = q.DeleteProjectBindingsForProject(ctx, sqlcgen.DeleteProjectBindingsForProjectParams{
+	if err := q.DeleteProjectBindingsForProject(ctx, sqlcgen.DeleteProjectBindingsForProjectParams{
 		WorkspaceID: workspaceID,
 		ProjectID:   projectID,
-	})
+	}); err != nil {
+		return db.MapSQLDriverError(op, err)
+	}
 	return nil
 }
 
@@ -765,6 +801,297 @@ func (r *ProjectRepository) SetHasMarkdownDoc(ctx context.Context, workspaceID, 
 		return project.Project{}, db.MapSQLDriverError(op, err)
 	}
 	return mapPostgresProject(row, buildPostgresActorLookup(ctx, q, workspaceID)), nil
+}
+
+func mapPostgresWorkflowState(row sqlcgen.WorkflowState) project.WorkflowState {
+	return project.WorkflowState{
+		ID:          row.ID,
+		WorkspaceID: row.WorkspaceID,
+		ProjectID:   row.ProjectID,
+		Name:        row.Name,
+		Category:    db.DomainWorkflowStateCategory(row.Name, row.Category),
+		ColorHex:    row.Color,
+		Position:    row.Position,
+		IsDefault:   row.IsDefault,
+		CreatedAt:   row.CreatedAt.UTC(),
+		UpdatedAt:   row.UpdatedAt.UTC(),
+	}
+}
+
+func mapPostgresProjectLabel(row sqlcgen.Label) project.ProjectLabel {
+	var projID uuid.UUID
+	if row.ProjectID != nil {
+		projID = *row.ProjectID
+	}
+	return project.ProjectLabel{
+		ID:          row.ID,
+		WorkspaceID: row.WorkspaceID,
+		ProjectID:   projID,
+		Name:        row.Name,
+		ColorHex:    row.Color,
+		Description: row.Description,
+		CreatedAt:   row.CreatedAt.UTC(),
+		UpdatedAt:   row.UpdatedAt.UTC(),
+	}
+}
+
+// ListWorkflowStates returns all active WorkflowStates for (workspaceID, projectID) ordered by Position.
+func (r *ProjectRepository) ListWorkflowStates(ctx context.Context, workspaceID, projectID uuid.UUID) ([]project.WorkflowState, error) {
+	const op = "postgres.ProjectRepository.ListWorkflowStates"
+	q, err := resolvePostgresQuerier(ctx, op, r.adapter, r.scoped, r.scope)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := q.GetProjectByID(ctx, sqlcgen.GetProjectByIDParams{
+		WorkspaceID: workspaceID,
+		ID:          projectID,
+	}); err != nil {
+		return nil, db.MapSQLDriverError(op, err)
+	}
+	rows, err := q.ListWorkflowStatesByProject(ctx, sqlcgen.ListWorkflowStatesByProjectParams{
+		WorkspaceID: workspaceID,
+		ProjectID:   projectID,
+	})
+	if err != nil {
+		return nil, db.MapSQLDriverError(op, err)
+	}
+	out := make([]project.WorkflowState, len(rows))
+	for i, row := range rows {
+		out[i] = mapPostgresWorkflowState(row)
+	}
+	return out, nil
+}
+
+// CreateWorkflowState inserts a custom WorkflowState scoped to (st.WorkspaceID, st.ProjectID).
+func (r *ProjectRepository) CreateWorkflowState(ctx context.Context, st project.WorkflowState) (project.WorkflowState, error) {
+	const op = "postgres.ProjectRepository.CreateWorkflowState"
+	q, err := resolvePostgresQuerier(ctx, op, r.adapter, r.scoped, r.scope)
+	if err != nil {
+		return project.WorkflowState{}, err
+	}
+	if _, err := q.GetProjectByID(ctx, sqlcgen.GetProjectByIDParams{
+		WorkspaceID: st.WorkspaceID,
+		ID:          st.ProjectID,
+	}); err != nil {
+		return project.WorkflowState{}, db.MapSQLDriverError(op, err)
+	}
+	if st.IsDefault {
+		existing, lErr := q.ListWorkflowStatesByProject(ctx, sqlcgen.ListWorkflowStatesByProjectParams{
+			WorkspaceID: st.WorkspaceID,
+			ProjectID:   st.ProjectID,
+		})
+		if lErr != nil {
+			return project.WorkflowState{}, db.MapSQLDriverError(op, lErr)
+		}
+		f := false
+		for _, ex := range existing {
+			if ex.IsDefault {
+				if _, uErr := q.UpdateWorkflowState(ctx, sqlcgen.UpdateWorkflowStateParams{
+					IsDefault:   &f,
+					WorkspaceID: st.WorkspaceID,
+					ProjectID:   st.ProjectID,
+					ID:          ex.ID,
+				}); uErr != nil {
+					return project.WorkflowState{}, db.MapSQLDriverError(op, uErr)
+				}
+			}
+		}
+	}
+
+	stID := st.ID
+	if stID == uuid.Nil {
+		stID = uuid.New()
+	}
+	color := st.ColorHex
+	if strings.TrimSpace(color) == "" {
+		color = "#6B7280"
+	}
+	row, err := q.CreateWorkflowState(ctx, sqlcgen.CreateWorkflowStateParams{
+		ID:          stID,
+		WorkspaceID: st.WorkspaceID,
+		ProjectID:   st.ProjectID,
+		Name:        st.Name,
+		Category:    db.SQLWorkflowStateCategory(st.Category),
+		Position:    st.Position,
+		Color:       color,
+		IsDefault:   st.IsDefault,
+	})
+	if err != nil {
+		return project.WorkflowState{}, db.MapSQLDriverError(op, err)
+	}
+	mapped := mapPostgresWorkflowState(row)
+	mapped.Description = st.Description
+	if strings.EqualFold(strings.TrimSpace(st.Category), "archived") {
+		mapped.Category = "archived"
+	}
+	return mapped, nil
+}
+
+// UpdateWorkflowState mutates an existing WorkflowState inside (in.WorkspaceID, in.ProjectID).
+func (r *ProjectRepository) UpdateWorkflowState(ctx context.Context, in project.UpdateWorkflowStateInput) (project.WorkflowState, error) {
+	const op = "postgres.ProjectRepository.UpdateWorkflowState"
+	q, err := resolvePostgresQuerier(ctx, op, r.adapter, r.scoped, r.scope)
+	if err != nil {
+		return project.WorkflowState{}, err
+	}
+	if _, err := q.GetProjectByID(ctx, sqlcgen.GetProjectByIDParams{
+		WorkspaceID: in.WorkspaceID,
+		ID:          in.ProjectID,
+	}); err != nil {
+		return project.WorkflowState{}, db.MapSQLDriverError(op, err)
+	}
+	cur, err := q.GetWorkflowStateByID(ctx, sqlcgen.GetWorkflowStateByIDParams{
+		WorkspaceID: in.WorkspaceID,
+		ID:          in.StateID,
+	})
+	if err != nil {
+		return project.WorkflowState{}, db.MapSQLDriverError(op, err)
+	}
+	if cur.ProjectID != in.ProjectID {
+		return project.WorkflowState{}, errs.New(errs.ErrNotFound, op, "workflow state not found in project")
+	}
+
+	if in.IsDefault != nil && *in.IsDefault {
+		existing, lErr := q.ListWorkflowStatesByProject(ctx, sqlcgen.ListWorkflowStatesByProjectParams{
+			WorkspaceID: in.WorkspaceID,
+			ProjectID:   in.ProjectID,
+		})
+		if lErr != nil {
+			return project.WorkflowState{}, db.MapSQLDriverError(op, lErr)
+		}
+		f := false
+		for _, ex := range existing {
+			if ex.ID != in.StateID && ex.IsDefault {
+				if _, uErr := q.UpdateWorkflowState(ctx, sqlcgen.UpdateWorkflowStateParams{
+					IsDefault:   &f,
+					WorkspaceID: in.WorkspaceID,
+					ProjectID:   in.ProjectID,
+					ID:          ex.ID,
+				}); uErr != nil {
+					return project.WorkflowState{}, db.MapSQLDriverError(op, uErr)
+				}
+			}
+		}
+	}
+
+	var catPtr *string
+	if in.Category != nil {
+		sqlCat := db.SQLWorkflowStateCategory(*in.Category)
+		catPtr = &sqlCat
+	}
+	row, err := q.UpdateWorkflowState(ctx, sqlcgen.UpdateWorkflowStateParams{
+		Name:        in.Name,
+		Category:    catPtr,
+		Position:    in.Position,
+		Color:       in.ColorHex,
+		IsDefault:   in.IsDefault,
+		WorkspaceID: in.WorkspaceID,
+		ProjectID:   in.ProjectID,
+		ID:          in.StateID,
+	})
+	if err != nil {
+		return project.WorkflowState{}, db.MapSQLDriverError(op, err)
+	}
+	mapped := mapPostgresWorkflowState(row)
+	if in.Description != nil {
+		mapped.Description = *in.Description
+	}
+	if in.Category != nil && strings.EqualFold(strings.TrimSpace(*in.Category), "archived") {
+		mapped.Category = "archived"
+	}
+	return mapped, nil
+}
+
+// ListLabels returns active ProjectLabels visible to (workspaceID, projectID).
+func (r *ProjectRepository) ListLabels(ctx context.Context, workspaceID, projectID uuid.UUID) ([]project.ProjectLabel, error) {
+	const op = "postgres.ProjectRepository.ListLabels"
+	q, err := resolvePostgresQuerier(ctx, op, r.adapter, r.scoped, r.scope)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := q.GetProjectByID(ctx, sqlcgen.GetProjectByIDParams{
+		WorkspaceID: workspaceID,
+		ID:          projectID,
+	}); err != nil {
+		return nil, db.MapSQLDriverError(op, err)
+	}
+	projCopy := projectID
+	rows, err := q.ListLabelsByProject(ctx, sqlcgen.ListLabelsByProjectParams{
+		WorkspaceID: workspaceID,
+		ProjectID:   &projCopy,
+	})
+	if err != nil {
+		return nil, db.MapSQLDriverError(op, err)
+	}
+	out := make([]project.ProjectLabel, len(rows))
+	for i, row := range rows {
+		out[i] = mapPostgresProjectLabel(row)
+	}
+	return out, nil
+}
+
+// CreateLabel inserts a new ProjectLabel scoped to (lbl.WorkspaceID, lbl.ProjectID).
+func (r *ProjectRepository) CreateLabel(ctx context.Context, lbl project.ProjectLabel) (project.ProjectLabel, error) {
+	const op = "postgres.ProjectRepository.CreateLabel"
+	q, err := resolvePostgresQuerier(ctx, op, r.adapter, r.scoped, r.scope)
+	if err != nil {
+		return project.ProjectLabel{}, err
+	}
+	if _, err := q.GetProjectByID(ctx, sqlcgen.GetProjectByIDParams{
+		WorkspaceID: lbl.WorkspaceID,
+		ID:          lbl.ProjectID,
+	}); err != nil {
+		return project.ProjectLabel{}, db.MapSQLDriverError(op, err)
+	}
+	lblID := lbl.ID
+	if lblID == uuid.Nil {
+		lblID = uuid.New()
+	}
+	projCopy := lbl.ProjectID
+	color := lbl.ColorHex
+	if strings.TrimSpace(color) == "" {
+		color = "#6B7280"
+	}
+	row, err := q.CreateLabel(ctx, sqlcgen.CreateLabelParams{
+		ID:          lblID,
+		WorkspaceID: lbl.WorkspaceID,
+		ProjectID:   &projCopy,
+		Name:        lbl.Name,
+		Color:       color,
+		Description: lbl.Description,
+	})
+	if err != nil {
+		return project.ProjectLabel{}, db.MapSQLDriverError(op, err)
+	}
+	return mapPostgresProjectLabel(row), nil
+}
+
+// DeleteLabel soft-deletes an active ProjectLabel matching (workspaceID, projectID, labelID).
+func (r *ProjectRepository) DeleteLabel(ctx context.Context, workspaceID, projectID, labelID uuid.UUID) error {
+	const op = "postgres.ProjectRepository.DeleteLabel"
+	q, err := resolvePostgresQuerier(ctx, op, r.adapter, r.scoped, r.scope)
+	if err != nil {
+		return err
+	}
+	if _, err := q.GetProjectByID(ctx, sqlcgen.GetProjectByIDParams{
+		WorkspaceID: workspaceID,
+		ID:          projectID,
+	}); err != nil {
+		return db.MapSQLDriverError(op, err)
+	}
+	projCopy := projectID
+	rows, err := q.SoftDeleteLabel(ctx, sqlcgen.SoftDeleteLabelParams{
+		WorkspaceID: workspaceID,
+		ProjectID:   &projCopy,
+		ID:          labelID,
+	})
+	if err != nil {
+		return db.MapSQLDriverError(op, err)
+	}
+	if rows == 0 {
+		return errs.New(errs.ErrNotFound, op, "label not found in project")
+	}
+	return nil
 }
 
 // =============================================================================
@@ -1011,13 +1338,15 @@ func (r *ObjectiveRepository) Update(ctx context.Context, o objective.Objective)
 		targetPtr = &utc
 	}
 	_, err = q.UpdateObjective(ctx, sqlcgen.UpdateObjectiveParams{
-		Title:       &o.Title,
-		Description: &encodedDesc,
-		Kind:        kindPtr,
-		Status:      &statusStr,
-		TargetDate:  targetPtr,
-		WorkspaceID: o.WorkspaceID,
-		ID:          o.ID,
+		ParentObjectiveID: existing.ParentObjectiveID,
+		Title:             &o.Title,
+		Description:       &encodedDesc,
+		Kind:              kindPtr,
+		Status:            &statusStr,
+		StartsAt:          existing.StartsAt,
+		TargetDate:        targetPtr,
+		WorkspaceID:       o.WorkspaceID,
+		ID:                o.ID,
 	})
 	return db.MapSQLDriverError(op, err)
 }
@@ -1243,10 +1572,14 @@ func mapPostgresTaskRow(
 		return task.Task{}, nil, err
 	}
 
-	var completedAt, deletedAt *time.Time
+	var completedAt, lastSignalAt, deletedAt *time.Time
 	if row.CompletedAt != nil {
 		t := row.CompletedAt.UTC()
 		completedAt = &t
+	}
+	if row.LastSignalAt != nil && !row.LastSignalAt.IsZero() {
+		t := row.LastSignalAt.UTC()
+		lastSignalAt = &t
 	}
 	if row.DeletedAt != nil {
 		t := row.DeletedAt.UTC()
@@ -1283,6 +1616,7 @@ func mapPostgresTaskRow(
 		CreatedAt:              row.CreatedAt.UTC(),
 		UpdatedAt:              row.UpdatedAt.UTC(),
 		CompletedAt:            completedAt,
+		LastSignalAt:           lastSignalAt,
 		DeletedAt:              deletedAt,
 	}, storedLease, nil
 }
@@ -1298,21 +1632,69 @@ func (r *TaskRepository) Create(ctx context.Context, t task.Task) error {
 		return db.MapSQLDriverError(op, err)
 	}
 
-	existingTasks, err := q.ListTasksByProject(ctx, sqlcgen.ListTasksByProjectParams{
-		WorkspaceID: t.WorkspaceID,
-		ProjectID:   t.ProjectID,
-	})
-	if err != nil {
-		return db.MapSQLDriverError(op, err)
+	var objPtr, parentPtr *uuid.UUID
+	if t.ObjectiveID != nil && *t.ObjectiveID != uuid.Nil {
+		objRow, objErr := q.GetObjectiveByID(ctx, sqlcgen.GetObjectiveByIDParams{
+			WorkspaceID: t.WorkspaceID,
+			ID:          *t.ObjectiveID,
+		})
+		if objErr != nil {
+			if errors.Is(objErr, pgx.ErrNoRows) {
+				return errs.New(errs.ErrNotFound, op, "objective not found in workspace")
+			}
+			return db.MapSQLDriverError(op, objErr)
+		}
+		if objRow.ProjectID != t.ProjectID {
+			return errs.Validation(op, "objective belongs to a different project", errs.FieldViolation{
+				Field:       "objective_id",
+				Description: "objective_id must belong to the same project_id",
+			})
+		}
+		idCopy := *t.ObjectiveID
+		objPtr = &idCopy
 	}
-	usedSeqs := make(map[int64]bool, len(existingTasks))
-	for _, ex := range existingTasks {
-		usedSeqs[ex.SequenceNumber] = true
+	if t.ParentTaskID != nil && *t.ParentTaskID != uuid.Nil {
+		idCopy := *t.ParentTaskID
+		parentPtr = &idCopy
 	}
 
 	key := strings.TrimSpace(t.Key)
 	var seqNum int64
-	if key == "" {
+	reallocate := key == ""
+	keepCustomKey := false
+
+	if !reallocate {
+		if parsedSeq, ok := db.ParseTrailingSequence(key); ok {
+			conflict, cErr := q.CheckTaskSequenceOrIdentifierConflict(ctx, sqlcgen.CheckTaskSequenceOrIdentifierConflictParams{
+				WorkspaceID:    t.WorkspaceID,
+				ProjectID:      t.ProjectID,
+				SequenceNumber: parsedSeq,
+				Identifier:     key,
+			})
+			if cErr != nil {
+				return db.MapSQLDriverError(op, cErr)
+			}
+			if !conflict {
+				seqNum = parsedSeq
+			} else {
+				reallocate = true
+			}
+		} else {
+			idConflict, cErr := q.CheckTaskSequenceOrIdentifierConflict(ctx, sqlcgen.CheckTaskSequenceOrIdentifierConflictParams{
+				WorkspaceID:    t.WorkspaceID,
+				ProjectID:      t.ProjectID,
+				SequenceNumber: -1,
+				Identifier:     key,
+			})
+			if cErr != nil {
+				return db.MapSQLDriverError(op, cErr)
+			}
+			keepCustomKey = !idConflict
+			reallocate = true
+		}
+	}
+
+	if reallocate {
 		for {
 			incProj, incErr := q.IncrementProjectIssueCounter(ctx, sqlcgen.IncrementProjectIssueCounterParams{
 				WorkspaceID: t.WorkspaceID,
@@ -1321,28 +1703,24 @@ func (r *TaskRepository) Create(ctx context.Context, t task.Task) error {
 			if incErr != nil {
 				return db.MapSQLDriverError(op, incErr)
 			}
-			if !usedSeqs[incProj.IssueCounter] {
-				seqNum = incProj.IssueCounter
-				key = fmt.Sprintf("%s-%d", incProj.KeyPrefix, seqNum)
-				break
+			candidateSeq := incProj.IssueCounter
+			candidateKey := fmt.Sprintf("%s-%d", incProj.KeyPrefix, candidateSeq)
+			if keepCustomKey {
+				candidateKey = key
 			}
-		}
-	} else {
-		if parsedSeq, ok := db.ParseTrailingSequence(key); ok && !usedSeqs[parsedSeq] {
-			seqNum = parsedSeq
-		} else {
-			for {
-				incProj, incErr := q.IncrementProjectIssueCounter(ctx, sqlcgen.IncrementProjectIssueCounterParams{
-					WorkspaceID: t.WorkspaceID,
-					ID:          t.ProjectID,
-				})
-				if incErr != nil {
-					return db.MapSQLDriverError(op, incErr)
-				}
-				if !usedSeqs[incProj.IssueCounter] {
-					seqNum = incProj.IssueCounter
-					break
-				}
+			conflict, cErr := q.CheckTaskSequenceOrIdentifierConflict(ctx, sqlcgen.CheckTaskSequenceOrIdentifierConflictParams{
+				WorkspaceID:    t.WorkspaceID,
+				ProjectID:      t.ProjectID,
+				SequenceNumber: candidateSeq,
+				Identifier:     candidateKey,
+			})
+			if cErr != nil {
+				return db.MapSQLDriverError(op, cErr)
+			}
+			if !conflict {
+				seqNum = candidateSeq
+				key = candidateKey
+				break
 			}
 		}
 	}
@@ -1358,16 +1736,6 @@ func (r *TaskRepository) Create(ctx context.Context, t task.Task) error {
 	stateID, err := resolvePostgresWorkflowStateID(ctx, q, t.WorkspaceID, t.ProjectID, status)
 	if err != nil {
 		return db.MapSQLDriverError(op, err)
-	}
-
-	var objPtr, parentPtr *uuid.UUID
-	if t.ObjectiveID != nil && *t.ObjectiveID != uuid.Nil {
-		idCopy := *t.ObjectiveID
-		objPtr = &idCopy
-	}
-	if t.ParentTaskID != nil && *t.ParentTaskID != uuid.Nil {
-		idCopy := *t.ParentTaskID
-		parentPtr = &idCopy
 	}
 	reporterPtr, err := ensurePostgresActorRow(ctx, q, t.WorkspaceID, t.CreatedBy, "", "")
 	if err != nil {
@@ -1398,6 +1766,11 @@ func (r *TaskRepository) Create(ctx context.Context, t task.Task) error {
 	if trimmedExt := strings.TrimSpace(t.ExternalID); trimmedExt != "" {
 		extPtr = &trimmedExt
 	}
+	var lastSignalPtr *time.Time
+	if t.LastSignalAt != nil && !t.LastSignalAt.IsZero() {
+		utc := t.LastSignalAt.UTC()
+		lastSignalPtr = &utc
+	}
 
 	_, err = q.CreateTask(ctx, sqlcgen.CreateTaskParams{
 		ID:                 taskID,
@@ -1417,6 +1790,7 @@ func (r *TaskRepository) Create(ctx context.Context, t task.Task) error {
 		ReporterActorID:    reporterPtr,
 		AssigneeActorID:    assigneePtr,
 		CompletedAt:        completedPtr,
+		LastSignalAt:       lastSignalPtr,
 	})
 	return db.MapSQLDriverError(op, err)
 }
@@ -1512,6 +1886,22 @@ func (r *TaskRepository) Update(ctx context.Context, t task.Task, expectedVersio
 
 	var objPtr, parentPtr, assigneePtr *uuid.UUID
 	if t.ObjectiveID != nil && *t.ObjectiveID != uuid.Nil {
+		objRow, objErr := q.GetObjectiveByID(ctx, sqlcgen.GetObjectiveByIDParams{
+			WorkspaceID: t.WorkspaceID,
+			ID:          *t.ObjectiveID,
+		})
+		if objErr != nil {
+			if errors.Is(objErr, pgx.ErrNoRows) {
+				return errs.New(errs.ErrNotFound, op, "objective not found in workspace")
+			}
+			return db.MapSQLDriverError(op, objErr)
+		}
+		if objRow.ProjectID != existing.ProjectID {
+			return errs.Validation(op, "objective belongs to a different project", errs.FieldViolation{
+				Field:       "objective_id",
+				Description: "objective_id must belong to the same project_id",
+			})
+		}
 		idCopy := *t.ObjectiveID
 		objPtr = &idCopy
 	}
@@ -1531,6 +1921,12 @@ func (r *TaskRepository) Update(ctx context.Context, t task.Task, expectedVersio
 	encodedDesc := db.EncodeTaskDescription(t, nextVersion)
 	encodedAC := db.EncodeAcceptanceCriteria(t.AcceptanceCriteria)
 
+	var lastSignalPtr *time.Time
+	if t.LastSignalAt != nil && !t.LastSignalAt.IsZero() {
+		utc := t.LastSignalAt.UTC()
+		lastSignalPtr = &utc
+	}
+
 	if _, err := q.UpdateTask(ctx, sqlcgen.UpdateTaskParams{
 		ObjectiveID:        objPtr,
 		ParentTaskID:       parentPtr,
@@ -1539,7 +1935,9 @@ func (r *TaskRepository) Update(ctx context.Context, t task.Task, expectedVersio
 		Title:              &t.Title,
 		Description:        &encodedDesc,
 		AcceptanceCriteria: &encodedAC,
+		EstimatePoints:     existing.EstimatePoints,
 		AssigneeActorID:    assigneePtr,
+		LastSignalAt:       lastSignalPtr,
 		WorkspaceID:        t.WorkspaceID,
 		ID:                 t.ID,
 	}); err != nil {
@@ -1644,12 +2042,52 @@ func (r *TaskRepository) SetHasMarkdownDoc(ctx context.Context, workspaceID, tas
 	return mapped, db.MapSQLDriverError(op, err)
 }
 
+// TouchSignal updates last_signal_at on (workspaceID, taskID) without changing updated_at and returns the updated Task.
+func (r *TaskRepository) TouchSignal(ctx context.Context, workspaceID, taskID uuid.UUID, signalAt time.Time) (task.Task, error) {
+	const op = "postgres.TaskRepository.TouchSignal"
+	q, err := resolvePostgresQuerier(ctx, op, r.adapter, r.scoped, r.scope)
+	if err != nil {
+		return task.Task{}, err
+	}
+	var sigPtr *time.Time
+	if !signalAt.IsZero() {
+		utc := signalAt.UTC()
+		sigPtr = &utc
+	}
+	row, err := q.TouchTaskLastSignal(ctx, sqlcgen.TouchTaskLastSignalParams{
+		LastSignalAt: sigPtr,
+		WorkspaceID:  workspaceID,
+		ID:           taskID,
+	})
+	if err != nil {
+		return task.Task{}, db.MapSQLDriverError(op, err)
+	}
+	actorMap := buildPostgresActorLookup(ctx, q, workspaceID)
+	mapped, _, err := mapPostgresTaskRow(ctx, q, row, actorMap, make(map[uuid.UUID]map[uuid.UUID]task.Status), time.Now().UTC())
+	return mapped, db.MapSQLDriverError(op, err)
+}
+
 // HardDelete detaches child subtasks and permanently deletes (workspaceID, taskID).
 func (r *TaskRepository) HardDelete(ctx context.Context, workspaceID, taskID uuid.UUID) error {
 	const op = "postgres.TaskRepository.HardDelete"
 	q, err := resolvePostgresQuerier(ctx, op, r.adapter, r.scoped, r.scope)
 	if err != nil {
 		return err
+	}
+	rels, err := q.ListTaskRelations(ctx, sqlcgen.ListTaskRelationsParams{
+		WorkspaceID: workspaceID,
+		TaskID:      taskID,
+	})
+	if err != nil {
+		return db.MapSQLDriverError(op, err)
+	}
+	for _, rel := range rels {
+		if dErr := q.DeleteDSLExecutionBatchByIdempotencyKey(ctx, sqlcgen.DeleteDSLExecutionBatchByIdempotencyKeyParams{
+			WorkspaceID:    workspaceID,
+			IdempotencyKey: db.RelationMetaIdempotencyKey(rel.ID),
+		}); dErr != nil {
+			return db.MapSQLDriverError(op, dErr)
+		}
 	}
 	parentCopy := taskID
 	if err := q.DetachSubtasksFromParent(ctx, sqlcgen.DetachSubtasksFromParentParams{
@@ -1994,6 +2432,12 @@ func (r *TaskRepository) DeleteRelation(ctx context.Context, workspaceID, relati
 	if rows == 0 {
 		return errs.New(errs.ErrNotFound, op, "task relation not found")
 	}
+	if err := q.DeleteDSLExecutionBatchByIdempotencyKey(ctx, sqlcgen.DeleteDSLExecutionBatchByIdempotencyKeyParams{
+		WorkspaceID:    workspaceID,
+		IdempotencyKey: db.RelationMetaIdempotencyKey(relationID),
+	}); err != nil {
+		return db.MapSQLDriverError(op, err)
+	}
 	return nil
 }
 
@@ -2194,30 +2638,81 @@ func (r *AuditRepository) Query(ctx context.Context, filter audit.QueryFilter) (
 	if err != nil {
 		return nil, err
 	}
-	const scanBatchSize = int32(10000)
-	var rows []sqlcgen.AuditLog
-	if filter.ResourceType != "" && filter.ResourceID != "" {
-		rows, err = q.ListAuditLogsByResource(ctx, sqlcgen.ListAuditLogsByResourceParams{
-			WorkspaceID:  filter.WorkspaceID,
-			ResourceType: filter.ResourceType,
-			ResourceID:   filter.ResourceID,
-			Offset:       0,
-			Limit:        scanBatchSize,
-		})
-	} else {
-		rows, err = q.ListAuditLogsByWorkspace(ctx, sqlcgen.ListAuditLogsByWorkspaceParams{
-			WorkspaceID: filter.WorkspaceID,
-			Offset:      0,
-			Limit:       scanBatchSize,
-		})
-	}
-	if err != nil {
-		return nil, db.MapSQLDriverError(op, err)
-	}
 	actorMap := buildPostgresActorLookup(ctx, q, filter.WorkspaceID)
-	mapped := make([]audit.Record, 0, len(rows))
-	for _, row := range rows {
-		mapped = append(mapped, mapPostgresAuditRecord(row, actorMap))
+	hasBothResource := filter.ResourceType != "" && filter.ResourceID != ""
+	effectiveLimit := filter.Limit
+	if effectiveLimit <= 0 {
+		effectiveLimit = 100
+	}
+
+	if !db.AuditQueryNeedsPostFilter(filter) {
+		sqlOffset := max(filter.Offset, 0)
+		sqlLimit := effectiveLimit
+		var rows []sqlcgen.AuditLog
+		if hasBothResource {
+			rows, err = q.ListAuditLogsByResource(ctx, sqlcgen.ListAuditLogsByResourceParams{
+				WorkspaceID:  filter.WorkspaceID,
+				ResourceType: filter.ResourceType,
+				ResourceID:   filter.ResourceID,
+				Offset:       sqlOffset,
+				Limit:        sqlLimit,
+			})
+		} else {
+			rows, err = q.ListAuditLogsByWorkspace(ctx, sqlcgen.ListAuditLogsByWorkspaceParams{
+				WorkspaceID: filter.WorkspaceID,
+				Offset:      sqlOffset,
+				Limit:       sqlLimit,
+			})
+		}
+		if err != nil {
+			return nil, db.MapSQLDriverError(op, err)
+		}
+		mapped := make([]audit.Record, len(rows))
+		for i, row := range rows {
+			mapped[i] = mapPostgresAuditRecord(row, actorMap)
+		}
+		sliceFilter := filter
+		sliceFilter.Offset = 0
+		sliceFilter.Limit = effectiveLimit
+		return db.FilterSortAndSliceAuditRecords(mapped, sliceFilter), nil
+	}
+
+	want := int64(max(filter.Offset, 0)) + int64(effectiveLimit)
+	batchSize := int32(min(max(int64(10000), want*4), 1<<30))
+	var mapped []audit.Record
+	probeFilter := filter
+	probeFilter.Offset = 0
+	probeFilter.Limit = int32(min(want+64, 1<<30))
+
+	for sqlOffset := int32(0); ; sqlOffset += batchSize {
+		var rows []sqlcgen.AuditLog
+		if hasBothResource {
+			rows, err = q.ListAuditLogsByResource(ctx, sqlcgen.ListAuditLogsByResourceParams{
+				WorkspaceID:  filter.WorkspaceID,
+				ResourceType: filter.ResourceType,
+				ResourceID:   filter.ResourceID,
+				Offset:       sqlOffset,
+				Limit:        batchSize,
+			})
+		} else {
+			rows, err = q.ListAuditLogsByWorkspace(ctx, sqlcgen.ListAuditLogsByWorkspaceParams{
+				WorkspaceID: filter.WorkspaceID,
+				Offset:      sqlOffset,
+				Limit:       batchSize,
+			})
+		}
+		if err != nil {
+			return nil, db.MapSQLDriverError(op, err)
+		}
+		for _, row := range rows {
+			mapped = append(mapped, mapPostgresAuditRecord(row, actorMap))
+		}
+		if int32(len(rows)) < batchSize {
+			break
+		}
+		if int64(len(db.FilterSortAndSliceAuditRecords(mapped, probeFilter))) >= want+64 {
+			break
+		}
 	}
 	return db.FilterSortAndSliceAuditRecords(mapped, filter), nil
 }

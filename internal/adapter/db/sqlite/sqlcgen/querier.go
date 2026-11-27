@@ -11,6 +11,8 @@ import (
 type Querier interface {
 	// AttachTaskLabel idempotently links a label to a task within a workspace.
 	AttachTaskLabel(ctx context.Context, arg AttachTaskLabelParams) error
+	// CheckTaskSequenceOrIdentifierConflict reports whether an active task already uses sequence_number in project_id or identifier in workspace_id.
+	CheckTaskSequenceOrIdentifierConflict(ctx context.Context, arg CheckTaskSequenceOrIdentifierConflictParams) (bool, error)
 	// ClaimTaskLease atomically acquires or renews an exclusive execution lease on an active task
 	// using optimistic concurrency: succeeds only if unclaimed, already held by actor_id, or expired.
 	// Optionally transitions state_id (e.g. into a 'started' workflow state) and defaults assignee_actor_id.
@@ -49,6 +51,8 @@ type Querier interface {
 	// All read and update operations strictly enforce soft-delete filtering (deleted_at IS NULL).
 	// CreateWorkspace inserts a new active workspace and returns the persisted row.
 	CreateWorkspace(ctx context.Context, arg CreateWorkspaceParams) (Workspace, error)
+	// DeleteDSLExecutionBatchByIdempotencyKey deletes a sidecar metadata row keyed by workspace_id and idempotency_key.
+	DeleteDSLExecutionBatchByIdempotencyKey(ctx context.Context, arg DeleteDSLExecutionBatchByIdempotencyKeyParams) error
 	// DeleteProjectBinding removes a single parent->child sub-project binding without deleting either project.
 	DeleteProjectBinding(ctx context.Context, arg DeleteProjectBindingParams) (int64, error)
 	// DeleteProjectBindingsForProject detaches all parent/child binding edges referencing a soft-deleted project
@@ -71,7 +75,7 @@ type Querier interface {
 	GetDSLExecutionBatchByIdempotencyKey(ctx context.Context, arg GetDSLExecutionBatchByIdempotencyKeyParams) (DslExecutionBatch, error)
 	// GetLabelByID retrieves an active label within a workspace by its UUID string.
 	GetLabelByID(ctx context.Context, arg GetLabelByIDParams) (Label, error)
-	// GetObjectiveByID retrieves an active objective within a workspace by its UUID string.
+	// GetObjectiveByID retrieves an active objective within an active project by its UUID string.
 	GetObjectiveByID(ctx context.Context, arg GetObjectiveByIDParams) (Objective, error)
 	// GetProjectByID retrieves an active project within a workspace by its UUID string.
 	GetProjectByID(ctx context.Context, arg GetProjectByIDParams) (Project, error)
@@ -79,11 +83,11 @@ type Querier interface {
 	GetProjectByKeyPrefix(ctx context.Context, arg GetProjectByKeyPrefixParams) (Project, error)
 	// GetProjectBySlug retrieves an active project within a workspace by its URL/CLI slug.
 	GetProjectBySlug(ctx context.Context, arg GetProjectBySlugParams) (Project, error)
-	// GetTaskByExternalID retrieves a single active task within a project by its external tracker ID (e.g. 'CU-869abc').
+	// GetTaskByExternalID retrieves a single active task within an active project by its external tracker ID (e.g. 'CU-869abc').
 	GetTaskByExternalID(ctx context.Context, arg GetTaskByExternalIDParams) (Task, error)
-	// GetTaskByID retrieves a single active task within a workspace by its UUID string.
+	// GetTaskByID retrieves a single active task within an active project by its UUID string.
 	GetTaskByID(ctx context.Context, arg GetTaskByIDParams) (Task, error)
-	// GetTaskByIdentifier retrieves a single active task within a workspace by its human key (e.g. 'FLW-42').
+	// GetTaskByIdentifier retrieves a single active task within an active project by its human key (e.g. 'FLW-42').
 	GetTaskByIdentifier(ctx context.Context, arg GetTaskByIdentifierParams) (Task, error)
 	// GetWorkflowStateByID retrieves an active workflow state scoped to its workspace.
 	GetWorkflowStateByID(ctx context.Context, arg GetWorkflowStateByIDParams) (WorkflowState, error)
@@ -152,29 +156,35 @@ type Querier interface {
 	SetTaskMarkdownDoc(ctx context.Context, arg SetTaskMarkdownDocParams) (Task, error)
 	// SoftDeleteActor marks an active actor as soft-deleted within its workspace.
 	SoftDeleteActor(ctx context.Context, arg SoftDeleteActorParams) (int64, error)
-	// SoftDeleteLabel marks an active label within a workspace as soft-deleted.
+	// SoftDeleteLabel marks an active label within a workspace (and optional project scope) as soft-deleted.
 	SoftDeleteLabel(ctx context.Context, arg SoftDeleteLabelParams) (int64, error)
 	// SoftDeleteObjective marks an active objective within a workspace as soft-deleted.
 	SoftDeleteObjective(ctx context.Context, arg SoftDeleteObjectiveParams) (int64, error)
+	// SoftDeleteObjectivesByProject soft-deletes all active objectives belonging to a project.
+	SoftDeleteObjectivesByProject(ctx context.Context, arg SoftDeleteObjectivesByProjectParams) error
 	// SoftDeleteProject marks an active project within a workspace as soft-deleted.
 	SoftDeleteProject(ctx context.Context, arg SoftDeleteProjectParams) (int64, error)
 	// SoftDeleteTask marks an active task as soft-deleted and releases any held execution lease.
 	SoftDeleteTask(ctx context.Context, arg SoftDeleteTaskParams) (int64, error)
 	// SoftDeleteTaskComment marks an active task comment within a workspace as soft-deleted.
 	SoftDeleteTaskComment(ctx context.Context, arg SoftDeleteTaskCommentParams) (int64, error)
+	// SoftDeleteTasksByProject soft-deletes all active tasks belonging to a project and clears their active claim leases.
+	SoftDeleteTasksByProject(ctx context.Context, arg SoftDeleteTasksByProjectParams) error
 	// SoftDeleteWorkflowState marks a project workflow state as soft-deleted.
 	SoftDeleteWorkflowState(ctx context.Context, arg SoftDeleteWorkflowStateParams) (int64, error)
 	// SoftDeleteWorkspace marks an active workspace as soft-deleted and returns the affected row count.
 	SoftDeleteWorkspace(ctx context.Context, id string) (int64, error)
+	// TouchTaskLastSignal updates last_signal_at on an active task within a workspace without mutating updated_at.
+	TouchTaskLastSignal(ctx context.Context, arg TouchTaskLastSignalParams) (Task, error)
 	// TransitionTaskState atomically moves an active task to a target workflow state and updates completed_at.
 	TransitionTaskState(ctx context.Context, arg TransitionTaskStateParams) (Task, error)
 	// UpdateActor performs an atomic partial update on an active actor within a workspace.
 	UpdateActor(ctx context.Context, arg UpdateActorParams) (Actor, error)
-	// UpdateObjective performs an atomic partial update on an active objective within a workspace.
+	// UpdateObjective performs an atomic update on an active objective (including nullable dates and parent_objective_id).
 	UpdateObjective(ctx context.Context, arg UpdateObjectiveParams) (Objective, error)
 	// UpdateProject performs an atomic partial update on an active project within a workspace.
 	UpdateProject(ctx context.Context, arg UpdateProjectParams) (Project, error)
-	// UpdateTask performs an atomic partial update on mutable metadata fields of an active task.
+	// UpdateTask performs an atomic update on mutable metadata fields (including nullable foreign keys) of an active task.
 	UpdateTask(ctx context.Context, arg UpdateTaskParams) (Task, error)
 	// UpdateWorkflowState performs an atomic partial update on an active project workflow state.
 	UpdateWorkflowState(ctx context.Context, arg UpdateWorkflowStateParams) (WorkflowState, error)

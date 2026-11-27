@@ -124,6 +124,7 @@ type Task struct {
 	DeletedAt          *string `json:"deleted_at"`
 	HasMarkdownDoc     int64   `json:"has_markdown_doc"`
 	ExternalID         *string `json:"external_id"`
+	LastSignalAt       *string `json:"last_signal_at"`
 }
 
 type TaskComment struct {

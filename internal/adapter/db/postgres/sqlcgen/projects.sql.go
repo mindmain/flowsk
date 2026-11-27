@@ -688,18 +688,20 @@ SET
     deleted_at = NOW(),
     updated_at = NOW()
 WHERE workspace_id = $1
-  AND id = $2
+  AND ($2::uuid IS NULL OR project_id = $2)
+  AND id = $3
   AND deleted_at IS NULL
 `
 
 type SoftDeleteLabelParams struct {
-	WorkspaceID uuid.UUID `json:"workspace_id"`
-	ID          uuid.UUID `json:"id"`
+	WorkspaceID uuid.UUID  `json:"workspace_id"`
+	ProjectID   *uuid.UUID `json:"project_id"`
+	ID          uuid.UUID  `json:"id"`
 }
 
-// SoftDeleteLabel marks an active label within a workspace as soft-deleted.
+// SoftDeleteLabel marks an active label within a workspace (and optional project scope) as soft-deleted.
 func (q *Queries) SoftDeleteLabel(ctx context.Context, arg SoftDeleteLabelParams) (int64, error) {
-	result, err := q.db.Exec(ctx, softDeleteLabel, arg.WorkspaceID, arg.ID)
+	result, err := q.db.Exec(ctx, softDeleteLabel, arg.WorkspaceID, arg.ProjectID, arg.ID)
 	if err != nil {
 		return 0, err
 	}

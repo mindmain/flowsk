@@ -34,6 +34,39 @@ func (q *Queries) AttachTaskLabel(ctx context.Context, arg AttachTaskLabelParams
 	return err
 }
 
+const checkTaskSequenceOrIdentifierConflict = `-- name: CheckTaskSequenceOrIdentifierConflict :one
+SELECT EXISTS (
+    SELECT 1
+    FROM tasks
+    WHERE workspace_id = ?1
+      AND deleted_at IS NULL
+      AND (
+          (project_id = ?2 AND sequence_number = ?3)
+          OR identifier = ?4
+      )
+)
+`
+
+type CheckTaskSequenceOrIdentifierConflictParams struct {
+	WorkspaceID    string `json:"workspace_id"`
+	ProjectID      string `json:"project_id"`
+	SequenceNumber int64  `json:"sequence_number"`
+	Identifier     string `json:"identifier"`
+}
+
+// CheckTaskSequenceOrIdentifierConflict reports whether an active task already uses sequence_number in project_id or identifier in workspace_id.
+func (q *Queries) CheckTaskSequenceOrIdentifierConflict(ctx context.Context, arg CheckTaskSequenceOrIdentifierConflictParams) (bool, error) {
+	row := q.db.QueryRowContext(ctx, checkTaskSequenceOrIdentifierConflict,
+		arg.WorkspaceID,
+		arg.ProjectID,
+		arg.SequenceNumber,
+		arg.Identifier,
+	)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const claimTaskLease = `-- name: ClaimTaskLease :one
 UPDATE tasks
 SET
@@ -52,7 +85,7 @@ WHERE workspace_id = ?5
       OR claim_expires_at IS NULL
       OR julianday(claim_expires_at) <= julianday('now')
   )
-RETURNING id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id
+RETURNING id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id, last_signal_at
 `
 
 type ClaimTaskLeaseParams struct {
@@ -103,6 +136,7 @@ func (q *Queries) ClaimTaskLease(ctx context.Context, arg ClaimTaskLeaseParams) 
 		&i.DeletedAt,
 		&i.HasMarkdownDoc,
 		&i.ExternalID,
+		&i.LastSignalAt,
 	)
 	return i, err
 }
@@ -130,7 +164,8 @@ INSERT INTO tasks (
     claimed_by_actor_id,
     claim_token,
     claim_expires_at,
-    completed_at
+    completed_at,
+    last_signal_at
 ) VALUES (
     ?1,
     ?2,
@@ -152,9 +187,10 @@ INSERT INTO tasks (
     ?18,
     ?19,
     ?20,
-    ?21
+    ?21,
+    ?22
 )
-RETURNING id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id
+RETURNING id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id, last_signal_at
 `
 
 type CreateTaskParams struct {
@@ -179,6 +215,7 @@ type CreateTaskParams struct {
 	ClaimToken         *string `json:"claim_token"`
 	ClaimExpiresAt     *string `json:"claim_expires_at"`
 	CompletedAt        *string `json:"completed_at"`
+	LastSignalAt       *string `json:"last_signal_at"`
 }
 
 // SQLite queries for tasks, optimistic agent leases, task labels, directed task relations, and task comments.
@@ -208,6 +245,7 @@ func (q *Queries) CreateTask(ctx context.Context, arg CreateTaskParams) (Task, e
 		arg.ClaimToken,
 		arg.ClaimExpiresAt,
 		arg.CompletedAt,
+		arg.LastSignalAt,
 	)
 	var i Task
 	err := row.Scan(
@@ -236,6 +274,7 @@ func (q *Queries) CreateTask(ctx context.Context, arg CreateTaskParams) (Task, e
 		&i.DeletedAt,
 		&i.HasMarkdownDoc,
 		&i.ExternalID,
+		&i.LastSignalAt,
 	)
 	return i, err
 }
@@ -412,12 +451,19 @@ func (q *Queries) DetachTaskLabel(ctx context.Context, arg DetachTaskLabelParams
 }
 
 const getTaskByExternalID = `-- name: GetTaskByExternalID :one
-SELECT id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id
-FROM tasks
-WHERE workspace_id = ?1
-  AND project_id = ?2
-  AND external_id = ?3
-  AND deleted_at IS NULL
+SELECT t.id, t.workspace_id, t.project_id, t.objective_id, t.parent_task_id, t.state_id, t.sequence_number, t.identifier, t.kind, t.priority, t.title, t.description, t.acceptance_criteria, t.estimate_points, t.reporter_actor_id, t.assignee_actor_id, t.claimed_by_actor_id, t.claim_token, t.claim_expires_at, t.completed_at, t.created_at, t.updated_at, t.deleted_at, t.has_markdown_doc, t.external_id, t.last_signal_at
+FROM tasks t
+WHERE t.workspace_id = ?1
+  AND t.project_id = ?2
+  AND t.external_id = ?3
+  AND t.deleted_at IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM projects p
+      WHERE p.id = t.project_id
+        AND p.workspace_id = t.workspace_id
+        AND p.deleted_at IS NULL
+  )
 `
 
 type GetTaskByExternalIDParams struct {
@@ -426,7 +472,7 @@ type GetTaskByExternalIDParams struct {
 	ExternalID  *string `json:"external_id"`
 }
 
-// GetTaskByExternalID retrieves a single active task within a project by its external tracker ID (e.g. 'CU-869abc').
+// GetTaskByExternalID retrieves a single active task within an active project by its external tracker ID (e.g. 'CU-869abc').
 func (q *Queries) GetTaskByExternalID(ctx context.Context, arg GetTaskByExternalIDParams) (Task, error) {
 	row := q.db.QueryRowContext(ctx, getTaskByExternalID, arg.WorkspaceID, arg.ProjectID, arg.ExternalID)
 	var i Task
@@ -456,16 +502,24 @@ func (q *Queries) GetTaskByExternalID(ctx context.Context, arg GetTaskByExternal
 		&i.DeletedAt,
 		&i.HasMarkdownDoc,
 		&i.ExternalID,
+		&i.LastSignalAt,
 	)
 	return i, err
 }
 
 const getTaskByID = `-- name: GetTaskByID :one
-SELECT id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id
-FROM tasks
-WHERE workspace_id = ?1
-  AND id = ?2
-  AND deleted_at IS NULL
+SELECT t.id, t.workspace_id, t.project_id, t.objective_id, t.parent_task_id, t.state_id, t.sequence_number, t.identifier, t.kind, t.priority, t.title, t.description, t.acceptance_criteria, t.estimate_points, t.reporter_actor_id, t.assignee_actor_id, t.claimed_by_actor_id, t.claim_token, t.claim_expires_at, t.completed_at, t.created_at, t.updated_at, t.deleted_at, t.has_markdown_doc, t.external_id, t.last_signal_at
+FROM tasks t
+WHERE t.workspace_id = ?1
+  AND t.id = ?2
+  AND t.deleted_at IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM projects p
+      WHERE p.id = t.project_id
+        AND p.workspace_id = t.workspace_id
+        AND p.deleted_at IS NULL
+  )
 `
 
 type GetTaskByIDParams struct {
@@ -473,7 +527,7 @@ type GetTaskByIDParams struct {
 	ID          string `json:"id"`
 }
 
-// GetTaskByID retrieves a single active task within a workspace by its UUID string.
+// GetTaskByID retrieves a single active task within an active project by its UUID string.
 func (q *Queries) GetTaskByID(ctx context.Context, arg GetTaskByIDParams) (Task, error) {
 	row := q.db.QueryRowContext(ctx, getTaskByID, arg.WorkspaceID, arg.ID)
 	var i Task
@@ -503,16 +557,24 @@ func (q *Queries) GetTaskByID(ctx context.Context, arg GetTaskByIDParams) (Task,
 		&i.DeletedAt,
 		&i.HasMarkdownDoc,
 		&i.ExternalID,
+		&i.LastSignalAt,
 	)
 	return i, err
 }
 
 const getTaskByIdentifier = `-- name: GetTaskByIdentifier :one
-SELECT id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id
-FROM tasks
-WHERE workspace_id = ?1
-  AND identifier = ?2
-  AND deleted_at IS NULL
+SELECT t.id, t.workspace_id, t.project_id, t.objective_id, t.parent_task_id, t.state_id, t.sequence_number, t.identifier, t.kind, t.priority, t.title, t.description, t.acceptance_criteria, t.estimate_points, t.reporter_actor_id, t.assignee_actor_id, t.claimed_by_actor_id, t.claim_token, t.claim_expires_at, t.completed_at, t.created_at, t.updated_at, t.deleted_at, t.has_markdown_doc, t.external_id, t.last_signal_at
+FROM tasks t
+WHERE t.workspace_id = ?1
+  AND t.identifier = ?2
+  AND t.deleted_at IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM projects p
+      WHERE p.id = t.project_id
+        AND p.workspace_id = t.workspace_id
+        AND p.deleted_at IS NULL
+  )
 `
 
 type GetTaskByIdentifierParams struct {
@@ -520,7 +582,7 @@ type GetTaskByIdentifierParams struct {
 	Identifier  string `json:"identifier"`
 }
 
-// GetTaskByIdentifier retrieves a single active task within a workspace by its human key (e.g. 'FLW-42').
+// GetTaskByIdentifier retrieves a single active task within an active project by its human key (e.g. 'FLW-42').
 func (q *Queries) GetTaskByIdentifier(ctx context.Context, arg GetTaskByIdentifierParams) (Task, error) {
 	row := q.db.QueryRowContext(ctx, getTaskByIdentifier, arg.WorkspaceID, arg.Identifier)
 	var i Task
@@ -550,6 +612,7 @@ func (q *Queries) GetTaskByIdentifier(ctx context.Context, arg GetTaskByIdentifi
 		&i.DeletedAt,
 		&i.HasMarkdownDoc,
 		&i.ExternalID,
+		&i.LastSignalAt,
 	)
 	return i, err
 }
@@ -576,7 +639,7 @@ func (q *Queries) HardDeleteTask(ctx context.Context, arg HardDeleteTaskParams) 
 }
 
 const listAgentClaimableTasks = `-- name: ListAgentClaimableTasks :many
-SELECT t.id, t.workspace_id, t.project_id, t.objective_id, t.parent_task_id, t.state_id, t.sequence_number, t.identifier, t.kind, t.priority, t.title, t.description, t.acceptance_criteria, t.estimate_points, t.reporter_actor_id, t.assignee_actor_id, t.claimed_by_actor_id, t.claim_token, t.claim_expires_at, t.completed_at, t.created_at, t.updated_at, t.deleted_at, t.has_markdown_doc, t.external_id
+SELECT t.id, t.workspace_id, t.project_id, t.objective_id, t.parent_task_id, t.state_id, t.sequence_number, t.identifier, t.kind, t.priority, t.title, t.description, t.acceptance_criteria, t.estimate_points, t.reporter_actor_id, t.assignee_actor_id, t.claimed_by_actor_id, t.claim_token, t.claim_expires_at, t.completed_at, t.created_at, t.updated_at, t.deleted_at, t.has_markdown_doc, t.external_id, t.last_signal_at
 FROM tasks t
 JOIN projects p
     ON p.id = t.project_id
@@ -683,6 +746,7 @@ func (q *Queries) ListAgentClaimableTasks(ctx context.Context, arg ListAgentClai
 			&i.DeletedAt,
 			&i.HasMarkdownDoc,
 			&i.ExternalID,
+			&i.LastSignalAt,
 		); err != nil {
 			return nil, err
 		}
@@ -853,7 +917,7 @@ func (q *Queries) ListTaskRelations(ctx context.Context, arg ListTaskRelationsPa
 }
 
 const listTasksByProject = `-- name: ListTasksByProject :many
-SELECT id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id
+SELECT id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id, last_signal_at
 FROM tasks
 WHERE workspace_id = ?1
   AND project_id = ?2
@@ -927,6 +991,7 @@ func (q *Queries) ListTasksByProject(ctx context.Context, arg ListTasksByProject
 			&i.DeletedAt,
 			&i.HasMarkdownDoc,
 			&i.ExternalID,
+			&i.LastSignalAt,
 		); err != nil {
 			return nil, err
 		}
@@ -942,7 +1007,7 @@ func (q *Queries) ListTasksByProject(ctx context.Context, arg ListTasksByProject
 }
 
 const listTasksByWorkspace = `-- name: ListTasksByWorkspace :many
-SELECT t.id, t.workspace_id, t.project_id, t.objective_id, t.parent_task_id, t.state_id, t.sequence_number, t.identifier, t.kind, t.priority, t.title, t.description, t.acceptance_criteria, t.estimate_points, t.reporter_actor_id, t.assignee_actor_id, t.claimed_by_actor_id, t.claim_token, t.claim_expires_at, t.completed_at, t.created_at, t.updated_at, t.deleted_at, t.has_markdown_doc, t.external_id
+SELECT t.id, t.workspace_id, t.project_id, t.objective_id, t.parent_task_id, t.state_id, t.sequence_number, t.identifier, t.kind, t.priority, t.title, t.description, t.acceptance_criteria, t.estimate_points, t.reporter_actor_id, t.assignee_actor_id, t.claimed_by_actor_id, t.claim_token, t.claim_expires_at, t.completed_at, t.created_at, t.updated_at, t.deleted_at, t.has_markdown_doc, t.external_id, t.last_signal_at
 FROM tasks t
 JOIN projects p
     ON p.id = t.project_id
@@ -992,6 +1057,7 @@ func (q *Queries) ListTasksByWorkspace(ctx context.Context, workspaceID string) 
 			&i.DeletedAt,
 			&i.HasMarkdownDoc,
 			&i.ExternalID,
+			&i.LastSignalAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1049,7 +1115,7 @@ SET
 WHERE workspace_id = ?2
   AND id = ?3
   AND deleted_at IS NULL
-RETURNING id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id
+RETURNING id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id, last_signal_at
 `
 
 type SetTaskExternalIDParams struct {
@@ -1088,6 +1154,7 @@ func (q *Queries) SetTaskExternalID(ctx context.Context, arg SetTaskExternalIDPa
 		&i.DeletedAt,
 		&i.HasMarkdownDoc,
 		&i.ExternalID,
+		&i.LastSignalAt,
 	)
 	return i, err
 }
@@ -1100,7 +1167,7 @@ SET
 WHERE workspace_id = ?2
   AND id = ?3
   AND deleted_at IS NULL
-RETURNING id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id
+RETURNING id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id, last_signal_at
 `
 
 type SetTaskMarkdownDocParams struct {
@@ -1139,6 +1206,7 @@ func (q *Queries) SetTaskMarkdownDoc(ctx context.Context, arg SetTaskMarkdownDoc
 		&i.DeletedAt,
 		&i.HasMarkdownDoc,
 		&i.ExternalID,
+		&i.LastSignalAt,
 	)
 	return i, err
 }
@@ -1194,6 +1262,81 @@ func (q *Queries) SoftDeleteTaskComment(ctx context.Context, arg SoftDeleteTaskC
 	return result.RowsAffected()
 }
 
+const softDeleteTasksByProject = `-- name: SoftDeleteTasksByProject :exec
+UPDATE tasks
+SET
+    deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    claimed_by_actor_id = NULL,
+    claim_token = NULL,
+    claim_expires_at = NULL
+WHERE workspace_id = ?1
+  AND project_id = ?2
+  AND deleted_at IS NULL
+`
+
+type SoftDeleteTasksByProjectParams struct {
+	WorkspaceID string `json:"workspace_id"`
+	ProjectID   string `json:"project_id"`
+}
+
+// SoftDeleteTasksByProject soft-deletes all active tasks belonging to a project and clears their active claim leases.
+func (q *Queries) SoftDeleteTasksByProject(ctx context.Context, arg SoftDeleteTasksByProjectParams) error {
+	_, err := q.db.ExecContext(ctx, softDeleteTasksByProject, arg.WorkspaceID, arg.ProjectID)
+	return err
+}
+
+const touchTaskLastSignal = `-- name: TouchTaskLastSignal :one
+UPDATE tasks
+SET
+    last_signal_at = ?1
+WHERE workspace_id = ?2
+  AND id = ?3
+  AND deleted_at IS NULL
+RETURNING id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id, last_signal_at
+`
+
+type TouchTaskLastSignalParams struct {
+	LastSignalAt *string `json:"last_signal_at"`
+	WorkspaceID  string  `json:"workspace_id"`
+	ID           string  `json:"id"`
+}
+
+// TouchTaskLastSignal updates last_signal_at on an active task within a workspace without mutating updated_at.
+func (q *Queries) TouchTaskLastSignal(ctx context.Context, arg TouchTaskLastSignalParams) (Task, error) {
+	row := q.db.QueryRowContext(ctx, touchTaskLastSignal, arg.LastSignalAt, arg.WorkspaceID, arg.ID)
+	var i Task
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.ProjectID,
+		&i.ObjectiveID,
+		&i.ParentTaskID,
+		&i.StateID,
+		&i.SequenceNumber,
+		&i.Identifier,
+		&i.Kind,
+		&i.Priority,
+		&i.Title,
+		&i.Description,
+		&i.AcceptanceCriteria,
+		&i.EstimatePoints,
+		&i.ReporterActorID,
+		&i.AssigneeActorID,
+		&i.ClaimedByActorID,
+		&i.ClaimToken,
+		&i.ClaimExpiresAt,
+		&i.CompletedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+		&i.HasMarkdownDoc,
+		&i.ExternalID,
+		&i.LastSignalAt,
+	)
+	return i, err
+}
+
 const transitionTaskState = `-- name: TransitionTaskState :one
 UPDATE tasks
 SET
@@ -1203,7 +1346,7 @@ SET
 WHERE workspace_id = ?3
   AND id = ?4
   AND deleted_at IS NULL
-RETURNING id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id
+RETURNING id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id, last_signal_at
 `
 
 type TransitionTaskStateParams struct {
@@ -1248,6 +1391,7 @@ func (q *Queries) TransitionTaskState(ctx context.Context, arg TransitionTaskSta
 		&i.DeletedAt,
 		&i.HasMarkdownDoc,
 		&i.ExternalID,
+		&i.LastSignalAt,
 	)
 	return i, err
 }
@@ -1255,20 +1399,21 @@ func (q *Queries) TransitionTaskState(ctx context.Context, arg TransitionTaskSta
 const updateTask = `-- name: UpdateTask :one
 UPDATE tasks
 SET
-    objective_id = COALESCE(?1, objective_id),
-    parent_task_id = COALESCE(?2, parent_task_id),
+    objective_id = ?1,
+    parent_task_id = ?2,
     kind = COALESCE(?3, kind),
     priority = COALESCE(?4, priority),
     title = COALESCE(?5, title),
     description = COALESCE(?6, description),
     acceptance_criteria = COALESCE(?7, acceptance_criteria),
-    estimate_points = COALESCE(?8, estimate_points),
-    assignee_actor_id = COALESCE(?9, assignee_actor_id),
+    estimate_points = ?8,
+    assignee_actor_id = ?9,
+    last_signal_at = ?10,
     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-WHERE workspace_id = ?10
-  AND id = ?11
+WHERE workspace_id = ?11
+  AND id = ?12
   AND deleted_at IS NULL
-RETURNING id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id
+RETURNING id, workspace_id, project_id, objective_id, parent_task_id, state_id, sequence_number, identifier, kind, priority, title, description, acceptance_criteria, estimate_points, reporter_actor_id, assignee_actor_id, claimed_by_actor_id, claim_token, claim_expires_at, completed_at, created_at, updated_at, deleted_at, has_markdown_doc, external_id, last_signal_at
 `
 
 type UpdateTaskParams struct {
@@ -1281,11 +1426,12 @@ type UpdateTaskParams struct {
 	AcceptanceCriteria *string `json:"acceptance_criteria"`
 	EstimatePoints     *int64  `json:"estimate_points"`
 	AssigneeActorID    *string `json:"assignee_actor_id"`
+	LastSignalAt       *string `json:"last_signal_at"`
 	WorkspaceID        string  `json:"workspace_id"`
 	ID                 string  `json:"id"`
 }
 
-// UpdateTask performs an atomic partial update on mutable metadata fields of an active task.
+// UpdateTask performs an atomic update on mutable metadata fields (including nullable foreign keys) of an active task.
 func (q *Queries) UpdateTask(ctx context.Context, arg UpdateTaskParams) (Task, error) {
 	row := q.db.QueryRowContext(ctx, updateTask,
 		arg.ObjectiveID,
@@ -1297,6 +1443,7 @@ func (q *Queries) UpdateTask(ctx context.Context, arg UpdateTaskParams) (Task, e
 		arg.AcceptanceCriteria,
 		arg.EstimatePoints,
 		arg.AssigneeActorID,
+		arg.LastSignalAt,
 		arg.WorkspaceID,
 		arg.ID,
 	)
@@ -1327,6 +1474,7 @@ func (q *Queries) UpdateTask(ctx context.Context, arg UpdateTaskParams) (Task, e
 		&i.DeletedAt,
 		&i.HasMarkdownDoc,
 		&i.ExternalID,
+		&i.LastSignalAt,
 	)
 	return i, err
 }

@@ -81,4 +81,15 @@ func TestRequireWorkspaceOwnership_EnforcesTenantIsolation(t *testing.T) {
 			t.Fatalf("unexpected resolved identity: %+v", got)
 		}
 	})
+
+	t.Run("propagates task signal suppression flag", func(t *testing.T) {
+		t.Parallel()
+		if authctx.ShouldEmitTaskSignal(context.TODO()) != true {
+			t.Fatal("expected default non-nil context to emit task signals")
+		}
+		suppressed := authctx.WithSuppressTaskSignal(context.Background())
+		if authctx.ShouldEmitTaskSignal(suppressed) {
+			t.Fatal("expected suppressed context to disable task signals")
+		}
+	})
 }

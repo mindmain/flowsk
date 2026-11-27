@@ -34,7 +34,31 @@ var (
 	projectKeyPrefixPattern = regexp.MustCompile(`^[A-Z][A-Z0-9]{1,9}$`)
 	windowsDrivePathPattern = regexp.MustCompile(`(?i)(^|[\s"'])[a-z]:[\\/]`)
 	scpGitURLPattern        = regexp.MustCompile(`^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$`)
+	hexColorPattern         = regexp.MustCompile(`^#[0-9A-Fa-f]{6}$`)
 )
+
+// BoardMetadataService is an optional segregated application interface implemented by
+// *ServiceSkeleton for managing custom per-project Kanban workflow states and labels
+// without breaking existing project.Service mocks.
+type BoardMetadataService interface {
+	// ListWorkflowStates returns active WorkflowStates for (workspaceID, projectID) ordered by Position.
+	ListWorkflowStates(ctx context.Context, workspaceID, projectID uuid.UUID) ([]WorkflowState, error)
+
+	// CreateWorkflowState validates and persists a custom WorkflowState inside an atomic audited transaction.
+	CreateWorkflowState(ctx context.Context, in CreateWorkflowStateInput) (WorkflowState, error)
+
+	// UpdateWorkflowState validates and updates an existing WorkflowState inside an atomic audited transaction.
+	UpdateWorkflowState(ctx context.Context, in UpdateWorkflowStateInput) (WorkflowState, error)
+
+	// ListLabels returns active ProjectLabels visible to (workspaceID, projectID).
+	ListLabels(ctx context.Context, workspaceID, projectID uuid.UUID) ([]ProjectLabel, error)
+
+	// CreateLabel validates and persists a new ProjectLabel inside an atomic audited transaction.
+	CreateLabel(ctx context.Context, in CreateProjectLabelInput) (ProjectLabel, error)
+
+	// DeleteLabel soft-deletes a ProjectLabel inside an atomic audited transaction.
+	DeleteLabel(ctx context.Context, workspaceID, projectID, labelID uuid.UUID) error
+}
 
 // Service defines pure domain operations for managing logical Projects inside a Workspace.
 type Service interface {
@@ -110,8 +134,11 @@ type ServiceSkeleton struct {
 	mdStore MarkdownStore
 }
 
-// Compile-time check ensuring *ServiceSkeleton implements Service.
-var _ Service = (*ServiceSkeleton)(nil)
+// Compile-time checks ensuring *ServiceSkeleton implements Service and BoardMetadataService.
+var (
+	_ Service              = (*ServiceSkeleton)(nil)
+	_ BoardMetadataService = (*ServiceSkeleton)(nil)
+)
 
 // NewService constructs a project ServiceSkeleton with resolved Repository and
 // tx.Manager dependencies.
@@ -501,7 +528,7 @@ func (s *ServiceSkeleton) DeleteProject(ctx context.Context, workspaceID, projec
 		return err
 	}
 
-	return s.txMgr.WithTransaction(ctx, func(ctx context.Context, scope tx.Scope) error {
+	if err := s.txMgr.WithTransaction(ctx, func(ctx context.Context, scope tx.Scope) error {
 		scopedRepo := s.repo.WithScope(scope)
 		current, err := scopedRepo.GetByID(ctx, workspaceID, projectID)
 		if err != nil {
@@ -517,9 +544,6 @@ func (s *ServiceSkeleton) DeleteProject(ctx context.Context, workspaceID, projec
 		}
 		if err := scopedRepo.SoftDelete(ctx, workspaceID, projectID); err != nil {
 			return err
-		}
-		if s.mdStore != nil {
-			_ = s.mdStore.DeleteProjectMarkdown(ctx, workspaceID, projectID)
 		}
 		deleted := current.Clone()
 		deleted.UpdatedAt = now
@@ -539,7 +563,14 @@ func (s *ServiceSkeleton) DeleteProject(ctx context.Context, workspaceID, projec
 			NewValues:    newSnapshot,
 			OccurredAt:   now,
 		})
-	})
+	}); err != nil {
+		return err
+	}
+
+	if s.mdStore != nil {
+		_ = s.mdStore.DeleteProjectMarkdown(context.WithoutCancel(ctx), workspaceID, projectID)
+	}
+	return nil
 }
 
 // BindSubproject links a child sub-project under a macro/parent project inside
@@ -778,21 +809,20 @@ func (s *ServiceSkeleton) PutProjectMarkdown(ctx context.Context, workspaceID, p
 	}
 
 	var updated Project
+	var prevHasDoc bool
 	if err := s.txMgr.WithTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
 		scopedRepo := s.repo.WithScope(scope)
 		current, err := scopedRepo.GetByID(txCtx, workspaceID, projectID)
 		if err != nil {
 			return err
 		}
+		prevHasDoc = current.HasMarkdownDoc
 		oldSnap, err := marshalSnapshot(op, current)
 		if err != nil {
 			return err
 		}
 		next, err := scopedRepo.SetHasMarkdownDoc(txCtx, workspaceID, projectID, true)
 		if err != nil {
-			return err
-		}
-		if err := s.mdStore.WriteProjectMarkdown(txCtx, workspaceID, projectID, markdown); err != nil {
 			return err
 		}
 		newSnap, err := marshalSnapshot(op, next)
@@ -815,6 +845,16 @@ func (s *ServiceSkeleton) PutProjectMarkdown(ctx context.Context, workspaceID, p
 		updated = next
 		return nil
 	}); err != nil {
+		return Project{}, err
+	}
+
+	if err := s.mdStore.WriteProjectMarkdown(context.WithoutCancel(ctx), workspaceID, projectID, markdown); err != nil {
+		if !prevHasDoc {
+			_ = s.txMgr.WithNoAuditTransaction(context.WithoutCancel(ctx), func(cCtx context.Context, scope tx.Scope) error {
+				_, cErr := s.repo.WithScope(scope).SetHasMarkdownDoc(cCtx, workspaceID, projectID, false)
+				return cErr
+			})
+		}
 		return Project{}, err
 	}
 	return updated.Clone(), nil
@@ -856,11 +896,6 @@ func (s *ServiceSkeleton) DeleteProjectMarkdown(ctx context.Context, workspaceID
 		if err != nil {
 			return err
 		}
-		if s.mdStore != nil {
-			if err := s.mdStore.DeleteProjectMarkdown(txCtx, workspaceID, projectID); err != nil {
-				return err
-			}
-		}
 		newSnap, err := marshalSnapshot(op, next)
 		if err != nil {
 			return err
@@ -883,7 +918,427 @@ func (s *ServiceSkeleton) DeleteProjectMarkdown(ctx context.Context, workspaceID
 	}); err != nil {
 		return Project{}, err
 	}
+
+	if s.mdStore != nil {
+		if err := s.mdStore.DeleteProjectMarkdown(context.WithoutCancel(ctx), workspaceID, projectID); err != nil {
+			return Project{}, err
+		}
+	}
 	return updated.Clone(), nil
+}
+
+// ListWorkflowStates returns active WorkflowStates for (workspaceID, projectID) ordered by Position.
+func (s *ServiceSkeleton) ListWorkflowStates(ctx context.Context, workspaceID, projectID uuid.UUID) ([]WorkflowState, error) {
+	const op = "project.Service.ListWorkflowStates"
+	if err := checkContext(ctx, op); err != nil {
+		return nil, err
+	}
+	if _, err := authctx.RequireWorkspaceOwnership(ctx, workspaceID); err != nil {
+		return nil, err
+	}
+	if projectID == uuid.Nil {
+		return nil, errs.Validation(op, "project_id is required", errs.FieldViolation{
+			Field:       "project_id",
+			Description: "project_id must be a non-nil UUID",
+		})
+	}
+	if err := s.ensureReadReady(op); err != nil {
+		return nil, err
+	}
+	boardRepo, ok := s.repo.(BoardMetadataRepository)
+	if !ok {
+		return nil, errs.New(errs.ErrPreconditionFailed, op, "project repository does not support workflow state persistence")
+	}
+	items, err := boardRepo.ListWorkflowStates(ctx, workspaceID, projectID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]WorkflowState, len(items))
+	for i := range items {
+		out[i] = items[i].Clone()
+	}
+	return out, nil
+}
+
+// CreateWorkflowState validates and persists a custom WorkflowState inside an atomic audited transaction.
+func (s *ServiceSkeleton) CreateWorkflowState(ctx context.Context, in CreateWorkflowStateInput) (WorkflowState, error) {
+	const op = "project.Service.CreateWorkflowState"
+	if err := checkContext(ctx, op); err != nil {
+		return WorkflowState{}, err
+	}
+	caller, err := authctx.RequireWorkspaceOwnership(ctx, in.WorkspaceID)
+	if err != nil {
+		return WorkflowState{}, err
+	}
+	if err := s.ensureWriteReady(op); err != nil {
+		return WorkflowState{}, err
+	}
+
+	name := strings.TrimSpace(in.Name)
+	desc := strings.TrimSpace(in.Description)
+	cat, catViolation := normalizeWorkflowCategory(in.Category)
+	color, colorViolation := normalizeHexColor(in.ColorHex)
+
+	var violations []errs.FieldViolation
+	if in.ProjectID == uuid.Nil {
+		violations = append(violations, errs.FieldViolation{Field: "project_id", Description: "project_id must be a non-nil UUID"})
+	}
+	if name == "" || utf8.RuneCountInString(name) > maxProjectNameRunes || containsHostFilesystemPath(name) {
+		violations = append(violations, errs.FieldViolation{Field: "name", Description: "name must be 1-120 characters without host filesystem paths"})
+	}
+	if utf8.RuneCountInString(desc) > maxProjectDescRunes {
+		violations = append(violations, errs.FieldViolation{Field: "description", Description: "description must not exceed 4000 characters"})
+	}
+	if catViolation != nil {
+		violations = append(violations, *catViolation)
+	}
+	if colorViolation != nil {
+		violations = append(violations, *colorViolation)
+	}
+	if in.Position < 0 {
+		violations = append(violations, errs.FieldViolation{Field: "position", Description: "position must be >= 0"})
+	}
+	if len(violations) > 0 {
+		return WorkflowState{}, errs.Validation(op, "invalid workflow state parameters", violations...)
+	}
+
+	now := time.Now().UTC()
+	candidate := WorkflowState{
+		ID:          newUUID(),
+		WorkspaceID: in.WorkspaceID,
+		ProjectID:   in.ProjectID,
+		Name:        name,
+		Description: desc,
+		Category:    cat,
+		ColorHex:    color,
+		Position:    in.Position,
+		IsDefault:   in.IsDefault,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+
+	var created WorkflowState
+	if err := s.txMgr.WithTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		scopedRepo := s.repo.WithScope(scope)
+		boardRepo, ok := scopedRepo.(BoardMetadataRepository)
+		if !ok {
+			return errs.New(errs.ErrPreconditionFailed, op, "project repository does not support workflow state persistence")
+		}
+		saved, err := boardRepo.CreateWorkflowState(txCtx, candidate)
+		if err != nil {
+			return err
+		}
+		snap, err := marshalSnapshot(op, saved)
+		if err != nil {
+			return err
+		}
+		if err := scope.Audit().Record(txCtx, tx.AuditEntry{
+			ID:           newUUID(),
+			WorkspaceID:  in.WorkspaceID,
+			ActorID:      caller.ActorID,
+			Action:       tx.AuditActionCreate,
+			ResourceType: "workflow_state",
+			ResourceID:   saved.ID.String(),
+			NewValues:    snap,
+			OccurredAt:   now,
+		}); err != nil {
+			return err
+		}
+		created = saved
+		return nil
+	}); err != nil {
+		return WorkflowState{}, err
+	}
+	return created.Clone(), nil
+}
+
+// UpdateWorkflowState validates and updates an existing WorkflowState inside an atomic audited transaction.
+func (s *ServiceSkeleton) UpdateWorkflowState(ctx context.Context, in UpdateWorkflowStateInput) (WorkflowState, error) {
+	const op = "project.Service.UpdateWorkflowState"
+	if err := checkContext(ctx, op); err != nil {
+		return WorkflowState{}, err
+	}
+	caller, err := authctx.RequireWorkspaceOwnership(ctx, in.WorkspaceID)
+	if err != nil {
+		return WorkflowState{}, err
+	}
+	if err := s.ensureWriteReady(op); err != nil {
+		return WorkflowState{}, err
+	}
+
+	normalized := in
+	var violations []errs.FieldViolation
+	if in.ProjectID == uuid.Nil {
+		violations = append(violations, errs.FieldViolation{Field: "project_id", Description: "project_id must be a non-nil UUID"})
+	}
+	if in.StateID == uuid.Nil {
+		violations = append(violations, errs.FieldViolation{Field: "state_id", Description: "state_id must be a non-nil UUID"})
+	}
+	if in.Name != nil {
+		trimmed := strings.TrimSpace(*in.Name)
+		if trimmed == "" || utf8.RuneCountInString(trimmed) > maxProjectNameRunes || containsHostFilesystemPath(trimmed) {
+			violations = append(violations, errs.FieldViolation{Field: "name", Description: "name must be 1-120 characters without host filesystem paths"})
+		} else {
+			normalized.Name = &trimmed
+		}
+	}
+	if in.Description != nil {
+		trimmed := strings.TrimSpace(*in.Description)
+		if utf8.RuneCountInString(trimmed) > maxProjectDescRunes {
+			violations = append(violations, errs.FieldViolation{Field: "description", Description: "description must not exceed 4000 characters"})
+		} else {
+			normalized.Description = &trimmed
+		}
+	}
+	if in.Category != nil {
+		cat, catV := normalizeWorkflowCategory(*in.Category)
+		if catV != nil {
+			violations = append(violations, *catV)
+		} else {
+			normalized.Category = &cat
+		}
+	}
+	if in.ColorHex != nil {
+		color, colorV := normalizeHexColor(*in.ColorHex)
+		if colorV != nil {
+			violations = append(violations, *colorV)
+		} else {
+			normalized.ColorHex = &color
+		}
+	}
+	if in.Position != nil && *in.Position < 0 {
+		violations = append(violations, errs.FieldViolation{Field: "position", Description: "position must be >= 0"})
+	}
+	if len(violations) > 0 {
+		return WorkflowState{}, errs.Validation(op, "invalid workflow state update parameters", violations...)
+	}
+
+	var updated WorkflowState
+	if err := s.txMgr.WithTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		scopedRepo := s.repo.WithScope(scope)
+		boardRepo, ok := scopedRepo.(BoardMetadataRepository)
+		if !ok {
+			return errs.New(errs.ErrPreconditionFailed, op, "project repository does not support workflow state persistence")
+		}
+		saved, err := boardRepo.UpdateWorkflowState(txCtx, normalized)
+		if err != nil {
+			return err
+		}
+		snap, err := marshalSnapshot(op, saved)
+		if err != nil {
+			return err
+		}
+		if err := scope.Audit().Record(txCtx, tx.AuditEntry{
+			ID:           newUUID(),
+			WorkspaceID:  in.WorkspaceID,
+			ActorID:      caller.ActorID,
+			Action:       tx.AuditActionUpdate,
+			ResourceType: "workflow_state",
+			ResourceID:   saved.ID.String(),
+			NewValues:    snap,
+			OccurredAt:   time.Now().UTC(),
+		}); err != nil {
+			return err
+		}
+		updated = saved
+		return nil
+	}); err != nil {
+		return WorkflowState{}, err
+	}
+	return updated.Clone(), nil
+}
+
+// ListLabels returns active ProjectLabels visible to (workspaceID, projectID).
+func (s *ServiceSkeleton) ListLabels(ctx context.Context, workspaceID, projectID uuid.UUID) ([]ProjectLabel, error) {
+	const op = "project.Service.ListLabels"
+	if err := checkContext(ctx, op); err != nil {
+		return nil, err
+	}
+	if _, err := authctx.RequireWorkspaceOwnership(ctx, workspaceID); err != nil {
+		return nil, err
+	}
+	if projectID == uuid.Nil {
+		return nil, errs.Validation(op, "project_id is required", errs.FieldViolation{
+			Field:       "project_id",
+			Description: "project_id must be a non-nil UUID",
+		})
+	}
+	if err := s.ensureReadReady(op); err != nil {
+		return nil, err
+	}
+	boardRepo, ok := s.repo.(BoardMetadataRepository)
+	if !ok {
+		return nil, errs.New(errs.ErrPreconditionFailed, op, "project repository does not support label persistence")
+	}
+	items, err := boardRepo.ListLabels(ctx, workspaceID, projectID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ProjectLabel, len(items))
+	for i := range items {
+		out[i] = items[i].Clone()
+	}
+	return out, nil
+}
+
+// CreateLabel validates and persists a new ProjectLabel inside an atomic audited transaction.
+func (s *ServiceSkeleton) CreateLabel(ctx context.Context, in CreateProjectLabelInput) (ProjectLabel, error) {
+	const op = "project.Service.CreateLabel"
+	if err := checkContext(ctx, op); err != nil {
+		return ProjectLabel{}, err
+	}
+	caller, err := authctx.RequireWorkspaceOwnership(ctx, in.WorkspaceID)
+	if err != nil {
+		return ProjectLabel{}, err
+	}
+	if err := s.ensureWriteReady(op); err != nil {
+		return ProjectLabel{}, err
+	}
+
+	name := strings.TrimSpace(in.Name)
+	desc := strings.TrimSpace(in.Description)
+	color, colorViolation := normalizeHexColor(in.ColorHex)
+
+	var violations []errs.FieldViolation
+	if in.ProjectID == uuid.Nil {
+		violations = append(violations, errs.FieldViolation{Field: "project_id", Description: "project_id must be a non-nil UUID"})
+	}
+	if name == "" || utf8.RuneCountInString(name) > maxProjectNameRunes || containsHostFilesystemPath(name) {
+		violations = append(violations, errs.FieldViolation{Field: "name", Description: "name must be 1-120 characters without host filesystem paths"})
+	}
+	if utf8.RuneCountInString(desc) > maxProjectDescRunes {
+		violations = append(violations, errs.FieldViolation{Field: "description", Description: "description must not exceed 4000 characters"})
+	}
+	if colorViolation != nil {
+		violations = append(violations, *colorViolation)
+	}
+	if len(violations) > 0 {
+		return ProjectLabel{}, errs.Validation(op, "invalid project label parameters", violations...)
+	}
+
+	now := time.Now().UTC()
+	candidate := ProjectLabel{
+		ID:          newUUID(),
+		WorkspaceID: in.WorkspaceID,
+		ProjectID:   in.ProjectID,
+		Name:        name,
+		ColorHex:    color,
+		Description: desc,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+
+	var created ProjectLabel
+	if err := s.txMgr.WithTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		scopedRepo := s.repo.WithScope(scope)
+		boardRepo, ok := scopedRepo.(BoardMetadataRepository)
+		if !ok {
+			return errs.New(errs.ErrPreconditionFailed, op, "project repository does not support label persistence")
+		}
+		saved, err := boardRepo.CreateLabel(txCtx, candidate)
+		if err != nil {
+			return err
+		}
+		snap, err := marshalSnapshot(op, saved)
+		if err != nil {
+			return err
+		}
+		if err := scope.Audit().Record(txCtx, tx.AuditEntry{
+			ID:           newUUID(),
+			WorkspaceID:  in.WorkspaceID,
+			ActorID:      caller.ActorID,
+			Action:       tx.AuditActionCreate,
+			ResourceType: "project_label",
+			ResourceID:   saved.ID.String(),
+			NewValues:    snap,
+			OccurredAt:   now,
+		}); err != nil {
+			return err
+		}
+		created = saved
+		return nil
+	}); err != nil {
+		return ProjectLabel{}, err
+	}
+	return created.Clone(), nil
+}
+
+// DeleteLabel soft-deletes a ProjectLabel inside an atomic audited transaction.
+func (s *ServiceSkeleton) DeleteLabel(ctx context.Context, workspaceID, projectID, labelID uuid.UUID) error {
+	const op = "project.Service.DeleteLabel"
+	if err := checkContext(ctx, op); err != nil {
+		return err
+	}
+	caller, err := authctx.RequireWorkspaceOwnership(ctx, workspaceID)
+	if err != nil {
+		return err
+	}
+	if err := s.ensureWriteReady(op); err != nil {
+		return err
+	}
+
+	var violations []errs.FieldViolation
+	if projectID == uuid.Nil {
+		violations = append(violations, errs.FieldViolation{Field: "project_id", Description: "project_id must be a non-nil UUID"})
+	}
+	if labelID == uuid.Nil {
+		violations = append(violations, errs.FieldViolation{Field: "label_id", Description: "label_id must be a non-nil UUID"})
+	}
+	if len(violations) > 0 {
+		return errs.Validation(op, "invalid project label deletion parameters", violations...)
+	}
+
+	return s.txMgr.WithTransaction(ctx, func(txCtx context.Context, scope tx.Scope) error {
+		scopedRepo := s.repo.WithScope(scope)
+		boardRepo, ok := scopedRepo.(BoardMetadataRepository)
+		if !ok {
+			return errs.New(errs.ErrPreconditionFailed, op, "project repository does not support label persistence")
+		}
+		if err := boardRepo.DeleteLabel(txCtx, workspaceID, projectID, labelID); err != nil {
+			return err
+		}
+		return scope.Audit().Record(txCtx, tx.AuditEntry{
+			ID:           newUUID(),
+			WorkspaceID:  workspaceID,
+			ActorID:      caller.ActorID,
+			Action:       tx.AuditActionDelete,
+			ResourceType: "project_label",
+			ResourceID:   labelID.String(),
+			OccurredAt:   time.Now().UTC(),
+		})
+	})
+}
+
+func normalizeWorkflowCategory(raw string) (string, *errs.FieldViolation) {
+	c := strings.ToLower(strings.TrimSpace(raw))
+	if c == "" {
+		return "unstarted", nil
+	}
+	switch c {
+	case "triage", "backlog", "unstarted", "started", "completed", "canceled", "archived":
+		return c, nil
+	case "cancelled":
+		return "canceled", nil
+	default:
+		return "", &errs.FieldViolation{
+			Field:       "category",
+			Description: "category must be triage, backlog, unstarted, started, completed, canceled, or archived",
+		}
+	}
+}
+
+func normalizeHexColor(raw string) (string, *errs.FieldViolation) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "#6B7280", nil
+	}
+	if !hexColorPattern.MatchString(trimmed) {
+		return "", &errs.FieldViolation{
+			Field:       "color_hex",
+			Description: "color_hex must be a 6-digit '#' prefixed hexadecimal color (e.g. '#3B82F6')",
+		}
+	}
+	return trimmed, nil
 }
 
 func normalizeRelativeSubpath(raw string) (string, *errs.FieldViolation) {

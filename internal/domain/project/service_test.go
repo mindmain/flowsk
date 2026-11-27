@@ -677,3 +677,103 @@ func TestProjectService_MultiBindingDAGCycleAndSafeParentDeletion(t *testing.T) 
 		t.Fatalf("expected only macroB->subWeb binding to remain, got %+v err=%v", remainingBindings, err)
 	}
 }
+
+type stubProjectMarkdownStore struct {
+	mu   sync.Mutex
+	docs map[uuid.UUID]string
+}
+
+func newStubProjectMarkdownStore() *stubProjectMarkdownStore {
+	return &stubProjectMarkdownStore{docs: make(map[uuid.UUID]string)}
+}
+
+func (s *stubProjectMarkdownStore) ReadProjectMarkdown(_ context.Context, _, projID uuid.UUID) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.docs[projID]
+	if !ok {
+		return "", errs.New(errs.ErrNotFound, "ReadProjectMarkdown", "not found")
+	}
+	return v, nil
+}
+
+func (s *stubProjectMarkdownStore) WriteProjectMarkdown(_ context.Context, _, projID uuid.UUID, md string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.docs[projID] = md
+	return nil
+}
+
+func (s *stubProjectMarkdownStore) DeleteProjectMarkdown(_ context.Context, _, projID uuid.UUID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.docs, projID)
+	return nil
+}
+
+func (s *stubProjectMarkdownStore) HasProjectMarkdown(_ context.Context, _, projID uuid.UUID) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.docs[projID]
+	return ok, nil
+}
+
+// TestProjectService_MarkdownPostCommitRollbackSafety verifies that rolled-back SQL
+// transactions never write or delete `.md` files in MarkdownStore.
+func TestProjectService_MarkdownPostCommitRollbackSafety(t *testing.T) {
+	t.Parallel()
+
+	env := newMemProjectEnv()
+	mdStore := newStubProjectMarkdownStore()
+	svc := project.NewService(newMemProjectRepo(env), env).WithMarkdownStore(mdStore)
+
+	wsID := uuid.New()
+	ctx := authctx.WithIdentity(context.Background(), authctx.Identity{
+		WorkspaceID: wsID,
+		ActorID:     uuid.New(),
+		Kind:        authctx.ActorKindHuman,
+		Handle:      "paolo",
+	})
+
+	proj, err := svc.CreateProject(ctx, project.CreateProjectInput{
+		WorkspaceID: wsID,
+		Slug:        "doc-proj",
+		KeyPrefix:   "DOC",
+		Name:        "Doc Project",
+	})
+	if err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+
+	boom := errors.New("audit failure")
+	env.auditFn = func() error { return boom }
+	if _, err := svc.PutProjectMarkdown(ctx, wsID, proj.ID, "# Rollback"); !errors.Is(err, boom) {
+		t.Fatalf("expected boom on PutProjectMarkdown, got %v", err)
+	}
+	if ok, _ := mdStore.HasProjectMarkdown(ctx, wsID, proj.ID); ok {
+		t.Fatal("expected rolled-back PutProjectMarkdown not to write markdown")
+	}
+	env.auditFn = nil
+
+	if _, err := svc.PutProjectMarkdown(ctx, wsID, proj.ID, "# Committed"); err != nil {
+		t.Fatalf("PutProjectMarkdown: %v", err)
+	}
+	env.auditFn = func() error { return boom }
+	if _, err := svc.DeleteProjectMarkdown(ctx, wsID, proj.ID); !errors.Is(err, boom) {
+		t.Fatalf("expected boom on DeleteProjectMarkdown, got %v", err)
+	}
+	if err := svc.DeleteProject(ctx, wsID, proj.ID); !errors.Is(err, boom) {
+		t.Fatalf("expected boom on DeleteProject, got %v", err)
+	}
+	if ok, _ := mdStore.HasProjectMarkdown(ctx, wsID, proj.ID); !ok {
+		t.Fatal("expected rolled-back DeleteProjectMarkdown/DeleteProject to keep markdown intact")
+	}
+	env.auditFn = nil
+
+	if err := svc.DeleteProject(ctx, wsID, proj.ID); err != nil {
+		t.Fatalf("DeleteProject commit: %v", err)
+	}
+	if ok, _ := mdStore.HasProjectMarkdown(ctx, wsID, proj.ID); ok {
+		t.Fatal("expected committed DeleteProject to remove project markdown")
+	}
+}

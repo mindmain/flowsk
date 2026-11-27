@@ -90,7 +90,7 @@ func (s *memTaskState) hydrate(t task.Task, now time.Time) task.Task {
 	var blockers int32
 	for _, rel := range s.relations {
 		if rel.WorkspaceID == t.WorkspaceID && rel.TargetTaskID == t.ID && rel.Type == task.RelationBlocks {
-			if src, ok := s.tasks[rel.SourceTaskID]; ok && src.DeletedAt == nil && src.Status != task.StatusDone {
+			if src, ok := s.tasks[rel.SourceTaskID]; ok && src.DeletedAt == nil && !src.Status.IsTerminal() {
 				blockers++
 			}
 		}
@@ -322,6 +322,26 @@ func (r *memTaskRepo) SetHasMarkdownDoc(_ context.Context, workspaceID, taskID u
 	return updated, err
 }
 
+func (r *memTaskRepo) TouchSignal(_ context.Context, workspaceID, taskID uuid.UUID, signalAt time.Time) (task.Task, error) {
+	var updated task.Task
+	err := r.writeState("task.Repo.TouchSignal", func(st *memTaskState) error {
+		cur, ok := st.tasks[taskID]
+		if !ok || cur.DeletedAt != nil || cur.WorkspaceID != workspaceID {
+			return errs.New(errs.ErrNotFound, "task.Repo.TouchSignal", "task not found")
+		}
+		if signalAt.IsZero() {
+			cur.LastSignalAt = nil
+		} else {
+			ts := signalAt.UTC()
+			cur.LastSignalAt = &ts
+		}
+		st.tasks[taskID] = cur
+		updated = st.hydrate(cur, time.Now().UTC())
+		return nil
+	})
+	return updated, err
+}
+
 func (r *memTaskRepo) HardDelete(_ context.Context, workspaceID, taskID uuid.UUID) error {
 	return r.writeState("task.Repo.HardDelete", func(st *memTaskState) error {
 		cur, ok := st.tasks[taskID]
@@ -370,6 +390,11 @@ func (r *memTaskRepo) QueryCompactQueue(_ context.Context, filter task.AgentWork
 				e := t.ActiveLease.ExpiresAt
 				exp = &e
 			}
+			var sig *time.Time
+			if t.LastSignalAt != nil {
+				s := *t.LastSignalAt
+				sig = &s
+			}
 			out = append(out, task.CompactTaskSummary{
 				ID:                     t.ID,
 				Key:                    t.Key,
@@ -382,6 +407,7 @@ func (r *memTaskRepo) QueryCompactQueue(_ context.Context, filter task.AgentWork
 				LeaseExpiresAt:         exp,
 				UnresolvedBlockerCount: t.UnresolvedBlockerCount,
 				Tags:                   t.TagsCopy(),
+				LastSignalAt:           sig,
 				UpdatedAt:              t.UpdatedAt,
 			})
 		}
@@ -1258,5 +1284,403 @@ func TestTaskExternalIDUniquenessPerProjectAndClear(t *testing.T) {
 	}
 	if _, err := svc.GetTaskByExternalID(ctx, wsID, projA, "CU-869abc"); !errors.Is(err, errs.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound after clearing ExternalID, got %v", err)
+	}
+}
+
+type stubTaskMarkdownStore struct {
+	mu       sync.Mutex
+	taskDocs map[uuid.UUID]string
+	projDocs map[uuid.UUID]string
+	writes   int
+	deletes  int
+}
+
+func newStubTaskMarkdownStore() *stubTaskMarkdownStore {
+	return &stubTaskMarkdownStore{
+		taskDocs: make(map[uuid.UUID]string),
+		projDocs: make(map[uuid.UUID]string),
+	}
+}
+
+func (m *stubTaskMarkdownStore) ReadTaskMarkdown(_ context.Context, _, taskID uuid.UUID) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.taskDocs[taskID]
+	if !ok {
+		return "", errs.New(errs.ErrNotFound, "ReadTaskMarkdown", "not found")
+	}
+	return v, nil
+}
+
+func (m *stubTaskMarkdownStore) WriteTaskMarkdown(_ context.Context, _, taskID uuid.UUID, md string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.writes++
+	m.taskDocs[taskID] = md
+	return nil
+}
+
+func (m *stubTaskMarkdownStore) DeleteTaskMarkdown(_ context.Context, _, taskID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deletes++
+	delete(m.taskDocs, taskID)
+	return nil
+}
+
+func (m *stubTaskMarkdownStore) HasTaskMarkdown(_ context.Context, _, taskID uuid.UUID) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.taskDocs[taskID]
+	return ok, nil
+}
+
+func (m *stubTaskMarkdownStore) ScanTaskFiles(_ context.Context, _ uuid.UUID) ([]uuid.UUID, []string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := make([]uuid.UUID, 0, len(m.taskDocs))
+	for id := range m.taskDocs {
+		ids = append(ids, id)
+	}
+	return ids, nil, nil
+}
+
+func (m *stubTaskMarkdownStore) RemoveMalformedTaskMarkdown(_ context.Context, _ string) error {
+	return nil
+}
+
+func (m *stubTaskMarkdownStore) DeleteProjectMarkdown(_ context.Context, _, projID uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.projDocs, projID)
+	return nil
+}
+
+func (m *stubTaskMarkdownStore) HasProjectMarkdown(_ context.Context, _, projID uuid.UUID) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.projDocs[projID]
+	return ok, nil
+}
+
+func (m *stubTaskMarkdownStore) ScanProjectFiles(_ context.Context, _ uuid.UUID) ([]uuid.UUID, []string, error) {
+	return nil, nil, nil
+}
+
+func (m *stubTaskMarkdownStore) RemoveMalformedProjectMarkdown(_ context.Context, _ string) error {
+	return nil
+}
+
+// TestTaskService_StabilizationFixes verifies empty-token ReleaseTask by same holder,
+// PollWorkQueue ExternalID + >100 Limit, terminal blocker resolution (Cancelled/Archived),
+// post-commit MarkdownStore safety + PruneOrphans audit error propagation, and ToProto fields.
+func TestTaskService_StabilizationFixes(t *testing.T) {
+	t.Parallel()
+
+	env := newMemTaskEnv()
+	env.mintKeyInRep = true
+	mdStore := newStubTaskMarkdownStore()
+	svc := task.NewService(newMemTaskRepo(env), env).WithMarkdownResources(mdStore, nil)
+
+	wsID := uuid.New()
+	projID := uuid.New()
+	actorID := uuid.New()
+	ctx := authctx.WithIdentity(context.Background(), authctx.Identity{
+		WorkspaceID: wsID,
+		ActorID:     actorID,
+		Kind:        authctx.ActorKindAgent,
+		Handle:      "stabilizer-agent",
+	})
+
+	// 1. ReleaseTask allows empty LeaseToken when called by active lease holder.
+	leasedTask, err := svc.CreateTask(ctx, task.CreateTaskInput{
+		WorkspaceID: wsID,
+		ProjectID:   projID,
+		ExternalID:  "EXT-900",
+		Title:       "Leased task",
+		Tags:        []string{"backend", "urgent"},
+		Labels: map[string]string{
+			"11111111-2222-3333-4444-555555555555": "label-uuid",
+			"non-uuid-key":                         "ignored-in-label-ids",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateTask leasedTask: %v", err)
+	}
+	lease, err := svc.ClaimTask(ctx, task.ClaimTaskInput{
+		WorkspaceID: wsID,
+		TaskID:      leasedTask.ID,
+		TTLSeconds:  300,
+	})
+	if err != nil || lease.LeaseToken == "" {
+		t.Fatalf("ClaimTask: %+v, err=%v", lease, err)
+	}
+	if err := svc.ReleaseTask(ctx, task.ReleaseTaskInput{
+		WorkspaceID: wsID,
+		TaskID:      leasedTask.ID,
+		LeaseToken:  "",
+	}); err != nil {
+		t.Fatalf("expected empty LeaseToken by same holder to succeed, got %v", err)
+	}
+
+	// 2. Terminal blocker states (StatusCancelled & StatusArchived) unblock downstream tasks.
+	blockerCancel, _ := svc.CreateTask(ctx, task.CreateTaskInput{WorkspaceID: wsID, ProjectID: projID, Title: "Blocker Cancel"})
+	blockerArchive, _ := svc.CreateTask(ctx, task.CreateTaskInput{WorkspaceID: wsID, ProjectID: projID, Title: "Blocker Archive"})
+	downstream, _ := svc.CreateTask(ctx, task.CreateTaskInput{WorkspaceID: wsID, ProjectID: projID, Title: "Downstream"})
+	_, _ = svc.AddRelation(ctx, task.AddRelationInput{WorkspaceID: wsID, SourceTaskID: blockerCancel.ID, TargetTaskID: downstream.ID, Type: task.RelationBlocks})
+	_, _ = svc.AddRelation(ctx, task.AddRelationInput{WorkspaceID: wsID, SourceTaskID: blockerArchive.ID, TargetTaskID: downstream.ID, Type: task.RelationBlocks})
+
+	if _, err := svc.TransitionTask(ctx, task.TransitionTaskInput{WorkspaceID: wsID, TaskID: downstream.ID, TargetStatus: task.StatusInProgress}); !errors.Is(err, errs.ErrPreconditionFailed) {
+		t.Fatalf("expected downstream blocked before terminal transitions, got %v", err)
+	}
+	if _, err := svc.TransitionTask(ctx, task.TransitionTaskInput{WorkspaceID: wsID, TaskID: blockerCancel.ID, TargetStatus: task.StatusCancelled}); err != nil {
+		t.Fatalf("TransitionTask Cancelled: %v", err)
+	}
+	if _, err := svc.TransitionTask(ctx, task.TransitionTaskInput{WorkspaceID: wsID, TaskID: blockerArchive.ID, TargetStatus: task.StatusArchived}); err != nil {
+		t.Fatalf("TransitionTask Archived: %v", err)
+	}
+	if _, err := svc.TransitionTask(ctx, task.TransitionTaskInput{WorkspaceID: wsID, TaskID: downstream.ID, TargetStatus: task.StatusInProgress}); err != nil {
+		t.Fatalf("expected downstream unblocked after Cancelled+Archived blockers, got %v", err)
+	}
+
+	// 3. PollWorkQueue ExternalID filtering and >100 Limit support.
+	extMatches, err := svc.PollWorkQueue(ctx, task.AgentWorkQueueFilter{
+		WorkspaceID: wsID,
+		ProjectID:   projID,
+		ExternalID:  "  EXT-900  ",
+		Statuses:    []task.Status{task.StatusReady},
+	})
+	if err != nil || len(extMatches) != 1 || extMatches[0].ID != leasedTask.ID {
+		t.Fatalf("PollWorkQueue ExternalID mismatch: %+v, err=%v", extMatches, err)
+	}
+	for i := range 130 {
+		_, _ = svc.CreateTask(ctx, task.CreateTaskInput{
+			WorkspaceID: wsID,
+			ProjectID:   projID,
+			Title:       fmt.Sprintf("Bulk Ready %d", i),
+		})
+	}
+	bulkQueue, err := svc.PollWorkQueue(ctx, task.AgentWorkQueueFilter{
+		WorkspaceID: wsID,
+		ProjectID:   projID,
+		Statuses:    []task.Status{task.StatusReady},
+		Limit:       250,
+	})
+	if err != nil || len(bulkQueue) < 131 {
+		t.Fatalf("expected PollWorkQueue(Limit=250) to return >=131 items without truncating at 100, got %d (err=%v)", len(bulkQueue), err)
+	}
+
+	// 4. Post-commit MarkdownStore safety on rollback & PruneOrphans audit error propagation.
+	auditFail := errors.New("simulated audit failure")
+	env.auditFn = func() error { return auditFail }
+	if _, err := svc.PutTaskMarkdown(ctx, wsID, leasedTask.ID, "# Should Not Persist"); !errors.Is(err, auditFail) {
+		t.Fatalf("expected auditFail on PutTaskMarkdown, got %v", err)
+	}
+	if hasDoc, _ := mdStore.HasTaskMarkdown(ctx, wsID, leasedTask.ID); hasDoc {
+		t.Fatal("expected rolled-back PutTaskMarkdown not to write markdown file")
+	}
+	env.auditFn = nil
+
+	if _, err := svc.PutTaskMarkdown(ctx, wsID, leasedTask.ID, "# Committed Doc"); err != nil {
+		t.Fatalf("PutTaskMarkdown commit: %v", err)
+	}
+	env.auditFn = func() error { return auditFail }
+	if _, err := svc.DeleteTaskMarkdown(ctx, wsID, leasedTask.ID); !errors.Is(err, auditFail) {
+		t.Fatalf("expected auditFail on DeleteTaskMarkdown, got %v", err)
+	}
+	if err := svc.DeleteTask(ctx, wsID, leasedTask.ID); !errors.Is(err, auditFail) {
+		t.Fatalf("expected auditFail on DeleteTask, got %v", err)
+	}
+	if hasDoc, _ := mdStore.HasTaskMarkdown(ctx, wsID, leasedTask.ID); !hasDoc {
+		t.Fatal("expected rolled-back DeleteTaskMarkdown/DeleteTask to preserve markdown file on disk")
+	}
+
+	// Simulate missing disk doc to verify PruneOrphans propagates Audit().Record errors.
+	_ = mdStore.DeleteTaskMarkdown(ctx, wsID, leasedTask.ID)
+	if _, err := svc.PruneOrphans(ctx, wsID, false); !errors.Is(err, auditFail) {
+		t.Fatalf("expected PruneOrphans to propagate audit error, got %v", err)
+	}
+	env.auditFn = nil
+
+	// 5. ToProto deterministic WorkflowStateId, Tags, UUID-only LabelIds, and CompactTaskSummary fields.
+	reloaded, err := svc.GetTask(ctx, wsID, leasedTask.ID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	pbTask := (&reloaded).ToProto()
+	wantStateID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("flowsk:workflow-state:"+projID.String()+":ready")).String()
+	if pbTask.GetWorkflowStateId() != wantStateID {
+		t.Fatalf("WorkflowStateId = %q, want %q", pbTask.GetWorkflowStateId(), wantStateID)
+	}
+	if len(pbTask.GetTags()) != 2 || pbTask.GetTags()[0] != "backend" {
+		t.Fatalf("unexpected pbTask.Tags: %+v", pbTask.GetTags())
+	}
+	if len(pbTask.GetLabelIds()) != 1 || pbTask.GetLabelIds()[0] != "11111111-2222-3333-4444-555555555555" {
+		t.Fatalf("expected only valid UUID in pbTask.LabelIds, got %+v", pbTask.GetLabelIds())
+	}
+	objUUID := uuid.New()
+	holderUUID := uuid.New()
+	summaryPB := (&task.CompactTaskSummary{
+		ID:             leasedTask.ID,
+		Key:            leasedTask.Key,
+		ExternalID:     "EXT-900",
+		Kind:           task.KindFeature,
+		Title:          "Summary",
+		Status:         task.StatusInProgress,
+		Priority:       task.PriorityHigh,
+		ObjectiveID:    &objUUID,
+		HolderActorID:  &holderUUID,
+		HasMarkdownDoc: true,
+	}).ToProto()
+	if summaryPB.GetObjectiveId() != objUUID.String() || summaryPB.GetClaimedByActorId() != holderUUID.String() ||
+		!summaryPB.GetHasMarkdownDoc() || summaryPB.GetExternalId() != "EXT-900" {
+		t.Fatalf("CompactTaskSummary.ToProto mismatch: %+v", summaryPB)
+	}
+}
+
+// TestTaskService_LastSignalAtLifecycleAndGlowRules verifies:
+//   - Suppressed contexts (Web UI / internal hydration) leave LastSignalAt nil on create/read/move.
+//   - Agent/CLI creation sets LastSignalAt = CreatedAt.
+//   - Point-reads (GetTask, GetTaskByKey, GetTaskByExternalID, GetTaskMarkdown), updates,
+//     claims, comments, docs, and transitions up to in_review advance LastSignalAt.
+//   - Transitions to blocked, done, cancelled, or archived stop updating LastSignalAt,
+//     and subsequent reads/comments in those states leave LastSignalAt frozen.
+//   - HasActiveSignalGlow illuminates strictly for ready/in_progress/in_review within 10 minutes
+//     and extinguishes immediately in backlog/blocked/done/cancelled/archived or after 10 minutes.
+func TestTaskService_LastSignalAtLifecycleAndGlowRules(t *testing.T) {
+	t.Parallel()
+
+	env := newMemTaskEnv()
+	env.mintKeyInRep = true
+	svc := task.NewService(newMemTaskRepo(env), env)
+	wsID := uuid.New()
+	projID := uuid.New()
+	agentCtx := authctx.WithIdentity(context.Background(), authctx.Identity{
+		WorkspaceID: wsID,
+		ActorID:     uuid.New(),
+		Kind:        authctx.ActorKindAgent,
+		Handle:      "agent-signal-01",
+	})
+	uiCtx := authctx.WithSuppressTaskSignal(agentCtx)
+
+	// 1. Web UI / suppressed create leaves LastSignalAt nil by default.
+	uiCreated, err := svc.CreateTask(uiCtx, task.CreateTaskInput{
+		WorkspaceID: wsID,
+		ProjectID:   projID,
+		Title:       "UI Created Backlog Item",
+		Status:      task.StatusBacklog,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask (uiCtx): %v", err)
+	}
+	if uiCreated.LastSignalAt != nil {
+		t.Fatalf("expected nil LastSignalAt when created from suppressed UI context, got %v", uiCreated.LastSignalAt)
+	}
+
+	// Suppressed read also leaves LastSignalAt nil.
+	uiRead, err := svc.GetTask(uiCtx, wsID, uiCreated.ID)
+	if err != nil || uiRead.LastSignalAt != nil {
+		t.Fatalf("expected suppressed GetTask to leave LastSignalAt nil, got %v (err=%v)", uiRead.LastSignalAt, err)
+	}
+
+	// 2. Agent create sets LastSignalAt == CreatedAt; Backlog never illuminates green glow.
+	created, err := svc.CreateTask(agentCtx, task.CreateTaskInput{
+		WorkspaceID: wsID,
+		ProjectID:   projID,
+		ExternalID:  "SIG-1",
+		Title:       "Agent Tracked Feature",
+		Status:      task.StatusBacklog,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask (agentCtx): %v", err)
+	}
+	if created.LastSignalAt == nil || !created.LastSignalAt.Equal(created.CreatedAt) {
+		t.Fatalf("expected LastSignalAt == CreatedAt (%v), got %v", created.CreatedAt, created.LastSignalAt)
+	}
+	if created.HasActiveSignalGlow(created.CreatedAt.Add(time.Minute)) {
+		t.Fatal("expected backlog task NOT to illuminate green glow")
+	}
+
+	// 3. Agent transition backlog -> ready -> in_progress -> in_review updates LastSignalAt and glows within 10m.
+	prevSig := *created.LastSignalAt
+	time.Sleep(2 * time.Millisecond)
+	readyTask, err := svc.TransitionTask(agentCtx, task.TransitionTaskInput{
+		WorkspaceID:  wsID,
+		TaskID:       created.ID,
+		TargetStatus: task.StatusReady,
+	})
+	if err != nil || readyTask.LastSignalAt == nil || !readyTask.LastSignalAt.After(prevSig) {
+		t.Fatalf("expected TransitionTask(ready) to advance LastSignalAt beyond %v, got %v (err=%v)", prevSig, readyTask.LastSignalAt, err)
+	}
+	if !readyTask.HasActiveSignalGlow(readyTask.LastSignalAt.Add(9 * time.Minute)) {
+		t.Fatal("expected ready task within 10m window to illuminate green glow")
+	}
+	if readyTask.HasActiveSignalGlow(readyTask.LastSignalAt.Add(10*time.Minute + time.Second)) {
+		t.Fatal("expected ready task older than 10m window to extinguish green glow")
+	}
+
+	// Agent point-read advances LastSignalAt.
+	prevSig = *readyTask.LastSignalAt
+	time.Sleep(2 * time.Millisecond)
+	readByKey, err := svc.GetTaskByKey(agentCtx, wsID, readyTask.Key)
+	if err != nil || readByKey.LastSignalAt == nil || !readByKey.LastSignalAt.After(prevSig) {
+		t.Fatalf("expected GetTaskByKey to advance LastSignalAt beyond %v, got %v (err=%v)", prevSig, readByKey.LastSignalAt, err)
+	}
+
+	// Transition to in_review still advances LastSignalAt and glows.
+	prevSig = *readByKey.LastSignalAt
+	time.Sleep(2 * time.Millisecond)
+	inReviewTask, err := svc.TransitionTask(agentCtx, task.TransitionTaskInput{
+		WorkspaceID:  wsID,
+		TaskID:       created.ID,
+		TargetStatus: task.StatusInReview,
+	})
+	if err != nil || inReviewTask.LastSignalAt == nil || !inReviewTask.LastSignalAt.After(prevSig) {
+		t.Fatalf("expected TransitionTask(in_review) to advance LastSignalAt beyond %v, got %v (err=%v)", prevSig, inReviewTask.LastSignalAt, err)
+	}
+	if !inReviewTask.HasActiveSignalGlow(time.Now().UTC()) {
+		t.Fatal("expected in_review task with fresh signal to illuminate green glow")
+	}
+
+	// 4. Transition to blocked freezes LastSignalAt and immediately extinguishes glow.
+	frozenSig := *inReviewTask.LastSignalAt
+	time.Sleep(2 * time.Millisecond)
+	blockedTask, err := svc.TransitionTask(agentCtx, task.TransitionTaskInput{
+		WorkspaceID:  wsID,
+		TaskID:       created.ID,
+		TargetStatus: task.StatusBlocked,
+	})
+	if err != nil {
+		t.Fatalf("TransitionTask(blocked): %v", err)
+	}
+	if blockedTask.LastSignalAt == nil || !blockedTask.LastSignalAt.Equal(frozenSig) {
+		t.Fatalf("expected blocked transition NOT to advance LastSignalAt (want %v, got %v)", frozenSig, blockedTask.LastSignalAt)
+	}
+	if blockedTask.HasActiveSignalGlow(frozenSig) {
+		t.Fatal("expected blocked task to extinguish green glow immediately regardless of timestamp")
+	}
+
+	// Subsequent agent read while blocked must NOT advance LastSignalAt.
+	time.Sleep(2 * time.Millisecond)
+	readBlocked, err := svc.GetTaskByExternalID(agentCtx, wsID, projID, "SIG-1")
+	if err != nil || readBlocked.LastSignalAt == nil || !readBlocked.LastSignalAt.Equal(frozenSig) {
+		t.Fatalf("expected GetTaskByExternalID on blocked task to keep frozen signal %v, got %v (err=%v)", frozenSig, readBlocked.LastSignalAt, err)
+	}
+
+	// 5. Transition to done also keeps LastSignalAt frozen and glow OFF.
+	time.Sleep(2 * time.Millisecond)
+	doneTask, err := svc.TransitionTask(agentCtx, task.TransitionTaskInput{
+		WorkspaceID:  wsID,
+		TaskID:       created.ID,
+		TargetStatus: task.StatusDone,
+	})
+	if err != nil {
+		t.Fatalf("TransitionTask(done): %v", err)
+	}
+	if doneTask.LastSignalAt == nil || !doneTask.LastSignalAt.Equal(frozenSig) {
+		t.Fatalf("expected done transition NOT to advance LastSignalAt (want %v, got %v)", frozenSig, doneTask.LastSignalAt)
+	}
+	if doneTask.HasActiveSignalGlow(frozenSig) {
+		t.Fatal("expected done task to extinguish green glow immediately")
 	}
 }
