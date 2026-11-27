@@ -124,6 +124,64 @@ func CompareSemver(a, b string) (int, bool) {
 	case va.Prerelease != "" && vb.Prerelease == "":
 		return -1, true
 	default:
-		return cmp.Compare(va.Prerelease, vb.Prerelease), true
+		return comparePrerelease(va.Prerelease, vb.Prerelease), true
 	}
+}
+
+// comparePrerelease compares dot-separated prerelease identifiers according to
+// SemVer 2.0.0 §11.4: pure-digit identifiers are compared numerically,
+// numeric identifiers have lower precedence than alphanumeric identifiers,
+// alphanumeric identifiers are compared lexically in ASCII order, and a larger
+// set of prerelease fields has higher precedence when prefixes match.
+func comparePrerelease(a, b string) int {
+	if a == b {
+		return 0
+	}
+	partsA := strings.Split(a, ".")
+	partsB := strings.Split(b, ".")
+	n := min(len(partsA), len(partsB))
+	for i := range n {
+		idA, idB := partsA[i], partsB[i]
+		if idA == idB {
+			continue
+		}
+		numA := isDigitsOnly(idA)
+		numB := isDigitsOnly(idB)
+		switch {
+		case numA && numB:
+			if c := compareNumericIdentifiers(idA, idB); c != 0 {
+				return c
+			}
+		case numA && !numB:
+			return -1
+		case !numA && numB:
+			return 1
+		default:
+			if c := cmp.Compare(idA, idB); c != 0 {
+				return c
+			}
+		}
+	}
+	return cmp.Compare(len(partsA), len(partsB))
+}
+
+func isDigitsOnly(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func compareNumericIdentifiers(a, b string) int {
+	ta := strings.TrimLeft(a, "0")
+	tb := strings.TrimLeft(b, "0")
+	if c := cmp.Compare(len(ta), len(tb)); c != 0 {
+		return c
+	}
+	return cmp.Compare(ta, tb)
 }

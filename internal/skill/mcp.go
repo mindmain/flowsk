@@ -31,21 +31,29 @@ func DefaultMCPArgs() []string {
 }
 
 // ResolveMCPCommand resolves the executable command string written into MCP client
-// configurations. When customCommand is empty, it prefers `exec.LookPath("flowsk")`
-// so macOS/Linux desktop GUI clients with minimal PATH environments still locate
-// `~/go/bin/flowsk`, falling back to `os.Executable()` (when named `flowsk`) or `"flowsk"`.
+// configurations. When customCommand is empty, it checks `os.Executable()` first
+// (when its basename is `flowsk` and not a `.test` or `go-build` temporary binary,
+// converted via `filepath.Abs`), falling back to `exec.LookPath("flowsk")` (also
+// converted via `filepath.Abs`) or `"flowsk"`.
 func ResolveMCPCommand(customCommand string) string {
 	if trimmed := strings.TrimSpace(customCommand); trimmed != "" {
 		return trimmed
 	}
-	if resolved, err := exec.LookPath("flowsk"); err == nil && strings.TrimSpace(resolved) != "" {
-		return filepath.Clean(resolved)
-	}
 	if exe, err := os.Executable(); err == nil && strings.TrimSpace(exe) != "" {
-		base := strings.TrimSuffix(filepath.Base(exe), ".exe")
-		if base == "flowsk" {
+		rawBase := filepath.Base(exe)
+		base := strings.TrimSuffix(rawBase, ".exe")
+		if base == "flowsk" && !strings.HasSuffix(rawBase, ".test") && !strings.Contains(exe, "go-build") {
+			if absExe, absErr := filepath.Abs(exe); absErr == nil {
+				return filepath.Clean(absExe)
+			}
 			return filepath.Clean(exe)
 		}
+	}
+	if resolved, err := exec.LookPath("flowsk"); err == nil && strings.TrimSpace(resolved) != "" {
+		if absPath, absErr := filepath.Abs(resolved); absErr == nil {
+			return filepath.Clean(absPath)
+		}
+		return filepath.Clean(resolved)
 	}
 	return "flowsk"
 }
@@ -199,6 +207,22 @@ func UninstallMCPFromProvider(target ProviderTarget) (MCPUninstallResult, error)
 	}
 	if err != nil {
 		return MCPUninstallResult{}, err
+	}
+
+	// Best-effort cleanup of a distinct pre-migration MCP config file when present.
+	if legacyCfg := strings.TrimSpace(target.LegacyMCPConfigPath); legacyCfg != "" {
+		if legacyReal, legacySym, lErr := resolveWritableTargetPath(legacyCfg); lErr == nil && filepath.Clean(legacyReal) != filepath.Clean(realPath) {
+			var legacyAction string
+			switch target.MCPFormat {
+			case MCPFormatJSON:
+				legacyAction, _ = removeJSONMCPServer(legacyReal, legacySym)
+			case MCPFormatTOML:
+				legacyAction, _ = removeTOMLMCPServer(legacyReal, legacySym)
+			}
+			if action == "not_found" && legacyAction == "removed" {
+				action = "removed"
+			}
+		}
 	}
 
 	return MCPUninstallResult{
@@ -369,8 +393,9 @@ func upsertTOMLMCPServer(realPath, cmd string, args []string) (string, error) {
 	for i, a := range args {
 		quotedArgs[i] = strconv.Quote(a)
 	}
-	canonicalBlock := fmt.Sprintf("[mcp_servers.%s]\ncommand = %s\nargs = [%s]",
-		SkillName, strconv.Quote(cmd), strings.Join(quotedArgs, ", "))
+	wantCmdLine := fmt.Sprintf("command = %s", strconv.Quote(cmd))
+	wantArgsLine := fmt.Sprintf("args = [%s]", strings.Join(quotedArgs, ", "))
+	canonicalBlock := fmt.Sprintf("[mcp_servers.%s]\n%s\n%s", SkillName, wantCmdLine, wantArgsLine)
 
 	normalized := strings.ReplaceAll(string(raw), "\r\n", "\n")
 	if strings.TrimSpace(normalized) == "" {
@@ -381,20 +406,17 @@ func upsertTOMLMCPServer(realPath, cmd string, args []string) (string, error) {
 	}
 
 	lines := strings.Split(normalized, "\n")
+	headers := scanTOMLTableHeaders(lines)
 	startIdx := -1
 	endIdx := len(lines)
 
-	for i, line := range lines {
-		hdr, isHdr := parseTOMLTableHeader(line)
-		if !isHdr {
-			continue
-		}
+	for _, h := range headers {
 		if startIdx == -1 {
-			if isFlowskTOMLHeader(hdr, false) {
-				startIdx = i
+			if isFlowskTOMLHeader(h.Header, false) {
+				startIdx = h.LineIdx
 			}
 		} else {
-			endIdx = i
+			endIdx = h.LineIdx
 			break
 		}
 	}
@@ -413,14 +435,15 @@ func upsertTOMLMCPServer(realPath, cmd string, args []string) (string, error) {
 		bodyEnd--
 	}
 
-	existingBlock := strings.Join(lines[startIdx:bodyEnd], "\n")
-	if strings.TrimSpace(existingBlock) == canonicalBlock {
+	existingSection := lines[startIdx:bodyEnd]
+	updatedSection := updateFlowskTOMLSection(existingSection, wantCmdLine, wantArgsLine)
+	if slices.Equal(existingSection, updatedSection) {
 		return "unchanged", nil
 	}
 
 	var outLines []string
 	outLines = append(outLines, lines[:startIdx]...)
-	outLines = append(outLines, strings.Split(canonicalBlock, "\n")...)
+	outLines = append(outLines, updatedSection...)
 	outLines = append(outLines, lines[bodyEnd:]...)
 
 	updatedContent := strings.TrimRight(strings.Join(outLines, "\n"), "\n") + "\n"
@@ -428,6 +451,197 @@ func upsertTOMLMCPServer(realPath, cmd string, args []string) (string, error) {
 		return "", err
 	}
 	return "updated", nil
+}
+
+func updateFlowskTOMLSection(sectionLines []string, wantCmdLine, wantArgsLine string) []string {
+	if len(sectionLines) == 0 {
+		return []string{fmt.Sprintf("[mcp_servers.%s]", SkillName), wantCmdLine, wantArgsLine}
+	}
+	rebuilt := []string{sectionLines[0]}
+	seenCmd := false
+	seenArgs := false
+	cmdIdx := -1
+
+	i := 1
+	for i < len(sectionLines) {
+		line := sectionLines[i]
+		key, rhs, isKV := splitTOMLTopLevelKeyValue(line)
+		if !isKV {
+			rebuilt = append(rebuilt, line)
+			i++
+			continue
+		}
+		endLine := consumeTOMLValueSpan(sectionLines, i, rhs)
+		switch key {
+		case "command":
+			if !seenCmd {
+				cmdIdx = len(rebuilt)
+				rebuilt = append(rebuilt, wantCmdLine)
+				seenCmd = true
+			}
+		case "args":
+			if !seenArgs {
+				rebuilt = append(rebuilt, wantArgsLine)
+				seenArgs = true
+			}
+		default:
+			rebuilt = append(rebuilt, sectionLines[i:endLine+1]...)
+		}
+		i = endLine + 1
+	}
+
+	if !seenCmd && !seenArgs {
+		rebuilt = slices.Insert(rebuilt, 1, wantCmdLine, wantArgsLine)
+	} else if !seenCmd {
+		rebuilt = slices.Insert(rebuilt, 1, wantCmdLine)
+	} else if !seenArgs {
+		insertAt := cmdIdx + 1
+		if insertAt < 1 || insertAt > len(rebuilt) {
+			insertAt = len(rebuilt)
+		}
+		rebuilt = slices.Insert(rebuilt, insertAt, wantArgsLine)
+	}
+	return rebuilt
+}
+
+func splitTOMLTopLevelKeyValue(line string) (key, rhs string, ok bool) {
+	stripped := stripTOMLComment(line)
+	trimmed := strings.TrimSpace(stripped)
+	if trimmed == "" || trimmed[0] == '[' {
+		return "", "", false
+	}
+	var inDouble, inSingle, escaped bool
+	for i := 0; i < len(trimmed); i++ {
+		ch := trimmed[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' && inDouble {
+			escaped = true
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '=' && !inDouble && !inSingle {
+			rawKey := strings.TrimSpace(trimmed[:i])
+			rawKey = strings.Trim(rawKey, `"'`)
+			if rawKey == "" {
+				return "", "", false
+			}
+			return rawKey, strings.TrimSpace(trimmed[i+1:]), true
+		}
+	}
+	return "", "", false
+}
+
+func consumeTOMLValueSpan(lines []string, startIdx int, firstRHS string) int {
+	var inMultiDouble, inMultiSingle bool
+	bracketDepth := 0
+	braceDepth := 0
+
+	scanSegment := func(seg string) {
+		j := 0
+		for j < len(seg) {
+			if inMultiDouble {
+				if seg[j] == '\\' {
+					j += 2
+					continue
+				}
+				if strings.HasPrefix(seg[j:], `"""`) {
+					j += 3
+					for j < len(seg) && seg[j] == '"' {
+						j++
+					}
+					inMultiDouble = false
+					continue
+				}
+				j++
+				continue
+			}
+			if inMultiSingle {
+				if strings.HasPrefix(seg[j:], `'''`) {
+					j += 3
+					for j < len(seg) && seg[j] == '\'' {
+						j++
+					}
+					inMultiSingle = false
+					continue
+				}
+				j++
+				continue
+			}
+			ch := seg[j]
+			if ch == '#' {
+				return
+			}
+			if strings.HasPrefix(seg[j:], `"""`) {
+				inMultiDouble = true
+				j += 3
+				continue
+			}
+			if strings.HasPrefix(seg[j:], `'''`) {
+				inMultiSingle = true
+				j += 3
+				continue
+			}
+			if ch == '"' {
+				j++
+				for j < len(seg) {
+					if seg[j] == '\\' {
+						j += 2
+						continue
+					}
+					if seg[j] == '"' {
+						j++
+						break
+					}
+					j++
+				}
+				continue
+			}
+			if ch == '\'' {
+				j++
+				for j < len(seg) {
+					if seg[j] == '\'' {
+						j++
+						break
+					}
+					j++
+				}
+				continue
+			}
+			switch ch {
+			case '[':
+				bracketDepth++
+			case ']':
+				if bracketDepth > 0 {
+					bracketDepth--
+				}
+			case '{':
+				braceDepth++
+			case '}':
+				if braceDepth > 0 {
+					braceDepth--
+				}
+			}
+			j++
+		}
+	}
+
+	scanSegment(firstRHS)
+	cur := startIdx
+	for (inMultiDouble || inMultiSingle || bracketDepth > 0 || braceDepth > 0) && cur+1 < len(lines) {
+		cur++
+		scanSegment(lines[cur])
+	}
+	return cur
 }
 
 func removeTOMLMCPServer(realPath string, isSymlink bool) (string, error) {
@@ -445,12 +659,18 @@ func removeTOMLMCPServer(realPath string, isSymlink bool) (string, error) {
 	}
 
 	lines := strings.Split(normalized, "\n")
+	headers := scanTOMLTableHeaders(lines)
+	headerByLine := make(map[int]string, len(headers))
+	for _, h := range headers {
+		headerByLine[h.LineIdx] = h.Header
+	}
+
 	var kept []string
 	skipping := false
 	removedAny := false
 
-	for _, line := range lines {
-		if hdr, isHdr := parseTOMLTableHeader(line); isHdr {
+	for idx, line := range lines {
+		if hdr, isHdr := headerByLine[idx]; isHdr {
 			if isFlowskTOMLHeader(hdr, true) {
 				skipping = true
 				removedAny = true
@@ -495,6 +715,102 @@ func removeTOMLMCPServer(realPath string, isSymlink bool) (string, error) {
 		return "", err
 	}
 	return "removed", nil
+}
+
+type tomlHeaderLine struct {
+	LineIdx int
+	Header  string
+}
+
+func scanTOMLTableHeaders(lines []string) []tomlHeaderLine {
+	var out []tomlHeaderLine
+	var inMultiDouble, inMultiSingle bool
+	for idx, line := range lines {
+		startedInMulti := inMultiDouble || inMultiSingle
+		advanceTOMLMultilineState(line, &inMultiDouble, &inMultiSingle)
+		if startedInMulti || inMultiDouble || inMultiSingle {
+			continue
+		}
+		if hdr, ok := parseTOMLTableHeader(line); ok {
+			out = append(out, tomlHeaderLine{LineIdx: idx, Header: hdr})
+		}
+	}
+	return out
+}
+
+func advanceTOMLMultilineState(line string, inMultiDouble, inMultiSingle *bool) {
+	i := 0
+	for i < len(line) {
+		if *inMultiDouble {
+			if line[i] == '\\' {
+				i += 2
+				continue
+			}
+			if strings.HasPrefix(line[i:], `"""`) {
+				i += 3
+				for i < len(line) && line[i] == '"' {
+					i++
+				}
+				*inMultiDouble = false
+				continue
+			}
+			i++
+			continue
+		}
+		if *inMultiSingle {
+			if strings.HasPrefix(line[i:], `'''`) {
+				i += 3
+				for i < len(line) && line[i] == '\'' {
+					i++
+				}
+				*inMultiSingle = false
+				continue
+			}
+			i++
+			continue
+		}
+		ch := line[i]
+		if ch == '#' {
+			return
+		}
+		if strings.HasPrefix(line[i:], `"""`) {
+			*inMultiDouble = true
+			i += 3
+			continue
+		}
+		if strings.HasPrefix(line[i:], `'''`) {
+			*inMultiSingle = true
+			i += 3
+			continue
+		}
+		if ch == '"' {
+			i++
+			for i < len(line) {
+				if line[i] == '\\' {
+					i += 2
+					continue
+				}
+				if line[i] == '"' {
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+		if ch == '\'' {
+			i++
+			for i < len(line) {
+				if line[i] == '\'' {
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+		i++
+	}
 }
 
 // parseTOMLTableHeader extracts the raw header expression inside `[...]` or `[[...]]`
@@ -553,38 +869,48 @@ func stripTOMLComment(line string) string {
 	return line
 }
 
-// resolveWritableTargetPath resolves symbolic links on path (if present) so atomic
-// rename writes update the symlink target file instead of replacing the symlink itself.
+// resolveWritableTargetPath resolves symbolic links on path (looping up to 8 hops
+// across dangling symlink chains) so atomic rename writes update the final target
+// file instead of replacing any symlink along the chain.
 func resolveWritableTargetPath(path string) (realPath string, isSymlink bool, err error) {
 	cleaned := filepath.Clean(strings.TrimSpace(path))
 	if cleaned == "" || cleaned == "." {
 		return "", false, errors.New("empty config file path")
 	}
 
-	linfo, err := os.Lstat(cleaned)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return cleaned, false, nil
+	const maxSymlinkHops = 8
+	cur := cleaned
+	for range maxSymlinkHops {
+		linfo, lErr := os.Lstat(cur)
+		if lErr != nil {
+			if errors.Is(lErr, os.ErrNotExist) {
+				return cur, isSymlink, nil
+			}
+			return "", isSymlink, lErr
 		}
-		return "", false, err
-	}
-
-	if linfo.Mode()&os.ModeSymlink != 0 {
-		resolved, evalErr := filepath.EvalSymlinks(cleaned)
-		if evalErr == nil {
-			return resolved, true, nil
+		if linfo.Mode()&os.ModeSymlink == 0 {
+			return cur, isSymlink, nil
 		}
-		linkDest, readErr := os.Readlink(cleaned)
-		if readErr != nil {
+		isSymlink = true
+		if resolved, evalErr := filepath.EvalSymlinks(cur); evalErr == nil {
+			return filepath.Clean(resolved), true, nil
+		} else if !errors.Is(evalErr, os.ErrNotExist) {
 			return "", true, evalErr
 		}
-		if !filepath.IsAbs(linkDest) {
-			linkDest = filepath.Join(filepath.Dir(cleaned), linkDest)
+		linkDest, readErr := os.Readlink(cur)
+		if readErr != nil {
+			return "", true, readErr
 		}
-		return filepath.Clean(linkDest), true, nil
+		if !filepath.IsAbs(linkDest) {
+			linkDest = filepath.Join(filepath.Dir(cur), linkDest)
+		}
+		cur = filepath.Clean(linkDest)
 	}
 
-	return cleaned, false, nil
+	if linfo, lErr := os.Lstat(cur); lErr == nil && linfo.Mode()&os.ModeSymlink != 0 {
+		return "", true, fmt.Errorf("too many symbolic link levels resolving %s", cleaned)
+	}
+	return cur, isSymlink, nil
 }
 
 func atomicWriteConfigFile(realPath string, content []byte, defaultPerm os.FileMode) error {

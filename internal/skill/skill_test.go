@@ -138,13 +138,13 @@ func TestInstallAndUninstallMCPJSONSymlinkAndTOMLPreservation(t *testing.T) {
 	home := t.TempDir()
 
 	// 1. Universal (~/.agents/mcp.json) starts non-existent -> created on install, deleted cleanly on uninstall!
-	// 2. Antigravity JSON config via symbolic link -> ~/.gemini/config/mcp_config.json
-	sharedDir := filepath.Join(home, ".gemini", "config")
-	agDir := filepath.Join(home, ".gemini", "antigravity")
+	// 2. Antigravity JSON config (~/.gemini/config/mcp_config.json) via symbolic link -> ~/dotfiles/mcp_config.json
+	sharedDir := filepath.Join(home, "dotfiles")
+	agConfigDir := filepath.Join(home, ".gemini", "config")
 	if err := os.MkdirAll(sharedDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(agDir, 0o755); err != nil {
+	if err := os.MkdirAll(agConfigDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	realSharedJSON := filepath.Join(sharedDir, "mcp_config.json")
@@ -152,7 +152,7 @@ func TestInstallAndUninstallMCPJSONSymlinkAndTOMLPreservation(t *testing.T) {
 	if err := os.WriteFile(realSharedJSON, []byte(initialJSON), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	symlinkJSON := filepath.Join(agDir, "mcp_config.json")
+	symlinkJSON := filepath.Join(agConfigDir, "mcp_config.json")
 	if err := os.Symlink(realSharedJSON, symlinkJSON); err != nil {
 		t.Fatal(err)
 	}
@@ -266,5 +266,227 @@ func TestVersionCompareSemver(t *testing.T) {
 	}
 	if c, ok := version.CompareSemver("v1.0.0-rc.1", "v1.0.0"); !ok || c >= 0 {
 		t.Fatalf("expected prerelease < stable, got c=%d ok=%t", c, ok)
+	}
+	if c, ok := version.CompareSemver("v1.0.0-alpha.2", "v1.0.0-alpha.10"); !ok || c >= 0 {
+		t.Fatalf("expected v1.0.0-alpha.2 < v1.0.0-alpha.10, got c=%d ok=%t", c, ok)
+	}
+}
+
+func TestTOMLPreservesUserKeysAndIgnoresMultilineFakeHeaders(t *testing.T) {
+	home := t.TempDir()
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tomlPath := filepath.Join(codexDir, "config.toml")
+	initial := strings.Join([]string{
+		`model = "gpt-5"`,
+		`instructions = """`,
+		`[mcp_servers.flowsk]`,
+		`command = "fake-inside-multiline"`,
+		`[mcp_servers.fake_after]`,
+		`"""`,
+		``,
+		`[mcp_servers.flowsk]`,
+		`# Keep user comments and extra fields intact`,
+		`command = "/old/bin/flowsk"`,
+		`args = [`,
+		`  "mcp",`,
+		`  "serve"`,
+		`]`,
+		`cwd = "/Users/dev/work"`,
+		`enabled = true`,
+		`startup_timeout_sec = 45`,
+		`env = { FLOWSK_WORKSPACE = "eng" }`,
+		``,
+		`[mcp_servers.other]`,
+		`command = "other-mcp"`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(tomlPath, []byte(initial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	targets, err := skill.ResolveMCPProvidersByIDs(home, []string{"codex"})
+	if err != nil || len(targets) != 1 {
+		t.Fatalf("ResolveMCPProvidersByIDs(codex): %v", err)
+	}
+
+	upd, err := skill.InstallMCPToProvider(targets[0], "/new/bin/flowsk")
+	if err != nil || upd.Action != "updated" {
+		t.Fatalf("expected updated action on TOML upsert, got %+v err=%v", upd, err)
+	}
+
+	unchanged, err := skill.InstallMCPToProvider(targets[0], "/new/bin/flowsk")
+	if err != nil || unchanged.Action != "unchanged" {
+		t.Fatalf("expected unchanged on second identical TOML upsert, got %+v err=%v", unchanged, err)
+	}
+
+	afterBytes, err := os.ReadFile(tomlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := string(afterBytes)
+	for _, want := range []string{
+		`command = "fake-inside-multiline"`,
+		`# Keep user comments and extra fields intact`,
+		`command = "/new/bin/flowsk"`,
+		`args = ["mcp", "serve", "--transport", "stdio"]`,
+		`cwd = "/Users/dev/work"`,
+		`enabled = true`,
+		`startup_timeout_sec = 45`,
+		`env = { FLOWSK_WORKSPACE = "eng" }`,
+		`[mcp_servers.other]`,
+	} {
+		if !strings.Contains(after, want) {
+			t.Fatalf("expected %q preserved in updated TOML, got:\n%s", want, after)
+		}
+	}
+	if strings.Contains(after, `/old/bin/flowsk`) {
+		t.Fatalf("expected /old/bin/flowsk to be replaced, got:\n%s", after)
+	}
+}
+
+func TestMultiHopDanglingSymlinkChainAndAccurateMCPDetection(t *testing.T) {
+	home := t.TempDir()
+
+	// 1. 4-hop dangling symlink chain for ~/.cursor/mcp.json -> link1 -> link2 -> link3 -> real/mcp.json
+	cursorDir := filepath.Join(home, ".cursor")
+	linksDir := filepath.Join(home, "links")
+	realTarget := filepath.Join(home, "dotfiles", "cursor-mcp.json")
+	if err := os.MkdirAll(cursorDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(linksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	l1 := filepath.Join(linksDir, "hop1.json")
+	l2 := filepath.Join(linksDir, "hop2.json")
+	l3 := filepath.Join(linksDir, "hop3.json")
+	if err := os.Symlink(realTarget, l3); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(l3, l2); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(l2, l1); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(l1, filepath.Join(cursorDir, "mcp.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	cursorTargets, err := skill.ResolveMCPProvidersByIDs(home, []string{"cursor"})
+	if err != nil || len(cursorTargets) != 1 {
+		t.Fatalf("ResolveMCPProvidersByIDs(cursor): %v", err)
+	}
+	res, err := skill.InstallMCPToProvider(cursorTargets[0], "/usr/local/bin/flowsk")
+	if err != nil || res.Action != "installed" {
+		t.Fatalf("InstallMCPToProvider across 4-hop dangling symlink failed: res=%+v err=%v", res, err)
+	}
+	if _, statErr := os.Stat(realTarget); statErr != nil {
+		t.Fatalf("expected real symlink destination %s to be created: %v", realTarget, statErr)
+	}
+	if linfo, lErr := os.Lstat(filepath.Join(cursorDir, "mcp.json")); lErr != nil || linfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected cursor/mcp.json to remain a symlink, err=%v", lErr)
+	}
+
+	// 2. ~/.claude.json with project history mentioning "flowsk" MUST NOT report MCPConfigured=true.
+	claudeJSONPath := filepath.Join(home, ".claude.json")
+	falsePosPayload := `{"projects":{"/Users/dev/github.com/mindmain/flowsk":{"lastPrompt":"run flowsk mcp serve"}},"mcpServers":{"other":{"command":"other"}}}`
+	if err := os.WriteFile(claudeJSONPath, []byte(falsePosPayload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	claudeTargets, err := skill.ResolveProvidersByIDs(home, []string{"claude"})
+	if err != nil || len(claudeTargets) != 1 {
+		t.Fatal(err)
+	}
+	if st := skill.InspectProvider(claudeTargets[0]); st.MCPConfigured {
+		t.Fatalf("expected MCPConfigured=false when flowsk only appears in projects history, got %+v", st)
+	}
+
+	// 3. Large (>4 MiB, <32 MiB) ~/.claude.json WITH mcpServers.flowsk MUST report MCPConfigured=true.
+	padding := strings.Repeat("x", 5*1024*1024)
+	largePayload := `{"historyPadding":"` + padding + `","mcpServers":{"flowsk":{"command":"flowsk","args":["mcp","serve","--transport","stdio"]}}}`
+	if err := os.WriteFile(claudeJSONPath, []byte(largePayload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if st := skill.InspectProvider(claudeTargets[0]); !st.MCPConfigured {
+		t.Fatalf("expected MCPConfigured=true on 5 MiB ~/.claude.json with mcpServers.flowsk, got %+v", st)
+	}
+
+	// 4. TOML with [mcp_servers.flowsk] inside multiline string MUST report MCPConfigured=false.
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeTOML := "notes = '''\n[mcp_servers.flowsk]\ncommand = \"flowsk\"\n'''\n"
+	if err := os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte(fakeTOML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	codexTargets, _ := skill.ResolveProvidersByIDs(home, []string{"codex"})
+	if st := skill.InspectProvider(codexTargets[0]); st.MCPConfigured {
+		t.Fatalf("expected MCPConfigured=false when [mcp_servers.flowsk] is inside ''' multiline string")
+	}
+}
+
+func TestAntigravityCanonicalConfigPathsAndLegacySkillCleanup(t *testing.T) {
+	home := t.TempDir()
+
+	// Seed legacy ~/.gemini/antigravity/skills/flowsk/SKILL.md and a sibling skill.
+	legacyFlowskDir := filepath.Join(home, ".gemini", "antigravity", "skills", "flowsk")
+	legacySiblingDir := filepath.Join(home, ".gemini", "antigravity", "skills", "other-skill")
+	if err := os.MkdirAll(legacyFlowskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(legacySiblingDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacySkillPath := filepath.Join(legacyFlowskDir, "SKILL.md")
+	if err := os.WriteFile(legacySkillPath, []byte("# legacy antigravity skill\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacySiblingDir, "SKILL.md"), []byte("# sibling\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	targets, err := skill.ResolveProvidersByIDs(home, []string{"antigravity"})
+	if err != nil || len(targets) != 1 {
+		t.Fatalf("ResolveProvidersByIDs(antigravity): %v", err)
+	}
+	ag := targets[0]
+
+	wantSkillPath := filepath.Join(home, ".gemini", "config", "skills", "flowsk", "SKILL.md")
+	wantMCPPath := filepath.Join(home, ".gemini", "config", "mcp_config.json")
+	if ag.SkillFilePath != wantSkillPath || ag.MCPConfigPath != wantMCPPath {
+		t.Fatalf("expected canonical ~/.gemini/config paths (%s, %s), got (%s, %s)",
+			wantSkillPath, wantMCPPath, ag.SkillFilePath, ag.MCPConfigPath)
+	}
+
+	// Pre-migration ~/.gemini/antigravity must still mark Antigravity as Detected=true,
+	// while Installed=false because canonical ~/.gemini/config/skills/flowsk/SKILL.md is missing.
+	pre := skill.InspectProvider(ag)
+	if !pre.Detected || pre.Installed {
+		t.Fatalf("expected Detected=true and Installed=false before canonical install, got %+v", pre)
+	}
+
+	// Installing writes ~/.gemini/config/skills/flowsk/SKILL.md AND removes legacy flowsk/SKILL.md!
+	res, err := skill.InstallToProvider(ag)
+	if err != nil || res.Action != "installed" {
+		t.Fatalf("InstallToProvider(antigravity): res=%+v err=%v", res, err)
+	}
+	if _, err := os.Stat(wantSkillPath); err != nil {
+		t.Fatalf("expected canonical skill installed at %s: %v", wantSkillPath, err)
+	}
+	if _, err := os.Stat(legacySkillPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected legacy skill %s to be cleaned up, stat err=%v", legacySkillPath, err)
+	}
+	if _, err := os.Stat(filepath.Join(legacySiblingDir, "SKILL.md")); err != nil {
+		t.Fatalf("expected legacy sibling skill to remain untouched: %v", err)
+	}
+
+	post := skill.InspectProvider(ag)
+	if !post.Installed || !post.UpToDate {
+		t.Fatalf("expected Installed=true and UpToDate=true after install, got %+v", post)
 	}
 }

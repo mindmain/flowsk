@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -25,7 +26,7 @@ const (
 	// ProviderCodex identifies OpenAI Codex CLI/App (`~/.codex/skills`).
 	ProviderCodex = "codex"
 
-	// ProviderAntigravity identifies Google Antigravity (`~/.gemini/antigravity/skills`).
+	// ProviderAntigravity identifies Google Antigravity (`~/.gemini/config/skills`).
 	ProviderAntigravity = "antigravity"
 
 	// ProviderGemini identifies Google Gemini CLI (`~/.gemini/skills`).
@@ -95,14 +96,23 @@ type ProviderTarget struct {
 	// HomeMarkerDir is the provider's root user directory used to detect whether the tool is present on disk.
 	HomeMarkerDir string `json:"home_marker_dir"`
 
+	// LegacyHomeMarkerDir is an optional pre-migration root user directory also checked during provider detection.
+	LegacyHomeMarkerDir string `json:"legacy_home_marker_dir,omitempty"`
+
 	// SkillsDir is the provider's global skills parent folder (`<SkillsDir>/flowsk/SKILL.md`).
 	SkillsDir string `json:"skills_dir"`
 
 	// SkillFilePath is the exact destination path of `<SkillsDir>/flowsk/SKILL.md`.
 	SkillFilePath string `json:"skill_file_path"`
 
+	// LegacySkillFilePath is an optional pre-migration `SKILL.md` path cleaned up during install and uninstall.
+	LegacySkillFilePath string `json:"legacy_skill_file_path,omitempty"`
+
 	// MCPConfigPath is the primary user-level MCP configuration file for this provider, if applicable.
 	MCPConfigPath string `json:"mcp_config_path,omitempty"`
+
+	// LegacyMCPConfigPath is an optional pre-migration MCP configuration file cleaned up on uninstall when distinct.
+	LegacyMCPConfigPath string `json:"legacy_mcp_config_path,omitempty"`
 
 	// MCPFormat identifies the configuration file syntax ("json" or "toml") when MCPConfigPath is non-empty.
 	MCPFormat string `json:"mcp_format,omitempty"`
@@ -194,11 +204,24 @@ func SupportedProviders(homeDir string) ([]ProviderTarget, error) {
 		}
 	}
 
+	antigravityTarget := mk(
+		ProviderAntigravity,
+		"Google Antigravity",
+		"~/.gemini/config/skills/flowsk/SKILL.md",
+		filepath.Join(".gemini", "config"),
+		filepath.Join(".gemini", "config", "skills"),
+		filepath.Join(".gemini", "config", "mcp_config.json"),
+		MCPFormatJSON,
+	)
+	antigravityTarget.LegacyHomeMarkerDir = filepath.Join(home, ".gemini", "antigravity")
+	antigravityTarget.LegacySkillFilePath = filepath.Join(home, ".gemini", "antigravity", "skills", SkillName, "SKILL.md")
+	antigravityTarget.LegacyMCPConfigPath = filepath.Join(home, ".gemini", "antigravity", "mcp_config.json")
+
 	return []ProviderTarget{
 		mk(ProviderAgents, "Universal Agents (~/.agents)", "~/.agents/skills/flowsk/SKILL.md", ".agents", filepath.Join(".agents", "skills"), filepath.Join(".agents", "mcp.json"), MCPFormatJSON),
 		mk(ProviderClaude, "Claude Code", "~/.claude/skills/flowsk/SKILL.md", ".claude", filepath.Join(".claude", "skills"), ".claude.json", MCPFormatJSON),
 		mk(ProviderCodex, "OpenAI Codex", "~/.codex/skills/flowsk/SKILL.md", ".codex", filepath.Join(".codex", "skills"), filepath.Join(".codex", "config.toml"), MCPFormatTOML),
-		mk(ProviderAntigravity, "Google Antigravity", "~/.gemini/antigravity/skills/flowsk/SKILL.md", filepath.Join(".gemini", "antigravity"), filepath.Join(".gemini", "antigravity", "skills"), filepath.Join(".gemini", "antigravity", "mcp_config.json"), MCPFormatJSON),
+		antigravityTarget,
 		mk(ProviderGemini, "Gemini CLI", "~/.gemini/skills/flowsk/SKILL.md", filepath.Join(".gemini", "skills"), filepath.Join(".gemini", "skills"), filepath.Join(".gemini", "settings.json"), MCPFormatJSON),
 		mk(ProviderCursor, "Cursor", "~/.cursor/skills/flowsk/SKILL.md", ".cursor", filepath.Join(".cursor", "skills"), filepath.Join(".cursor", "mcp.json"), MCPFormatJSON),
 	}, nil
@@ -248,7 +271,11 @@ func InspectProvider(target ProviderTarget) ProviderStatus {
 		ExpectedHash: expected,
 	}
 
-	if dirExists(target.HomeMarkerDir) || dirExists(target.SkillsDir) || (target.MCPConfigPath != "" && fileExists(target.MCPConfigPath)) {
+	if dirExists(target.HomeMarkerDir) ||
+		dirExists(target.LegacyHomeMarkerDir) ||
+		dirExists(target.SkillsDir) ||
+		(target.LegacySkillFilePath != "" && fileExists(target.LegacySkillFilePath)) ||
+		(target.MCPConfigPath != "" && fileExists(target.MCPConfigPath)) {
 		st.Detected = true
 	}
 
@@ -292,6 +319,7 @@ func InstallToProvider(target ProviderTarget) (InstallResult, error) {
 	if existing, err := os.ReadFile(target.SkillFilePath); err == nil {
 		prevHash = ComputeHash(existing)
 		if prevHash == expected {
+			removeLegacySkillFile(target.LegacySkillFilePath, target.SkillFilePath)
 			return InstallResult{
 				Target: target,
 				Action: "unchanged",
@@ -343,6 +371,8 @@ func InstallToProvider(target ProviderTarget) (InstallResult, error) {
 		return InstallResult{}, fmt.Errorf("installed skill hash mismatch: got %s, expected %s", gotHash, expected)
 	}
 
+	removeLegacySkillFile(target.LegacySkillFilePath, target.SkillFilePath)
+
 	action := "installed"
 	if prevHash != "" {
 		action = "updated"
@@ -355,30 +385,52 @@ func InstallToProvider(target ProviderTarget) (InstallResult, error) {
 	}, nil
 }
 
-// UninstallFromProvider removes `<SkillsDir>/flowsk/SKILL.md` if present and
-// cleans up the `<SkillsDir>/flowsk` folder when empty, never touching sibling skills.
+// UninstallFromProvider removes `<SkillsDir>/flowsk/SKILL.md` (plus any pre-migration
+// `LegacySkillFilePath`) if present and cleans up empty `flowsk` skill folders without
+// touching sibling skills.
 func UninstallFromProvider(target ProviderTarget) (UninstallResult, error) {
 	if strings.TrimSpace(target.SkillFilePath) == "" {
 		return UninstallResult{}, errors.New("provider skill_file_path must not be empty")
 	}
 
+	removedCanonical := false
 	if err := os.Remove(target.SkillFilePath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return UninstallResult{
-				Target: target,
-				Action: "not_found",
-			}, nil
+		if !errors.Is(err, os.ErrNotExist) {
+			return UninstallResult{}, fmt.Errorf("remove skill %s: %w", target.SkillFilePath, err)
 		}
-		return UninstallResult{}, fmt.Errorf("remove skill %s: %w", target.SkillFilePath, err)
+	} else {
+		removedCanonical = true
+		// Best-effort removal of `<SkillsDir>/flowsk` only if now empty.
+		_ = os.Remove(filepath.Dir(target.SkillFilePath))
 	}
 
-	// Best-effort removal of `<SkillsDir>/flowsk` only if now empty.
-	_ = os.Remove(filepath.Dir(target.SkillFilePath))
+	removedLegacy := removeLegacySkillFile(target.LegacySkillFilePath, target.SkillFilePath)
+
+	if !removedCanonical && !removedLegacy {
+		return UninstallResult{
+			Target: target,
+			Action: "not_found",
+		}, nil
+	}
 
 	return UninstallResult{
 		Target: target,
 		Action: "removed",
 	}, nil
+}
+
+// removeLegacySkillFile best-effort deletes a pre-migration SKILL.md path and its
+// parent `flowsk` directory when empty, never touching canonicalPath or sibling skills.
+func removeLegacySkillFile(legacyPath, canonicalPath string) bool {
+	trimmed := strings.TrimSpace(legacyPath)
+	if trimmed == "" || filepath.Clean(trimmed) == filepath.Clean(canonicalPath) {
+		return false
+	}
+	if err := os.Remove(trimmed); err != nil {
+		return false
+	}
+	_ = os.Remove(filepath.Dir(trimmed))
+	return true
 }
 
 func dirExists(path string) bool {
@@ -397,19 +449,44 @@ func fileExists(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
-// fileMentionsFlowskMCP performs a bounded read-only check for a `"flowsk"` or
-// `mcp_servers.flowsk` entry without parsing or exposing any secret values.
+const maxMCPConfigInspectBytes = 32 * 1024 * 1024
+
+// fileMentionsFlowskMCP performs a bounded (32 MiB) read-only check verifying
+// whether path registers the `flowsk` MCP server under JSON `mcpServers.flowsk`
+// or TOML `[mcp_servers.flowsk]` without exposing any secret values or triggering
+// false positives on unrelated workspace/project history entries.
 func fileMentionsFlowskMCP(path string) bool {
 	info, err := os.Stat(path)
-	if err != nil || info.IsDir() || info.Size() > 4*1024*1024 {
+	if err != nil || info.IsDir() || info.Size() > maxMCPConfigInspectBytes {
 		return false
 	}
 	raw, err := os.ReadFile(path)
-	if err != nil {
+	if err != nil || len(bytes.TrimSpace(raw)) == 0 {
 		return false
 	}
-	lower := strings.ToLower(string(raw))
-	return strings.Contains(lower, `"flowsk"`) ||
-		strings.Contains(lower, `mcp_servers.flowsk`) ||
-		strings.Contains(lower, `flowsk mcp serve`)
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".json":
+		var root struct {
+			MCPServers map[string]json.RawMessage `json:"mcpServers"`
+		}
+		if err := json.Unmarshal(raw, &root); err != nil {
+			return false
+		}
+		entry, ok := root.MCPServers[SkillName]
+		trimmed := bytes.TrimSpace(entry)
+		return ok && len(trimmed) > 0 && string(trimmed) != "null"
+	case ".toml":
+		normalized := strings.ReplaceAll(string(raw), "\r\n", "\n")
+		for _, h := range scanTOMLTableHeaders(strings.Split(normalized, "\n")) {
+			if isFlowskTOMLHeader(h.Header, false) {
+				return true
+			}
+		}
+		return false
+	default:
+		lower := strings.ToLower(string(raw))
+		return strings.Contains(lower, `"flowsk"`) ||
+			strings.Contains(lower, `mcp_servers.flowsk`) ||
+			strings.Contains(lower, `flowsk mcp serve`)
+	}
 }
