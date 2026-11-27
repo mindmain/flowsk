@@ -4,6 +4,7 @@ package webui_test
 
 import (
 	"encoding/json"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -141,5 +142,29 @@ func TestDynamicBootstrapHandler_AuthStateAndZeroLeakage(t *testing.T) {
 		authPayload.WorkspaceID != "11111111-1111-4111-8111-111111111111" ||
 		authPayload.ActorID != "22222222-2222-4222-8222-222222222222" {
 		t.Fatalf("unexpected auth bootstrap payload: %+v", authPayload)
+	}
+}
+
+func TestEmbeddedDistIndexHTML_StrictCSPCompatible(t *testing.T) {
+	t.Parallel()
+
+	distFS, err := webui.DistFS()
+	if err != nil {
+		t.Fatalf("DistFS: %v", err)
+	}
+	rawIndex, err := fs.ReadFile(distFS, "index.html")
+	if err != nil {
+		t.Fatalf("read embedded dist/index.html: %v", err)
+	}
+	html := string(rawIndex)
+	if !strings.Contains(html, "<app-root></app-root>") {
+		t.Fatalf("embedded dist/index.html missing <app-root>: %s", html)
+	}
+	// Strict `script-src 'self'` CSP blocks inline event handlers such as Beasties'
+	// `media="print" onload="this.media='all'"`, which would prevent Tailwind CSS from loading.
+	for _, forbidden := range []string{`onload=`, `onerror=`, `media="print"`} {
+		if strings.Contains(strings.ToLower(html), forbidden) {
+			t.Fatalf("embedded dist/index.html contains CSP-incompatible token %q:\n%s", forbidden, html)
+		}
 	}
 }
