@@ -153,16 +153,27 @@ func (h *Handler) CreateObjective(
 	if domainKind != nil {
 		resolvedKind = *domainKind
 	}
+	slug := strings.TrimSpace(req.Msg.GetSlug())
+	if slug == "" {
+		slug = slugifyTitle(title)
+	} else {
+		slug = slugifyTitle(slug)
+	}
+	priorityRank := int32(2)
+	if req.Msg.PriorityRank != nil {
+		priorityRank = req.Msg.GetPriorityRank()
+	}
 
 	created, err := h.svc.CreateObjective(ctx, objective.CreateObjectiveInput{
 		WorkspaceID:     workspaceID,
 		ProjectID:       projectID,
 		Kind:            resolvedKind,
-		Slug:            slugifyTitle(title),
+		Slug:            slug,
 		Title:           title,
 		Summary:         req.Msg.GetDescription(),
 		SuccessCriteria: splitLines(req.Msg.GetSuccessCriteria()),
 		Status:          initialStatus,
+		PriorityRank:    priorityRank,
 		TargetDate:      protoTimestampToTimePtr(req.Msg.GetTargetDate()),
 	})
 	if err != nil {
@@ -330,6 +341,10 @@ func (h *Handler) UpdateObjective(
 	if err != nil {
 		return nil, connectrpc.MapDomainError(err)
 	}
+	kindPtr, err := parseObjectiveKind(op, req.Msg.GetKind(), true)
+	if err != nil {
+		return nil, connectrpc.MapDomainError(err)
+	}
 	if _, err := authctx.RequireWorkspaceOwnership(ctx, workspaceID); err != nil {
 		return nil, connectrpc.MapDomainError(err)
 	}
@@ -351,10 +366,12 @@ func (h *Handler) UpdateObjective(
 	updated, err := h.svc.UpdateObjective(ctx, objective.UpdateObjectiveInput{
 		WorkspaceID:     workspaceID,
 		ObjectiveID:     objectiveID,
+		Kind:            kindPtr,
 		Title:           req.Msg.Title,
 		Summary:         req.Msg.Description,
 		SuccessCriteria: criteria,
 		Status:          statusPtr,
+		PriorityRank:    req.Msg.PriorityRank,
 		TargetDate:      targetDate,
 	})
 	if err != nil {

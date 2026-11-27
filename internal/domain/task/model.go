@@ -96,22 +96,39 @@ func (s Status) IlluminatesSignalGlow() bool {
 	}
 }
 
-// Priority defines deterministic urgency tiers for ordering agent work queues.
+// Priority defines deterministic urgency tiers for ordering agent work queues
+// using the unified 0..4 scale shared across Tasks, Goals, CLI, and Code Mode:
+// 0 = None (unprioritized), 1 = Urgent (P1), 2 = High (P2), 3 = Medium (P3), 4 = Low (P4).
 type Priority int32
 
 const (
-	// PriorityCritical (P0) indicates urgent production or critical-path blocker work.
-	PriorityCritical Priority = 0
+	// PriorityNone (0 / P0) indicates an unprioritized work item ordered after PriorityLow (P4).
+	PriorityNone Priority = 0
 
-	// PriorityHigh (P1) indicates high-priority milestone deliverables.
-	PriorityHigh Priority = 1
+	// PriorityUrgent (1 / P1) indicates urgent production or critical-path blocker work.
+	PriorityUrgent Priority = 1
 
-	// PriorityMedium (P2) is the standard default execution priority.
-	PriorityMedium Priority = 2
+	// PriorityCritical (1 / P1) aliases PriorityUrgent for backward-compatible domain callers.
+	PriorityCritical Priority = PriorityUrgent
 
-	// PriorityLow (P3) indicates opportunistic improvements or tech-debt cleanup.
-	PriorityLow Priority = 3
+	// PriorityHigh (2 / P2) indicates high-priority milestone deliverables.
+	PriorityHigh Priority = 2
+
+	// PriorityMedium (3 / P3) is the standard default execution priority.
+	PriorityMedium Priority = 3
+
+	// PriorityLow (4 / P4) indicates opportunistic improvements or tech-debt cleanup.
+	PriorityLow Priority = 4
 )
+
+// SortOrder returns the ascending queue sort rank for Priority so urgent work (1..4)
+// always precedes unprioritized items (0 -> 5), matching SQL `CASE WHEN priority = 0 THEN 5 ELSE priority END`.
+func (p Priority) SortOrder() int32 {
+	if p >= PriorityUrgent && p <= PriorityLow {
+		return int32(p)
+	}
+	return 5
+}
 
 // Kind classifies the structural intent of a Task node in the work graph.
 type Kind string
@@ -175,7 +192,7 @@ type Task struct {
 	// Status is the current workflow lifecycle state.
 	Status Status
 
-	// Priority determines queue ordering (0 = Critical .. 3 = Low).
+	// Priority determines queue ordering (0 = None, 1 = Urgent/P1 .. 4 = Low/P4).
 	Priority Priority
 
 	// AssigneeActorID optionally identifies the primary assigned human or agent principal.
@@ -480,7 +497,7 @@ type CompactTaskSummary struct {
 	// Status is the current workflow state.
 	Status Status
 
-	// Priority is the numeric urgency rank (0..3).
+	// Priority is the numeric urgency rank (0 = None, 1 = P1 .. 4 = P4).
 	Priority Priority
 
 	// ObjectiveID is the optional UUID of the linked Objective (nil if unlinked).

@@ -76,6 +76,8 @@ func (o *Objective) ToProto() *flowsk_objective_pb.Objective {
 		CreatedByActorId: uuidToString(o.CreatedBy),
 		CreatedAt:        timeToProto(o.CreatedAt),
 		UpdatedAt:        timeToProto(o.UpdatedAt),
+		Slug:             o.Slug,
+		PriorityRank:     o.PriorityRank,
 	}
 }
 

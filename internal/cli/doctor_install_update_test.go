@@ -223,6 +223,57 @@ func TestInstallDoctorAndUninstallCommandsEndToEnd(t *testing.T) {
 			t.Fatal("expected ~/.agents/mcp.json to be removed after uninstall")
 		}
 	}
+
+	// 5. Simulate T3 Code isolated Antigravity profile with 0-byte mcp_config.json while ~/.gemini/config has flowsk:
+	//    `flowsk doctor --strict` must warn about the unsynced T3 profile until `flowsk install -p antigravity --yes` syncs it!
+	t3CfgDir := filepath.Join(userHome, ".t3", "userdata", "providers", "antigravity", "ac0a3dfd", "config")
+	if err := os.MkdirAll(t3CfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t3MCPFile := filepath.Join(t3CfgDir, "mcp_config.json")
+	if err := os.WriteFile(t3MCPFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	agCfgDir := filepath.Join(userHome, ".gemini", "config")
+	if err := os.MkdirAll(filepath.Join(agCfgDir, "skills", "flowsk"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agCfgDir, "skills", "flowsk", "SKILL.md"), skill.EmbeddedContent(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agCfgDir, "mcp_config.json"), []byte(`{"mcpServers":{"flowsk":{"command":"/usr/local/bin/flowsk","args":["mcp","serve","--transport","stdio"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	{
+		root := cli.NewRootCommand(env)
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetArgs([]string{"doctor", "--home", userHome, "--strict", "--format", "human"})
+		if err := root.ExecuteContext(context.Background()); err == nil {
+			t.Fatalf("expected flowsk doctor --strict to warn on unsynced T3 Antigravity mcp_config.json, got nil\nout=%s", out.String())
+		}
+		if !strings.Contains(out.String(), "unsynced") {
+			t.Fatalf("expected [mcp ! 1 unsynced] badge in doctor output, got:\n%s", out.String())
+		}
+	}
+	{
+		root := cli.NewRootCommand(env)
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetArgs([]string{"install", "--home", userHome, "--providers", "antigravity", "--mcp-command", "/usr/local/bin/flowsk", "--yes", "--format", "json"})
+		if err := root.ExecuteContext(context.Background()); err != nil {
+			t.Fatalf("flowsk install -p antigravity --yes failed: %v", err)
+		}
+	}
+	{
+		root := cli.NewRootCommand(env)
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetArgs([]string{"doctor", "--home", userHome, "--strict", "--format", "human"})
+		if err := root.ExecuteContext(context.Background()); err != nil {
+			t.Fatalf("expected flowsk doctor --strict to pass after syncing T3 Antigravity profile, got %v\nout=%s", err, out.String())
+		}
+	}
 }
 
 func TestUpdateCommandGitHubStates(t *testing.T) {

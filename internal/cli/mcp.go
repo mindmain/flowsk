@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 
+	"github.com/mindmain/flowsk/internal/skill"
 	"github.com/mindmain/flowsk/internal/transport/mcp"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -44,8 +46,10 @@ func newMCPCommand(v *viper.Viper, opts *GlobalOptions, deps mcpCommandDeps) *co
 	}
 
 	mcpCmd := &cobra.Command{
-		Use:   "mcp",
-		Short: "Model Context Protocol (MCP) server, tool descriptors, and agent setup guides",
+		Use:                        "mcp",
+		Short:                      "Model Context Protocol (MCP) server, tool descriptors, and agent setup guides",
+		SuggestionsMinimumDistance: 2,
+		RunE:                       subcommandGroupRunE,
 		Long: `Exposes Flowsk's token-frugal Model Context Protocol (MCP) interface over stdio
 or Streamable HTTP for Claude, Gemini, ChatGPT, Codex, and Antigravity agents.
 
@@ -222,17 +226,18 @@ func setMCPConfigAuthToken(cfg *mcp.Config, token string) {
 }
 
 func buildMCPClientSnippets(workspace string) []MCPClientSnippetView {
+	binCmd := skill.ResolveMCPCommand("")
 	promptHint := "Poll project state with flowsk_digest, filter tasks/goals or discover SDK methods with flowsk_search, and execute multi-step ES6 JavaScript against flowsk.* atomically via flowsk_execute."
 	jsonBlock := func(actor string) string {
-		return fmt.Sprintf(`# Command: flowsk mcp serve --transport stdio --workspace %s --actor %s
+		return fmt.Sprintf(`# Command: %s mcp serve --transport stdio --workspace %s --actor %s
 {
   "mcpServers": {
     "flowsk": {
-      "command": "flowsk",
+      "command": %s,
       "args": ["mcp", "serve", "--transport", "stdio", "--workspace", %q, "--actor", %q]
     }
   }
-}`, workspace, actor, workspace, actor)
+}`, binCmd, workspace, actor, strconv.Quote(binCmd), workspace, actor)
 	}
 	return []MCPClientSnippetView{
 		{
@@ -249,7 +254,7 @@ func buildMCPClientSnippets(workspace string) []MCPClientSnippetView {
 		},
 		{
 			Client:         "antigravity",
-			ConfigPathHint: "~/.gemini/config/mcp_config.json",
+			ConfigPathHint: "~/.gemini/config/mcp_config.json (plus ~/.t3/userdata/providers/antigravity/*/config/mcp_config.json in T3 Code)",
 			ConfigSnippet:  jsonBlock("antigravity-agent"),
 			SystemPrompt:   promptHint,
 		},
@@ -257,14 +262,14 @@ func buildMCPClientSnippets(workspace string) []MCPClientSnippetView {
 			Client:         "codex",
 			ConfigPathHint: "~/.codex/config.toml",
 			ConfigSnippet: fmt.Sprintf(`[mcp_servers.flowsk]
-command = "flowsk"
-args = ["mcp", "serve", "--transport", "stdio", "--workspace", %q, "--actor", "codex-agent"]`, workspace),
+command = %s
+args = ["mcp", "serve", "--transport", "stdio", "--workspace", %q, "--actor", "codex-agent"]`, strconv.Quote(binCmd), workspace),
 			SystemPrompt: promptHint,
 		},
 		{
 			Client:         "chatgpt",
 			ConfigPathHint: "Streamable HTTP MCP endpoint",
-			ConfigSnippet:  fmt.Sprintf("flowsk mcp serve --transport http --http-addr 127.0.0.1:8081 --workspace %s", workspace),
+			ConfigSnippet:  fmt.Sprintf("%s mcp serve --transport http --http-addr 127.0.0.1:8081 --workspace %s", binCmd, workspace),
 			SystemPrompt:   promptHint,
 		},
 	}

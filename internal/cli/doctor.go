@@ -271,18 +271,28 @@ func newDoctorCommand(v *viper.Viper, opts *GlobalOptions, deps doctorCommandDep
 				missingOnDetectedCnt := 0
 				mcpConfiguredCnt := 0
 				var skillDetails []string
+				var mcpDriftDetails []string
 
 				for _, st := range skillStatuses {
+					var activeDrift []string
+					if (st.Installed || st.MCPConfigured) && len(st.UnsyncedMCPPaths) > 0 {
+						activeDrift = append([]string(nil), st.UnsyncedMCPPaths...)
+						for _, dp := range st.UnsyncedMCPPaths {
+							mcpDriftDetails = append(mcpDriftDetails, fmt.Sprintf("%s: secondary profile MCP config missing 'flowsk' (%s)", st.Target.Name, dp))
+						}
+					}
+
 					report.Skills = append(report.Skills, DoctorSkillView{
-						ProviderID:      st.Target.ID,
-						ProviderName:    st.Target.Name,
-						Detected:        st.Detected,
-						Installed:       st.Installed,
-						UpToDate:        st.UpToDate,
-						InstalledSHA256: st.InstalledHash,
-						ExpectedSHA256:  st.ExpectedHash,
-						SkillPath:       st.Target.SkillFilePath,
-						MCPConfigured:   st.MCPConfigured,
+						ProviderID:       st.Target.ID,
+						ProviderName:     st.Target.Name,
+						Detected:         st.Detected,
+						Installed:        st.Installed,
+						UpToDate:         st.UpToDate,
+						InstalledSHA256:  st.InstalledHash,
+						ExpectedSHA256:   st.ExpectedHash,
+						SkillPath:        st.Target.SkillFilePath,
+						MCPConfigured:    st.MCPConfigured,
+						UnsyncedMCPPaths: activeDrift,
 					})
 
 					if !st.Detected {
@@ -337,15 +347,24 @@ func newDoctorCommand(v *viper.Viper, opts *GlobalOptions, deps doctorCommandDep
 					})
 				}
 
-				// 5. MCP configuration check across detected providers.
-				if detectedCnt > 0 && mcpConfiguredCnt == 0 {
+				// 5. MCP configuration check across detected providers (including T3 Code secondary profile drift).
+				switch {
+				case len(mcpDriftDetails) > 0:
+					addCheck(DoctorCheckView{
+						Name:    "mcp",
+						Status:  "warn",
+						Summary: fmt.Sprintf("%d secondary AI profile MCP config(s) missing 'flowsk' (%d primary provider(s) configured)", len(mcpDriftDetails), mcpConfiguredCnt),
+						Hint:    "Run 'flowsk install --providers antigravity --yes' to sync isolated T3 Code / Antigravity MCP config(s)",
+						Details: mcpDriftDetails,
+					})
+				case detectedCnt > 0 && mcpConfiguredCnt == 0:
 					addCheck(DoctorCheckView{
 						Name:    "mcp",
 						Status:  "warn",
 						Summary: "No detected AI provider config mentions the 'flowsk' MCP server",
 						Hint:    "Run 'flowsk install' to install SKILL.md and register the 'flowsk' MCP server",
 					})
-				} else if mcpConfiguredCnt > 0 {
+				case mcpConfiguredCnt > 0:
 					addCheck(DoctorCheckView{
 						Name:    "mcp",
 						Status:  "ok",
@@ -461,7 +480,10 @@ func renderHumanDoctorReport(w io.Writer, v DoctorReportView) error {
 				statusLabel = tuiMutedStyle.Render("· not detected ")
 			}
 			mcpTag := ""
-			if s.MCPConfigured {
+			switch {
+			case len(s.UnsyncedMCPPaths) > 0:
+				mcpTag = " " + tuiWarnStyle.Render(fmt.Sprintf("[mcp ! %d unsynced]", len(s.UnsyncedMCPPaths)))
+			case s.MCPConfigured:
 				mcpTag = " " + tuiOKStyle.Render("[mcp ✓]")
 			}
 			fmt.Fprintf(&b, "  %-28s  %s%s\n", s.ProviderName, statusLabel, mcpTag)

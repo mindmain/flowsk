@@ -411,7 +411,7 @@ func (r *memTaskRepo) QueryCompactQueue(_ context.Context, filter task.AgentWork
 				UpdatedAt:              t.UpdatedAt,
 			})
 		}
-		sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+		sort.Slice(out, func(i, j int) bool { return out[i].Priority.SortOrder() < out[j].Priority.SortOrder() })
 		if filter.Limit > 0 && int(filter.Limit) < len(out) {
 			out = out[:filter.Limit]
 		}

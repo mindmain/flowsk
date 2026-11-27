@@ -5,6 +5,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -212,21 +213,23 @@ func newCodeCommand(opts *GlobalOptions, deps codeCommandDeps) *cobra.Command {
 	}
 
 	var (
-		evalCode string
-		codeFile string
-		stdin    bool
-		dryRun   bool
+		evalCode    string
+		commandCode string
+		codeFile    string
+		stdin       bool
+		dryRun      bool
 	)
 
 	cmd := &cobra.Command{
-		Use:     "code",
+		Use:     "code [script]",
 		Aliases: []string{"exec"},
 		Short:   "Execute sandboxed ES6 JavaScript against the Flowsk SDK in one ACID transaction (Cloudflare Code Mode)",
 		Long: `Evaluates standard ES6 JavaScript inside Flowsk's pure-Go hermetic sandbox (goja)
 against the global 'flowsk' SDK. All reads and writes run inside ONE atomic ACID
 database transaction (rolling back automatically on error or --dry-run).`,
-		Example: `  # Query completed tasks and return custom JSON from JavaScript
+		Example: `  # Query completed tasks and return custom JSON from JavaScript (-e or -c)
   flowsk code -e 'return flowsk.tasks.search("state:done")'
+  flowsk code -c 'return flowsk.goals.list()'
 
   # Create a goal, two linked tasks, and claim the first in one atomic JS call
   flowsk code -e '
@@ -235,8 +238,8 @@ database transaction (rolling back automatically on error or --dry-run).`,
     const t2 = flowsk.tasks.create({ title: "Wire CLI search", objective: g.key, dependsOn: [t1.key] });
     return flowsk.tasks.claim(t1.key, 1800);
   '`,
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if err := ctx.Err(); err != nil {
 				return fmt.Errorf("code context canceled: %w", err)
@@ -244,7 +247,24 @@ database transaction (rolling back automatically on error or --dry-run).`,
 			if client == nil {
 				return ErrNotImplemented
 			}
-			script, err := readExclusiveTextInput(cmd.InOrStdin(), evalCode, codeFile, stdin, "JavaScript code")
+			inlineSources := 0
+			inlineSnippet := ""
+			if evalCode != "" {
+				inlineSources++
+				inlineSnippet = evalCode
+			}
+			if commandCode != "" {
+				inlineSources++
+				inlineSnippet = commandCode
+			}
+			if len(args) == 1 && args[0] != "" {
+				inlineSources++
+				inlineSnippet = args[0]
+			}
+			if inlineSources > 1 {
+				return errors.New("ambiguous JavaScript code input: specify only one of -e/--eval, -c/--command, or positional [script]")
+			}
+			script, err := readExclusiveTextInput(cmd.InOrStdin(), inlineSnippet, codeFile, stdin, "JavaScript code")
 			if err != nil {
 				return err
 			}
@@ -267,6 +287,7 @@ database transaction (rolling back automatically on error or --dry-run).`,
 
 	flags := cmd.Flags()
 	flags.StringVarP(&evalCode, "eval", "e", "", "Inline ES6 JavaScript snippet to execute against `flowsk.*`")
+	flags.StringVarP(&commandCode, "command", "c", "", "Inline ES6 JavaScript snippet to execute (alias for --eval / -e)")
 	flags.StringVarP(&codeFile, "file", "f", "", "Local path to a .js script file (read locally; path never sent to server)")
 	flags.BoolVar(&stdin, "stdin", false, "Read JavaScript code from standard input")
 	flags.BoolVar(&dryRun, "dry-run", false, "Simulate execution in a rolled-back transaction without persisting changes")

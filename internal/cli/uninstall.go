@@ -82,9 +82,9 @@ func NewUninstallTUIModel(statuses []skill.ProviderStatus, preselectedSkillIDs, 
 			}
 		}
 	} else {
-		// Default: pre-select every provider whose MCP config currently mentions flowsk.
+		// Default: pre-select every provider whose primary or secondary MCP config currently mentions flowsk.
 		for _, st := range mcpStatuses {
-			if st.MCPConfigured {
+			if st.MCPConfigured || len(st.SyncedMCPPaths) > 0 {
 				selectedMCP[st.Target.ID] = true
 			}
 		}

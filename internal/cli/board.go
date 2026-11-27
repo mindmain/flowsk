@@ -433,7 +433,7 @@ func computeProjectStateCounts(items []TaskSummaryView) ProjectStateCountsView {
 			c.Done++
 		case cat == "canceled" || cat == "cancelled" || st == "canceled" || st == "cancelled":
 			c.Canceled++
-		case cat == "blocked" || st == "blocked" || t.Blocked:
+		case cat == "blocked" || st == "blocked":
 			c.Blocked++
 		case cat == "backlog" || cat == "triage" || st == "backlog" || st == "triage":
 			c.Backlog++

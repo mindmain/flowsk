@@ -311,7 +311,7 @@ func (s *ServiceSkeleton) CreateTask(ctx context.Context, in CreateTaskInput) (T
 	if !isValidPriority(in.Priority) {
 		violations = append(violations, errs.FieldViolation{
 			Field:       "priority",
-			Description: "priority must be between 0 (Critical) and 3 (Low)",
+			Description: "priority must be between 0 (None) and 4 (Low)",
 		})
 	}
 	criteria, critViolation := sanitizeStringSlice(in.AcceptanceCriteria, "acceptance_criteria")
@@ -685,7 +685,7 @@ func (s *ServiceSkeleton) UpdateTask(ctx context.Context, in UpdateTaskInput) (T
 	if in.Priority != nil && !isValidPriority(*in.Priority) {
 		violations = append(violations, errs.FieldViolation{
 			Field:       "priority",
-			Description: "priority must be between 0 (Critical) and 3 (Low)",
+			Description: "priority must be between 0 (None) and 4 (Low)",
 		})
 	}
 	var nextCriteria []string
@@ -1962,7 +1962,7 @@ func isValidKind(k Kind) bool {
 }
 
 func isValidPriority(p Priority) bool {
-	return p >= PriorityCritical && p <= PriorityLow
+	return p >= PriorityNone && p <= PriorityLow
 }
 
 func isValidCommentKind(k CommentKind) bool {

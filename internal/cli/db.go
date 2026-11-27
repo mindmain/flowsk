@@ -40,8 +40,10 @@ func newDBCommand(v *viper.Viper, opts *GlobalOptions, deps dbCommandDeps) *cobr
 		formatter = deps.OutputFormatter()
 	}
 	dbCmd := &cobra.Command{
-		Use:   "db",
-		Short: "Run reversible Goose database migrations and health checks (SQLite / PostgreSQL)",
+		Use:                        "db",
+		Short:                      "Run reversible Goose database migrations and health checks (SQLite / PostgreSQL)",
+		SuggestionsMinimumDistance: 2,
+		RunE:                       subcommandGroupRunE,
 		Long: `Administers Flowsk persistence backends supporting seamless switching between
 local/shared-volume pure-Go SQLite and shared office PostgreSQL.`,
 	}
@@ -99,8 +101,10 @@ func (h *dbHandler) resolveDriverAndDSN() (string, string, error) {
 
 func (h *dbHandler) newMigrateSubcommand() *cobra.Command {
 	migrateCmd := &cobra.Command{
-		Use:   "migrate",
-		Short: "Apply, roll back, or inspect Goose SQL migrations",
+		Use:                        "migrate",
+		Short:                      "Apply, roll back, or inspect Goose SQL migrations",
+		SuggestionsMinimumDistance: 2,
+		RunE:                       subcommandGroupRunE,
 	}
 
 	var targetVersion int64

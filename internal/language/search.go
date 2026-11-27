@@ -186,17 +186,20 @@ func NormalizeStatusToken(raw string) (task.Status, bool) {
 	}
 }
 
-// NormalizePriorityToken maps human/AI priority names or numbers ("urgent"/"0",
-// "high"/"1", "medium"/"2", "low"/"3") to canonical domain task.Priority values.
+// NormalizePriorityToken maps human/AI priority names or numbers ("none"/"p0"/"0",
+// "urgent"/"critical"/"p1"/"1", "high"/"p2"/"2", "medium"/"normal"/"p3"/"3",
+// "low"/"p4"/"4") to canonical unified domain task.Priority values (0..4).
 func NormalizePriorityToken(raw string) (task.Priority, bool) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "critical", "urgent", "p0", "0":
-		return task.PriorityCritical, true
-	case "high", "p1", "1":
+	case "none", "unprioritized", "p0", "0":
+		return task.PriorityNone, true
+	case "critical", "urgent", "p1", "1":
+		return task.PriorityUrgent, true
+	case "high", "p2", "2":
 		return task.PriorityHigh, true
-	case "medium", "normal", "p2", "2":
+	case "medium", "normal", "p3", "3":
 		return task.PriorityMedium, true
-	case "low", "p3", "p4", "3", "4":
+	case "low", "p4", "4":
 		return task.PriorityLow, true
 	default:
 		return 0, false
@@ -219,12 +222,13 @@ declare const flowsk: {
     unbind(parentKey: string, childKey: string): { parentKey: string; childKey: string; removed: boolean };
     bindings(): ProjectBinding[];
     getDoc(slugOrKey?: string): { id: string; key: string; slug: string; markdown: string; hasMarkdownDoc: boolean };
+    setDoc(markdown: string): Project;
     setDoc(slugOrKey: string, markdown: string): Project;
     deleteDoc(slugOrKey?: string): Project;
   };
   goals: { // alias: flowsk.objectives
     list(filter?: string): Goal[];
-    create(in: { title: string; project?: string; kind?: "goal" | "milestone" | "cycle"; status?: "planned" | "active" | "at_risk"; slug?: string; summary?: string; priority?: number | "urgent" | "high" | "medium" | "low"; targetDate?: string; successCriteria?: string[] }): Goal;
+    create(in: { title: string; project?: string; kind?: "goal" | "milestone" | "cycle"; status?: "planned" | "active" | "at_risk"; slug?: string; summary?: string; priority?: 0 | 1 | 2 | 3 | 4 | "none" | "urgent" | "high" | "medium" | "low"; targetDate?: string; successCriteria?: string[] }): Goal;
     update(slugOrId: string, patch: { title?: string; kind?: "goal" | "milestone" | "cycle"; status?: "planned" | "active" | "at_risk" | "achieved" | "dropped"; summary?: string; priority?: number | string; targetDate?: string | null; successCriteria?: string[] }): Goal;
     close(slugOrId: string, note?: string): Goal;
   };
@@ -235,8 +239,8 @@ declare const flowsk: {
     next(opts?: { claim?: boolean; ttlSeconds?: number }): TaskDetail | null;
     get(keyOrId: string): TaskDetail;
     getByExternal(externalId: string, project?: string): TaskDetail | null;
-    create(in: { title: string; project?: string; kind?: "epic" | "feature" | "bug" | "chore" | "research"; externalId?: string; description?: string; markdown?: string; priority?: number | "urgent" | "high" | "medium" | "low"; state?: string; objective?: string; parent?: string; tags?: string[]; dependsOn?: string[]; acceptance?: string | string[] }): TaskDetail;
-    upsertExternal(in: { externalId: string; project?: string; kind?: "epic" | "feature" | "bug" | "chore" | "research"; title: string; description?: string; markdown?: string; priority?: number | "urgent" | "high" | "medium" | "low"; state?: string; objective?: string; parent?: string; tags?: string[]; dependsOn?: string[]; acceptance?: string | string[] }): TaskDetail;
+    create(in: { title: string; project?: string; kind?: "epic" | "feature" | "bug" | "chore" | "research"; externalId?: string; description?: string; markdown?: string; priority?: 0 | 1 | 2 | 3 | 4 | "none" | "urgent" | "high" | "medium" | "low"; state?: string; objective?: string; parent?: string; tags?: string[]; dependsOn?: string[]; acceptance?: string | string[] }): TaskDetail;
+    upsertExternal(in: { externalId: string; project?: string; kind?: "epic" | "feature" | "bug" | "chore" | "research"; title: string; description?: string; markdown?: string; priority?: 0 | 1 | 2 | 3 | 4 | "none" | "urgent" | "high" | "medium" | "low"; state?: string; objective?: string; parent?: string; tags?: string[]; dependsOn?: string[]; acceptance?: string | string[] }): TaskDetail;
     update(keyOrId: string, patch: { title?: string; kind?: string; externalId?: string; description?: string; markdown?: string; priority?: number | string; tags?: string[]; acceptance?: string | string[]; objective?: string; parent?: string }): TaskDetail;
     claim(keyOrId: string, ttlSeconds?: number): TaskDetail;
     release(keyOrId: string, opts?: { state?: string; note?: string }): TaskDetail;
@@ -322,9 +326,9 @@ func CodeModeSDKCatalog() []SDKMethodDoc {
 		{
 			Name:      "flowsk.projects.setDoc",
 			Category:  "projects",
-			Signature: "flowsk.projects.setDoc(slugOrKey: string, markdown: string): Project",
-			Summary:   "Creates or updates the extended Markdown charter (<project_id>.md) inside ~/.flowsk/projects.",
-			Example:   `flowsk.projects.setDoc("CORE", "# Core Platform Charter\n\nStrict 3-layer architecture.");`,
+			Signature: "flowsk.projects.setDoc(markdown: string): Project | flowsk.projects.setDoc(slugOrKey: string, markdown: string): Project",
+			Summary:   "Creates or updates the extended Markdown charter (<project_id>.md) for the active session project (1 arg) or an explicit project key/slug (2 args).",
+			Example:   `flowsk.projects.setDoc("# Core Platform Charter\n\nStrict 3-layer architecture.");`,
 		},
 		{
 			Name:      "flowsk.projects.deleteDoc",
@@ -456,7 +460,7 @@ func CodeModeSDKCatalog() []SDKMethodDoc {
 			Name:      "flowsk.tasks.block",
 			Category:  "tasks",
 			Signature: "flowsk.tasks.block(keyOrId: string, reasonOrOpts: string | { by?: string[], reason?: string }, by?: string[]): TaskDetail",
-			Summary:   "Adds DAG-validated upstream blocker dependencies, records a blocker reason, and transitions the task to blocked.",
+			Summary:   "Adds DAG-validated upstream blocker dependencies (keeping the task in its workflow column with blocked=true) or transitions to blocked when no 'by' tasks are given.",
 			Example:   `flowsk.tasks.block("FLW-3", { by: ["FLW-2"], reason: "Needs RPC handler" });`,
 		},
 		{

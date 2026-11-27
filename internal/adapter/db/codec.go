@@ -378,8 +378,11 @@ type TaskMeta struct {
 	// DomainKind preserves exact task.Kind (including 'chore' and 'research').
 	DomainKind task.Kind `json:"domain_kind,omitempty"`
 
-	// DomainPriority preserves exact task.Priority (0..3).
+	// DomainPriority preserves exact task.Priority (0=None, 1=Urgent..4=Low when PriorityScale >= 2).
 	DomainPriority task.Priority `json:"domain_priority"`
+
+	// PriorityScale identifies the DomainPriority encoding version (0/1 = legacy 0..3, 2 = unified 0..4).
+	PriorityScale int `json:"priority_scale,omitempty"`
 
 	// Tags preserves Task.Tags.
 	Tags []string `json:"tags,omitempty"`
@@ -412,6 +415,7 @@ func EncodeTaskDescription(t task.Task, version int64) string {
 	meta := TaskMeta{
 		DomainKind:         t.Kind,
 		DomainPriority:     t.Priority,
+		PriorityScale:      2,
 		Tags:               t.TagsCopy(),
 		Labels:             t.LabelsCopy(),
 		Version:            version,
@@ -423,18 +427,32 @@ func EncodeTaskDescription(t task.Task, version int64) string {
 	return encodeEnvelope(t.Description, meta, false)
 }
 
-// DecodeTaskDescription unpacks Task Description and TaskMeta (falling back cleanly for raw rows).
+// DecodeTaskDescription unpacks Task Description and TaskMeta, transparently upgrading
+// legacy 0-based v1 envelopes (`PriorityScale < 2`) and raw SQL rows onto the unified 0..4 scale.
 func DecodeTaskDescription(raw, sqlKind string, sqlPriority int32, hasObj, hasParent, hasAssignee bool) (string, TaskMeta) {
 	text, meta, ok := decodeEnvelope[TaskMeta](raw)
 	if ok {
 		if meta.Version <= 0 {
 			meta.Version = 1
 		}
+		if meta.PriorityScale < 2 {
+			switch {
+			case sqlPriority == 0:
+				meta.DomainPriority = task.PriorityNone
+			case meta.DomainPriority >= 0 && meta.DomainPriority <= 3:
+				meta.DomainPriority = meta.DomainPriority + 1
+			case sqlPriority >= 1 && sqlPriority <= 4:
+				meta.DomainPriority = task.Priority(sqlPriority)
+			default:
+				meta.DomainPriority = task.PriorityMedium
+			}
+			meta.PriorityScale = 2
+		}
 		return text, meta
 	}
 	domainPrio := task.PriorityMedium
-	if sqlPriority >= 1 && sqlPriority <= 4 {
-		domainPrio = task.Priority(sqlPriority - 1)
+	if sqlPriority >= 0 && sqlPriority <= 4 {
+		domainPrio = task.Priority(sqlPriority)
 	}
 	domainKind := task.Kind(sqlKind)
 	if sqlKind == "task" || sqlKind == "issue" {
@@ -443,6 +461,7 @@ func DecodeTaskDescription(raw, sqlKind string, sqlPriority int32, hasObj, hasPa
 	return raw, TaskMeta{
 		DomainKind:         domainKind,
 		DomainPriority:     domainPrio,
+		PriorityScale:      2,
 		Version:            1,
 		HasObjectiveID:     hasObj,
 		HasParentTaskID:    hasParent,
@@ -496,16 +515,15 @@ func SQLTaskKind(k task.Kind) string {
 	}
 }
 
-// SQLTaskPriority maps domain `task.Priority` (0=Critical..3=Low) onto SQL `tasks.priority` (1..4).
+// SQLTaskPriority maps domain `task.Priority` (0=None, 1=Urgent..4=Low) 1:1 onto SQL `tasks.priority` (0..4).
 func SQLTaskPriority(p task.Priority) int32 {
-	mapped := int32(p) + 1
-	if mapped < 1 {
-		return 1
+	if p < task.PriorityNone {
+		return int32(task.PriorityNone)
 	}
-	if mapped > 4 {
-		return 4
+	if p > task.PriorityLow {
+		return int32(task.PriorityLow)
 	}
-	return mapped
+	return int32(p)
 }
 
 // ParseTrailingSequence extracts the positive numeric suffix from a task key (e.g. "FLW-104" -> 104).
@@ -854,7 +872,7 @@ func FilterAndSortCompactQueue(
 		if len(filter.Statuses) > 0 && !slices.Contains(filter.Statuses, t.Status) {
 			continue
 		}
-		if filter.MaxPriority != nil && t.Priority > *filter.MaxPriority {
+		if filter.MaxPriority != nil && t.Priority.SortOrder() > (*filter.MaxPriority).SortOrder() {
 			continue
 		}
 		if filter.OnlyUnblocked && t.UnresolvedBlockerCount > 0 {
@@ -933,7 +951,7 @@ func FilterAndSortCompactQueue(
 		createdMap[t.ID] = t.CreatedAt
 	}
 	slices.SortFunc(out, func(a, b task.CompactTaskSummary) int {
-		if c := cmp.Compare(a.Priority, b.Priority); c != 0 {
+		if c := cmp.Compare(a.Priority.SortOrder(), b.Priority.SortOrder()); c != 0 {
 			return c
 		}
 		ca, cb := createdMap[a.ID], createdMap[b.ID]

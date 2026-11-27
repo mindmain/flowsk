@@ -480,6 +480,8 @@ func formatSkillTUIBadge(st skill.ProviderStatus) string {
 
 func formatMCPTUIBadge(st skill.ProviderStatus) string {
 	switch {
+	case st.MCPConfigured && len(st.UnsyncedMCPPaths) > 0:
+		return tuiWarnStyle.Render(fmt.Sprintf("↻ mcp sync needed (%d profile)", len(st.UnsyncedMCPPaths)))
 	case st.MCPConfigured:
 		return tuiOKStyle.Render("✓ mcp configured")
 	case st.Target.ID == skill.ProviderAgents:
@@ -633,12 +635,13 @@ Default selections:
 					out.MCPUnchangedCount++
 				}
 				out.MCPItems = append(out.MCPItems, MCPInstallItemView{
-					ProviderID:   mcpTarget.ID,
-					ProviderName: mcpTarget.Name,
-					ConfigPath:   mRes.ConfigPath,
-					Command:      mRes.Command,
-					Args:         mRes.Args,
-					Action:       mRes.Action,
+					ProviderID:           mcpTarget.ID,
+					ProviderName:         mcpTarget.Name,
+					ConfigPath:           mRes.ConfigPath,
+					SyncedSecondaryPaths: mRes.SyncedSecondaryPaths,
+					Command:              mRes.Command,
+					Args:                 mRes.Args,
+					Action:               mRes.Action,
 				})
 			}
 
@@ -762,6 +765,9 @@ func renderHumanInstallSkill(w io.Writer, v InstallSkillView) error {
 			v.MCPInstalledCount, v.MCPUpdatedCount, v.MCPUnchangedCount)
 		for _, m := range v.MCPItems {
 			fmt.Fprintf(&b, "  %s  %-28s  %s\n", renderInstallActionBadge(m.Action), m.ProviderName, tuiMutedStyle.Render(m.ConfigPath))
+			for _, sp := range m.SyncedSecondaryPaths {
+				fmt.Fprintf(&b, "                %-28s  %s\n", tuiInfoStyle.Render("↳ synced profile"), tuiMutedStyle.Render(sp))
+			}
 		}
 	}
 

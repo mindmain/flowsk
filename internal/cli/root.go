@@ -46,8 +46,10 @@ Core Capabilities:
     inside your Git repository and NEVER transmits host filesystem paths to any
     server. Per-machine directory bindings live exclusively inside
     ~/.flowsk/local_paths.json.`,
-		SilenceUsage:  true,
-		SilenceErrors: true,
+		SilenceUsage:               true,
+		SilenceErrors:              true,
+		SuggestionsMinimumDistance: 2,
+		RunE:                       subcommandGroupRunE,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			if err := cmd.Context().Err(); err != nil {
 				return fmt.Errorf("context canceled: %w", err)
@@ -96,11 +98,11 @@ func isConfigBootstrapCommand(cmd *cobra.Command) bool {
 	}
 	parent := cmd.Parent()
 	if parent == nil {
-		return false
+		return true
 	}
 	if parent.Parent() == nil {
 		switch cmd.Name() {
-		case "install", "uninstall", "doctor", "update":
+		case "install", "uninstall", "doctor", "update", "config":
 			return true
 		}
 	}

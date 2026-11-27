@@ -40,8 +40,10 @@ func newAuditCommand(opts *GlobalOptions, deps auditCommandDeps) *cobra.Command 
 	}
 
 	auditCmd := &cobra.Command{
-		Use:   "audit",
-		Short: "Inspect immutable workspace-scoped mutation audit events",
+		Use:                        "audit",
+		Short:                      "Inspect immutable workspace-scoped mutation audit events",
+		SuggestionsMinimumDistance: 2,
+		RunE:                       subcommandGroupRunE,
 		Long: `Queries the append-only audit trail recorded atomically alongside every
 workspace, project, objective, task, claim, and Code Mode JavaScript mutation.`,
 	}
@@ -113,8 +115,9 @@ func (h *auditHandler) newListSubcommand() *cobra.Command {
 
 func (h *auditHandler) newGetSubcommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "get <audit-event-id>",
-		Short: "Inspect a single immutable audit event and its structured diff metadata",
+		Use:     "get <audit-event-id>",
+		Aliases: []string{"show", "view"},
+		Short:   "Inspect a single immutable audit event and its structured diff metadata",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()

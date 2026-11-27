@@ -1058,7 +1058,7 @@ func (e *inMemoryEnv) NextTask(_ context.Context, in cli.NextTaskInput) (cli.Nex
 				continue
 			}
 		}
-		if best == nil || tv.Priority < best.Priority {
+		if best == nil || cliPrioritySortRank(tv.Priority) < cliPrioritySortRank(best.Priority) {
 			best = tv
 		}
 	}
@@ -1079,6 +1079,13 @@ func (e *inMemoryEnv) NextTask(_ context.Context, in cli.NextTaskInput) (cli.Nex
 	}
 	copied := *best
 	return cli.NextTaskResult{Task: &copied, Claimed: claimed}, nil
+}
+
+func cliPrioritySortRank(p int) int {
+	if p >= 1 && p <= 4 {
+		return p
+	}
+	return 5
 }
 
 func (e *inMemoryEnv) Digest(_ context.Context, in cli.TaskDigestInput) (cli.ProjectDigestView, error) {
@@ -1494,19 +1501,19 @@ func TestWorkspaceProjectObjectiveTaskBoardAndAuditLifecycle(t *testing.T) {
 	}
 
 	// 4. Task lifecycle: create, subtasks, dependencies, claim, comment, move, block, unblock, next, digest.
-	out = mustExecCLI(t, env, "", "--actor", "claude-arch", "--format", "compact", "task", "create", "Build SQLite WAL store", "--objective", "CORE-O1", "--priority", "1", "--label", "storage", "--acceptance", "go test -race green")
+	out = mustExecCLI(t, env, "", "--actor", "claude-arch", "--format", "compact", "task", "create", "Build SQLite WAL store", "--objective", "CORE-O1", "--priority", "2", "--label", "storage", "--acceptance", "go test -race green")
 	if !strings.Contains(out, "CORE-1") {
 		t.Fatalf("expected CORE-1 in task create compact output: %s", out)
 	}
 
-	out = mustExecCLI(t, env, "", "--actor", "claude-arch", "--format", "compact", "task", "create", "Wire ConnectRPC server", "--objective", "CORE-O1", "--parent", "CORE-1", "--priority", "2", "--depends-on", "CORE-1")
+	out = mustExecCLI(t, env, "", "--actor", "claude-arch", "--format", "compact", "task", "create", "Wire ConnectRPC server", "--objective", "CORE-O1", "--parent", "CORE-1", "--priority", "3", "--depends-on", "CORE-1")
 	if !strings.Contains(out, "CORE-2") {
 		t.Fatalf("expected CORE-2 in task create output: %s", out)
 	}
 
-	mustExecCLI(t, env, "", "--actor", "claude-arch", "--format", "compact", "task", "create", "Write CLI renderers", "--objective", "CORE-O1", "--priority", "0", "--label", "cli")
+	mustExecCLI(t, env, "", "--actor", "claude-arch", "--format", "compact", "task", "create", "Write CLI renderers", "--objective", "CORE-O1", "--priority", "1", "--label", "cli")
 
-	// `task next` without --claim selects highest-priority unblocked task (CORE-3, P0).
+	// `task next` without --claim selects highest-priority unblocked task (CORE-3, P1 urgent).
 	out = mustExecCLI(t, env, "", "--format", "compact", "task", "next")
 	if !strings.Contains(out, "CORE-3") {
 		t.Fatalf("expected CORE-3 from task next, got: %s", out)
@@ -1820,6 +1827,46 @@ func TestCodeModeDBConfigMCPAndServeCommands(t *testing.T) {
 	statusClean := mustExecCLI(t, env, "", "--format", "human", "status", "--all")
 	if strings.Contains(statusClean, "orphan") {
 		t.Fatalf("expected zero orphan warning after prune, got:\n%s", statusClean)
+	}
+
+	// 6. Agent CLI ergonomics: `code -c`, positional `code [script]`, `goal create --slug --success-criteria`, `task show`, `task done`, and unknown subcommand rejection.
+	codeShortOut := mustExecCLI(t, env, "", "code", "-c", "return 42;")
+	if !strings.Contains(codeShortOut, "COMMITTED") || env.lastExecScriptIn.Script != "return 42;" {
+		t.Fatalf("expected `flowsk code -c` to execute inline script 'return 42;', got script=%q out=%q", env.lastExecScriptIn.Script, codeShortOut)
+	}
+	mustExecCLI(t, env, "", "code", "return 99;")
+	if env.lastExecScriptIn.Script != "return 99;" {
+		t.Fatalf("expected positional `flowsk code [script]` to execute 'return 99;', got script=%q", env.lastExecScriptIn.Script)
+	}
+	if _, _, ambErr := execCLI(t, env, "", "code", "-e", "return 1;", "-c", "return 2;"); ambErr == nil {
+		t.Fatal("expected error when both -e and -c are provided")
+	}
+	goalErgOut := mustExecCLI(t, env, "", "--project", "CORE", "--format", "json", "goal", "create", "Ergonomic Goal", "--slug", "ergo-goal", "--priority", "1", "--success-criteria", "Pass gate A", "--success-criteria", "Pass gate B")
+	if !strings.Contains(goalErgOut, "Ergonomic Goal") {
+		t.Fatalf("unexpected goal create output: %s", goalErgOut)
+	}
+	createdTaskJSON := mustExecCLI(t, env, "", "--project", "WEBUI", "--format", "json", "task", "create", "Close via done alias", "--priority", "1")
+	var createdTask cli.TaskView
+	if err := json.Unmarshal([]byte(createdTaskJSON), &createdTask); err != nil || createdTask.Key == "" {
+		t.Fatalf("failed to parse created task JSON %q: %v", createdTaskJSON, err)
+	}
+	showOut := mustExecCLI(t, env, "", "--project", "WEBUI", "--format", "compact", "task", "show", createdTask.Key)
+	if !strings.Contains(showOut, createdTask.Key) {
+		t.Fatalf("expected `flowsk task show` alias to return %s, got: %q", createdTask.Key, showOut)
+	}
+	doneOut := mustExecCLI(t, env, "", "--project", "WEBUI", "--format", "compact", "task", "done", createdTask.Key, "--note", "Shipped")
+	if !strings.Contains(strings.ToLower(doneOut), "done") || !strings.Contains(doneOut, "P1") {
+		t.Fatalf("expected `flowsk task done` to transition %s to done with P1, got: %q", createdTask.Key, doneOut)
+	}
+	for _, unknownCmd := range [][]string{
+		{"bogus-root"},
+		{"task", "nonexistent-subcmd"},
+		{"goal", "nonexistent-subcmd"},
+		{"project", "nonexistent-subcmd"},
+	} {
+		if _, _, uErr := execCLI(t, env, "", unknownCmd...); uErr == nil {
+			t.Fatalf("expected non-zero error for unknown command %v, got nil", unknownCmd)
+		}
 	}
 }
 

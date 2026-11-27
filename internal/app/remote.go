@@ -721,6 +721,7 @@ func (c *dualModeClient) remoteCreateObjective(ctx context.Context, opts cli.Glo
 			td = timestamppb.New(parsed.UTC())
 		}
 	}
+	prio := int32(max(0, in.Priority))
 	resp, err := sess.prov.ObjectiveClient().CreateObjective(sess.ctx, connect.NewRequest(&flowsk_objective_pb.CreateObjectiveRequest{
 		WorkspaceId:     sess.workspaceID.String(),
 		ActorId:         sess.actorID.String(),
@@ -728,8 +729,10 @@ func (c *dualModeClient) remoteCreateObjective(ctx context.Context, opts cli.Glo
 		Kind:            pbKind,
 		Status:          flowsk_objective_pb.ObjectiveStatus_OBJECTIVE_STATUS_ACTIVE,
 		Title:           in.Title,
+		Slug:            strings.TrimSpace(in.Slug),
 		Description:     in.Summary,
-		SuccessCriteria: in.Summary,
+		SuccessCriteria: strings.Join(in.SuccessCriteria, "\n"),
+		PriorityRank:    &prio,
 		TargetDate:      td,
 	}))
 	if err != nil {
@@ -803,12 +806,19 @@ func (c *dualModeClient) remoteUpdateObjective(ctx context.Context, opts cli.Glo
 		return cli.ObjectiveView{}, err
 	}
 	req := &flowsk_objective_pb.UpdateObjectiveRequest{
-		WorkspaceId:     sess.workspaceID.String(),
-		ActorId:         sess.actorID.String(),
-		ObjectiveId:     cur.ID,
-		Title:           in.Title,
-		Description:     in.Summary,
-		SuccessCriteria: in.Summary,
+		WorkspaceId: sess.workspaceID.String(),
+		ActorId:     sess.actorID.String(),
+		ObjectiveId: cur.ID,
+		Title:       in.Title,
+		Description: in.Summary,
+	}
+	if in.SuccessCriteria != nil {
+		joined := strings.Join(*in.SuccessCriteria, "\n")
+		req.SuccessCriteria = &joined
+	}
+	if in.Priority != nil {
+		pr := int32(max(0, *in.Priority))
+		req.PriorityRank = &pr
 	}
 	if in.Status != nil && strings.TrimSpace(*in.Status) != "" {
 		req.Status = mapCLIObjectiveStatusToProto(*in.Status)
@@ -1963,21 +1973,30 @@ func protoObjectiveToCLI(o *flowsk_objective_pb.Objective) cli.ObjectiveView {
 	if o.GetTargetDate() != nil {
 		td = o.GetTargetDate().AsTime().UTC().Format("2006-01-02")
 	}
+	var criteria []string
+	if strings.TrimSpace(o.GetSuccessCriteria()) != "" {
+		for _, line := range strings.Split(o.GetSuccessCriteria(), "\n") {
+			if trimmed := strings.TrimSpace(line); trimmed != "" {
+				criteria = append(criteria, trimmed)
+			}
+		}
+	}
 	return cli.ObjectiveView{
-		ID:             o.GetId(),
-		WorkspaceID:    o.GetWorkspaceId(),
-		ProjectID:      o.GetProjectId(),
-		Key:            slugifyIdentifier(o.GetTitle()),
-		Kind:           kind,
-		Title:          o.GetTitle(),
-		Summary:        o.GetDescription(),
-		Status:         status,
-		Priority:       1,
-		TargetDate:     td,
-		CompletedTasks: int(o.GetCompletedTaskCount()),
-		TotalTasks:     int(o.GetTotalTaskCount()),
-		CreatedAt:      o.GetCreatedAt().AsTime(),
-		UpdatedAt:      o.GetUpdatedAt().AsTime(),
+		ID:              o.GetId(),
+		WorkspaceID:     o.GetWorkspaceId(),
+		ProjectID:       o.GetProjectId(),
+		Key:             firstNonEmpty(o.GetSlug(), slugifyIdentifier(o.GetTitle())),
+		Kind:            kind,
+		Title:           o.GetTitle(),
+		Summary:         o.GetDescription(),
+		SuccessCriteria: criteria,
+		Status:          status,
+		Priority:        int(o.GetPriorityRank()),
+		TargetDate:      td,
+		CompletedTasks:  int(o.GetCompletedTaskCount()),
+		TotalTasks:      int(o.GetTotalTaskCount()),
+		CreatedAt:       o.GetCreatedAt().AsTime(),
+		UpdatedAt:       o.GetUpdatedAt().AsTime(),
 	}
 }
 
@@ -2251,11 +2270,13 @@ func protoCategoryToDisplayName(cat flowsk_project_pb.WorkflowStateCategory) str
 
 func mapCLIPriorityToProto(p int) flowsk_task_pb.TaskPriority {
 	switch p {
+	case 0:
+		return flowsk_task_pb.TaskPriority_TASK_PRIORITY_NONE
 	case 1:
 		return flowsk_task_pb.TaskPriority_TASK_PRIORITY_URGENT
 	case 2:
 		return flowsk_task_pb.TaskPriority_TASK_PRIORITY_HIGH
-	case 3, 0:
+	case 3:
 		return flowsk_task_pb.TaskPriority_TASK_PRIORITY_MEDIUM
 	default:
 		return flowsk_task_pb.TaskPriority_TASK_PRIORITY_LOW
@@ -2264,11 +2285,14 @@ func mapCLIPriorityToProto(p int) flowsk_task_pb.TaskPriority {
 
 func mapProtoPriorityToCLI(p flowsk_task_pb.TaskPriority) int {
 	switch p {
+	case flowsk_task_pb.TaskPriority_TASK_PRIORITY_NONE:
+		return 0
 	case flowsk_task_pb.TaskPriority_TASK_PRIORITY_URGENT:
 		return 1
 	case flowsk_task_pb.TaskPriority_TASK_PRIORITY_HIGH:
 		return 2
-	case flowsk_task_pb.TaskPriority_TASK_PRIORITY_MEDIUM:
+	case flowsk_task_pb.TaskPriority_TASK_PRIORITY_MEDIUM,
+		flowsk_task_pb.TaskPriority_TASK_PRIORITY_UNSPECIFIED:
 		return 3
 	default:
 		return 4

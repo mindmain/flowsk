@@ -456,8 +456,14 @@ type CreateObjectiveInput struct {
 	// Kind classifies the objective ("goal", "milestone", or "cycle").
 	Kind string `json:"kind"`
 
-	// Summary describes measurable outcome criteria.
+	// Slug optionally sets the explicit project-scoped URL/SDK slug (derived from Title when empty).
+	Slug string `json:"slug,omitempty"`
+
+	// Summary describes measurable outcome context.
 	Summary string `json:"summary,omitempty"`
+
+	// SuccessCriteria lists explicit verifiable Definition-of-Done checkpoints.
+	SuccessCriteria []string `json:"success_criteria,omitempty"`
 
 	// Priority ranks objective urgency (0..4).
 	Priority int `json:"priority"`
@@ -512,6 +518,9 @@ type UpdateObjectiveInput struct {
 
 	// Summary updates the outcome summary when non-nil.
 	Summary *string `json:"summary,omitempty"`
+
+	// SuccessCriteria replaces verifiable completion criteria when non-nil.
+	SuccessCriteria *[]string `json:"success_criteria,omitempty"`
 
 	// Status updates the lifecycle status when non-nil.
 	Status *string `json:"status,omitempty"`
@@ -573,6 +582,9 @@ type ObjectiveView struct {
 
 	// Summary explains the outcome criteria.
 	Summary string `json:"summary,omitempty"`
+
+	// SuccessCriteria lists verifiable completion checkpoints when present.
+	SuccessCriteria []string `json:"success_criteria,omitempty"`
 
 	// Status tracks current lifecycle state (planned, active, at_risk, completed, achieved, canceled, dropped).
 	Status string `json:"status"`
@@ -2035,6 +2047,9 @@ type MCPInstallItemView struct {
 	// ConfigPath is the configured MCP file path.
 	ConfigPath string `json:"config_path"`
 
+	// SyncedSecondaryPaths lists any secondary profile MCP config files synchronized alongside ConfigPath.
+	SyncedSecondaryPaths []string `json:"synced_secondary_paths,omitempty"`
+
 	// Command is the executable configured for `flowsk`.
 	Command string `json:"command"`
 
@@ -2174,6 +2189,10 @@ type DoctorSkillView struct {
 
 	// MCPConfigured reports whether the provider's MCP config mentions `flowsk`.
 	MCPConfigured bool `json:"mcp_configured"`
+
+	// UnsyncedMCPPaths lists secondary profile MCP config files (e.g. T3 Code Antigravity profiles)
+	// where `flowsk` is missing or out of sync when this provider is installed/configured.
+	UnsyncedMCPPaths []string `json:"unsynced_mcp_paths,omitempty"`
 }
 
 // DoctorReportView aggregates all diagnostic checks produced by `flowsk doctor`.

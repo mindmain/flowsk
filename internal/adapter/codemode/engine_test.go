@@ -300,6 +300,8 @@ func TestCodeModeEngine_MarkdownDocsAndGoalsLifecycle(t *testing.T) {
 			});
 			const updatedMs = flowsk.goals.update(ms.key, { status: "at_risk" });
 
+			// 1-arg flowsk.projects.setDoc(markdown) uses the active session project, and 2-arg explicit key also works.
+			flowsk.projects.setDoc("# Initial Charter");
 			flowsk.projects.setDoc("CORE", "# Core Architecture\n\nGo channels + SSE");
 			const t1 = flowsk.tasks.create({
 				title: "Implement Go channel EventBroker",
@@ -507,15 +509,38 @@ func TestCodeModeEngine_SDKParameterAndErrorFidelity(t *testing.T) {
 		t.Fatalf("expected ErrValidation for malformed targetDate, got: %v", badDateErr)
 	}
 
+	// Missing or undefined markdown arguments in setDoc must throw a TypeError and roll back!
+	for _, badDocScript := range []string{
+		`return flowsk.projects.setDoc();`,
+		`return flowsk.projects.setDoc("CORE", undefined);`,
+		`return flowsk.projects.setDoc(123);`,
+		`const t = flowsk.tasks.create({ title: "Doc Check" }); return flowsk.tasks.setDoc(t.key);`,
+		`const t = flowsk.tasks.create({ title: "Doc Check" }); return flowsk.tasks.setDoc(t.key, undefined);`,
+	} {
+		if _, badDocErr := eng.Execute(ctx, codemode.ExecuteInput{
+			WorkspaceID:      wsID,
+			DefaultProjectID: &projID,
+			Script:           badDocScript,
+		}); !errors.Is(badDocErr, errs.ErrValidation) {
+			t.Fatalf("expected ErrValidation (JS TypeError) for %q, got: %v", badDocScript, badDocErr)
+		}
+	}
+
 	res, err := eng.Execute(ctx, codemode.ExecuteInput{
 		WorkspaceID:      wsID,
 		DefaultProjectID: &projID,
 		Timeout:          20 * time.Second,
 		Script: `
-			// 1. Auto-generated project keys normalize safely.
+			// 1. Auto-generated project keys normalize safely, and priority scale (0..4) is unified across goals & tasks.
 			const p1 = flowsk.projects.create({ name: "v1-api" });
 			const p2 = flowsk.projects.create({ name: "123-svc" });
 			const p3 = flowsk.projects.create({ name: "x" });
+			const prioGoalNum = flowsk.goals.create({ title: "Numeric P1 Goal", priority: 1 });
+			const prioGoalStr = flowsk.goals.create({ title: "Urgent P1 Goal", priority: "urgent" });
+			const prioTaskNum = flowsk.tasks.create({ title: "Numeric P1 Task", priority: 1 });
+			const prioTaskP1 = flowsk.tasks.create({ title: "Token P1 Task", priority: "p1" });
+			const prioTaskUrg = flowsk.tasks.create({ title: "Urgent P1 Task", priority: "urgent" });
+			const prioTaskNone = flowsk.tasks.create({ title: "Unprioritized Task", priority: 0 });
 
 			// 2. Goals: omitted successCriteria stays empty, RFC3339 targetDate works, "" clears targetDate, [] clears criteria, close records note.
 			const g1 = flowsk.goals.create({
@@ -556,11 +581,14 @@ func TestCodeModeEngine_SDKParameterAndErrorFidelity(t *testing.T) {
 				acceptance: []
 			});
 
-			// 4. Selective block & unblock.
+			// 4. Selective dependency block & unblock (keeps workflow status "ready" with blocked=true) vs external impediment block (transitions to "blocked").
 			const target = flowsk.tasks.create({ title: "Target work", objective: g1.key });
 			const blockedTarget = flowsk.tasks.block(target.key, "Waiting on A and B", [depA.key, depB.key]);
 			const afterPartialUnblock = flowsk.tasks.unblock(target.key, [depA.key]);
 			const afterFullUnblock = flowsk.tasks.unblock(target.key, [depB.key]);
+			const impedimentTarget = flowsk.tasks.create({ title: "External Impediment", objective: g1.key });
+			const externallyBlocked = flowsk.tasks.block(impedimentTarget.key, "Waiting on third-party API credentials");
+			const externallyUnblocked = flowsk.tasks.unblock(impedimentTarget.key);
 
 			// 5. Ready limit, list limit, board options, and goals.close(note).
 			const readyLimited = flowsk.tasks.ready(2);
@@ -575,6 +603,7 @@ func TestCodeModeEngine_SDKParameterAndErrorFidelity(t *testing.T) {
 				p1Key: p1.key,
 				p2Key: p2.key,
 				p3Key: p3.key,
+				prioUnifiedOk: prioGoalNum.priority === 1 && prioGoalStr.priority === 1 && prioTaskNum.priority === 1 && prioTaskP1.priority === 1 && prioTaskUrg.priority === 1 && prioTaskNone.priority === 0,
 				g1InitialCriteriaLen,
 				g1InitialTarget,
 				g1ClearedTarget: g1WithCriteria.targetDate,
@@ -587,8 +616,12 @@ func TestCodeModeEngine_SDKParameterAndErrorFidelity(t *testing.T) {
 				extUpdatedTagsLen: extUpdated.tags.length,
 				extUpdatedAccLen: extUpdated.acceptance.length,
 				blockedStatus: blockedTarget.status,
-				partialUnblockStatus: afterPartialUnblock.status,
+				blockedFlag: blockedTarget.blocked,
+				partialUnblockBlocked: afterPartialUnblock.blocked,
+				fullUnblockBlocked: afterFullUnblock.blocked,
 				fullUnblockStatus: afterFullUnblock.status,
+				externalBlockedStatus: externallyBlocked.status,
+				externalUnblockedStatus: externallyUnblocked.status,
 				readyLen: readyLimited.length,
 				listLen: listLimited.length,
 				boardOpenCount: boardOpen.tasks.length,
@@ -613,8 +646,13 @@ func TestCodeModeEngine_SDKParameterAndErrorFidelity(t *testing.T) {
 		m["extUpdatedBlocked"] != true || m["extUpdatedTagsLen"] != int64(0) || m["extUpdatedAccLen"] != int64(0) {
 		t.Fatalf("unexpected upsertExternal behavior: %+v", m)
 	}
-	if m["blockedStatus"] != "blocked" || m["partialUnblockStatus"] != "blocked" || m["fullUnblockStatus"] != "ready" {
-		t.Fatalf("unexpected block/unblock transitions: blocked=%v partial=%v full=%v", m["blockedStatus"], m["partialUnblockStatus"], m["fullUnblockStatus"])
+	if m["prioUnifiedOk"] != true {
+		t.Fatalf("expected unified 0..4 priority scale across goals and tasks, got %+v", m)
+	}
+	if m["blockedStatus"] != "ready" || m["blockedFlag"] != true || m["partialUnblockBlocked"] != true ||
+		m["fullUnblockBlocked"] != false || m["fullUnblockStatus"] != "ready" ||
+		m["externalBlockedStatus"] != "blocked" || m["externalUnblockedStatus"] != "ready" {
+		t.Fatalf("unexpected block/unblock transitions: %+v", m)
 	}
 	if m["readyLen"] != int64(2) || m["listLen"] != int64(2) {
 		t.Fatalf("expected ready(2) and list({limit:2}) to return 2 items, got ready=%v list=%v", m["readyLen"], m["listLen"])

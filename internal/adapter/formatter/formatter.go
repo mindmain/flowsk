@@ -515,7 +515,9 @@ func renderProgressBar(completed, total int32, barWidth int) string {
 
 func priorityBadge(p task.Priority) string {
 	switch p {
-	case task.PriorityCritical:
+	case task.PriorityNone:
+		return "[NONE]"
+	case task.PriorityUrgent:
 		return "[URGENT]"
 	case task.PriorityHigh:
 		return "[HIGH]"

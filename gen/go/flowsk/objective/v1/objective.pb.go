@@ -185,7 +185,11 @@ type Objective struct {
 	// UTC timestamp when the objective was created.
 	CreatedAt *timestamppb.Timestamp `protobuf:"bytes,16,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
 	// UTC timestamp when the objective was last updated.
-	UpdatedAt     *timestamppb.Timestamp `protobuf:"bytes,17,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	UpdatedAt *timestamppb.Timestamp `protobuf:"bytes,17,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	// Project-scoped short URL and Code Mode SDK slug (for example, "q4-zero-copy-sync").
+	Slug string `protobuf:"bytes,18,opt,name=slug,proto3" json:"slug,omitempty"`
+	// Relative priority rank within the project (0 = none, 1 = urgent .. 4 = low).
+	PriorityRank  int32 `protobuf:"varint,19,opt,name=priority_rank,json=priorityRank,proto3" json:"priority_rank,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -339,6 +343,20 @@ func (x *Objective) GetUpdatedAt() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *Objective) GetSlug() string {
+	if x != nil {
+		return x.Slug
+	}
+	return ""
+}
+
+func (x *Objective) GetPriorityRank() int32 {
+	if x != nil {
+		return x.PriorityRank
+	}
+	return 0
+}
+
 // CreateObjectiveRequest contains fields to create a new Objective.
 type CreateObjectiveRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -363,7 +381,11 @@ type CreateObjectiveRequest struct {
 	// Optional planned start timestamp.
 	StartDate *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=start_date,json=startDate,proto3" json:"start_date,omitempty"`
 	// Optional target completion timestamp.
-	TargetDate    *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=target_date,json=targetDate,proto3" json:"target_date,omitempty"`
+	TargetDate *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=target_date,json=targetDate,proto3" json:"target_date,omitempty"`
+	// Optional project-scoped slug; when empty, derived automatically from title.
+	Slug string `protobuf:"bytes,12,opt,name=slug,proto3" json:"slug,omitempty"`
+	// Optional relative priority rank (0 = none, 1 = urgent .. 4 = low; defaults to 2 when omitted).
+	PriorityRank  *int32 `protobuf:"varint,13,opt,name=priority_rank,json=priorityRank,proto3,oneof" json:"priority_rank,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -473,6 +495,20 @@ func (x *CreateObjectiveRequest) GetTargetDate() *timestamppb.Timestamp {
 		return x.TargetDate
 	}
 	return nil
+}
+
+func (x *CreateObjectiveRequest) GetSlug() string {
+	if x != nil {
+		return x.Slug
+	}
+	return ""
+}
+
+func (x *CreateObjectiveRequest) GetPriorityRank() int32 {
+	if x != nil && x.PriorityRank != nil {
+		return *x.PriorityRank
+	}
+	return 0
 }
 
 // CreateObjectiveResponse wraps the newly created objective.
@@ -813,8 +849,12 @@ type UpdateObjectiveRequest struct {
 	TargetDate *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=target_date,json=targetDate,proto3" json:"target_date,omitempty"`
 	// When true, clears target_date back to unset.
 	ClearTargetDate bool `protobuf:"varint,12,opt,name=clear_target_date,json=clearTargetDate,proto3" json:"clear_target_date,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Optional updated relative priority rank (0 = none, 1 = urgent .. 4 = low).
+	PriorityRank *int32 `protobuf:"varint,13,opt,name=priority_rank,json=priorityRank,proto3,oneof" json:"priority_rank,omitempty"`
+	// Optional updated objective classification (UNSPECIFIED leaves kind unchanged).
+	Kind          ObjectiveKind `protobuf:"varint,14,opt,name=kind,proto3,enum=flowsk.objective.v1.ObjectiveKind" json:"kind,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *UpdateObjectiveRequest) Reset() {
@@ -929,6 +969,20 @@ func (x *UpdateObjectiveRequest) GetClearTargetDate() bool {
 		return x.ClearTargetDate
 	}
 	return false
+}
+
+func (x *UpdateObjectiveRequest) GetPriorityRank() int32 {
+	if x != nil && x.PriorityRank != nil {
+		return *x.PriorityRank
+	}
+	return 0
+}
+
+func (x *UpdateObjectiveRequest) GetKind() ObjectiveKind {
+	if x != nil {
+		return x.Kind
+	}
+	return ObjectiveKind_OBJECTIVE_KIND_UNSPECIFIED
 }
 
 // UpdateObjectiveResponse wraps the updated objective entity.
@@ -1228,7 +1282,7 @@ var File_flowsk_objective_v1_objective_proto protoreflect.FileDescriptor
 
 const file_flowsk_objective_v1_objective_proto_rawDesc = "" +
 	"\n" +
-	"#flowsk/objective/v1/objective.proto\x12\x13flowsk.objective.v1\x1a\x1bbuf/validate/validate.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xa2\a\n" +
+	"#flowsk/objective/v1/objective.proto\x12\x13flowsk.objective.v1\x1a\x1bbuf/validate/validate.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xf0\a\n" +
 	"\tObjective\x12\x18\n" +
 	"\x02id\x18\x01 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\x02id\x12+\n" +
 	"\fworkspace_id\x18\x02 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\vworkspaceId\x12'\n" +
@@ -1255,8 +1309,10 @@ const file_flowsk_objective_v1_objective_proto_rawDesc = "" +
 	"\n" +
 	"created_at\x18\x10 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x129\n" +
 	"\n" +
-	"updated_at\x18\x11 \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAtB\x11\n" +
-	"\x0f_owner_actor_id\"\xe2\x04\n" +
+	"updated_at\x18\x11 \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x12\x1c\n" +
+	"\x04slug\x18\x12 \x01(\tB\b\xbaH\x05r\x03\x18\x80\x01R\x04slug\x12.\n" +
+	"\rpriority_rank\x18\x13 \x01(\x05B\t\xbaH\x06\x1a\x04\x18\x04(\x00R\fpriorityRankB\x11\n" +
+	"\x0f_owner_actor_id\"\xc7\x05\n" +
 	"\x16CreateObjectiveRequest\x12+\n" +
 	"\fworkspace_id\x18\x01 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\vworkspaceId\x12#\n" +
 	"\bactor_id\x18\x02 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\aactorId\x12'\n" +
@@ -1274,8 +1330,11 @@ const file_flowsk_objective_v1_objective_proto_rawDesc = "" +
 	"start_date\x18\n" +
 	" \x01(\v2\x1a.google.protobuf.TimestampR\tstartDate\x12;\n" +
 	"\vtarget_date\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"targetDateB\x11\n" +
-	"\x0f_owner_actor_id\"W\n" +
+	"targetDate\x12\x1c\n" +
+	"\x04slug\x18\f \x01(\tB\b\xbaH\x05r\x03\x18\x80\x01R\x04slug\x123\n" +
+	"\rpriority_rank\x18\r \x01(\x05B\t\xbaH\x06\x1a\x04\x18\x04(\x00H\x01R\fpriorityRank\x88\x01\x01B\x11\n" +
+	"\x0f_owner_actor_idB\x10\n" +
+	"\x0e_priority_rank\"W\n" +
 	"\x17CreateObjectiveResponse\x12<\n" +
 	"\tobjective\x18\x01 \x01(\v2\x1e.flowsk.objective.v1.ObjectiveR\tobjective\"\x94\x01\n" +
 	"\x13GetObjectiveRequest\x12+\n" +
@@ -1301,7 +1360,7 @@ const file_flowsk_objective_v1_objective_proto_rawDesc = "" +
 	"\n" +
 	"objectives\x18\x01 \x03(\v2\x1e.flowsk.objective.v1.ObjectiveR\n" +
 	"objectives\x12&\n" +
-	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xb8\x05\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xc1\x06\n" +
 	"\x16UpdateObjectiveRequest\x12+\n" +
 	"\fworkspace_id\x18\x01 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\vworkspaceId\x12#\n" +
 	"\bactor_id\x18\x02 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\aactorId\x12+\n" +
@@ -1318,11 +1377,14 @@ const file_flowsk_objective_v1_objective_proto_rawDesc = "" +
 	" \x01(\v2\x1a.google.protobuf.TimestampR\tstartDate\x12;\n" +
 	"\vtarget_date\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"targetDate\x12*\n" +
-	"\x11clear_target_date\x18\f \x01(\bR\x0fclearTargetDateB\b\n" +
+	"\x11clear_target_date\x18\f \x01(\bR\x0fclearTargetDate\x123\n" +
+	"\rpriority_rank\x18\r \x01(\x05B\t\xbaH\x06\x1a\x04\x18\x04(\x00H\x04R\fpriorityRank\x88\x01\x01\x12@\n" +
+	"\x04kind\x18\x0e \x01(\x0e2\".flowsk.objective.v1.ObjectiveKindB\b\xbaH\x05\x82\x01\x02\x10\x01R\x04kindB\b\n" +
 	"\x06_titleB\x0e\n" +
 	"\f_descriptionB\x13\n" +
 	"\x11_success_criteriaB\x11\n" +
-	"\x0f_owner_actor_id\"W\n" +
+	"\x0f_owner_actor_idB\x10\n" +
+	"\x0e_priority_rank\"W\n" +
 	"\x17UpdateObjectiveResponse\x12<\n" +
 	"\tobjective\x18\x01 \x01(\v2\x1e.flowsk.objective.v1.ObjectiveR\tobjective\"\xac\x02\n" +
 	"\x15CloseObjectiveRequest\x12+\n" +
@@ -1414,27 +1476,28 @@ var file_flowsk_objective_v1_objective_proto_depIdxs = []int32{
 	1,  // 16: flowsk.objective.v1.UpdateObjectiveRequest.status:type_name -> flowsk.objective.v1.ObjectiveStatus
 	15, // 17: flowsk.objective.v1.UpdateObjectiveRequest.start_date:type_name -> google.protobuf.Timestamp
 	15, // 18: flowsk.objective.v1.UpdateObjectiveRequest.target_date:type_name -> google.protobuf.Timestamp
-	2,  // 19: flowsk.objective.v1.UpdateObjectiveResponse.objective:type_name -> flowsk.objective.v1.Objective
-	1,  // 20: flowsk.objective.v1.CloseObjectiveRequest.terminal_status:type_name -> flowsk.objective.v1.ObjectiveStatus
-	2,  // 21: flowsk.objective.v1.CloseObjectiveResponse.objective:type_name -> flowsk.objective.v1.Objective
-	15, // 22: flowsk.objective.v1.DeleteObjectiveResponse.deleted_at:type_name -> google.protobuf.Timestamp
-	3,  // 23: flowsk.objective.v1.ObjectiveService.CreateObjective:input_type -> flowsk.objective.v1.CreateObjectiveRequest
-	5,  // 24: flowsk.objective.v1.ObjectiveService.GetObjective:input_type -> flowsk.objective.v1.GetObjectiveRequest
-	7,  // 25: flowsk.objective.v1.ObjectiveService.ListObjectives:input_type -> flowsk.objective.v1.ListObjectivesRequest
-	9,  // 26: flowsk.objective.v1.ObjectiveService.UpdateObjective:input_type -> flowsk.objective.v1.UpdateObjectiveRequest
-	11, // 27: flowsk.objective.v1.ObjectiveService.CloseObjective:input_type -> flowsk.objective.v1.CloseObjectiveRequest
-	13, // 28: flowsk.objective.v1.ObjectiveService.DeleteObjective:input_type -> flowsk.objective.v1.DeleteObjectiveRequest
-	4,  // 29: flowsk.objective.v1.ObjectiveService.CreateObjective:output_type -> flowsk.objective.v1.CreateObjectiveResponse
-	6,  // 30: flowsk.objective.v1.ObjectiveService.GetObjective:output_type -> flowsk.objective.v1.GetObjectiveResponse
-	8,  // 31: flowsk.objective.v1.ObjectiveService.ListObjectives:output_type -> flowsk.objective.v1.ListObjectivesResponse
-	10, // 32: flowsk.objective.v1.ObjectiveService.UpdateObjective:output_type -> flowsk.objective.v1.UpdateObjectiveResponse
-	12, // 33: flowsk.objective.v1.ObjectiveService.CloseObjective:output_type -> flowsk.objective.v1.CloseObjectiveResponse
-	14, // 34: flowsk.objective.v1.ObjectiveService.DeleteObjective:output_type -> flowsk.objective.v1.DeleteObjectiveResponse
-	29, // [29:35] is the sub-list for method output_type
-	23, // [23:29] is the sub-list for method input_type
-	23, // [23:23] is the sub-list for extension type_name
-	23, // [23:23] is the sub-list for extension extendee
-	0,  // [0:23] is the sub-list for field type_name
+	0,  // 19: flowsk.objective.v1.UpdateObjectiveRequest.kind:type_name -> flowsk.objective.v1.ObjectiveKind
+	2,  // 20: flowsk.objective.v1.UpdateObjectiveResponse.objective:type_name -> flowsk.objective.v1.Objective
+	1,  // 21: flowsk.objective.v1.CloseObjectiveRequest.terminal_status:type_name -> flowsk.objective.v1.ObjectiveStatus
+	2,  // 22: flowsk.objective.v1.CloseObjectiveResponse.objective:type_name -> flowsk.objective.v1.Objective
+	15, // 23: flowsk.objective.v1.DeleteObjectiveResponse.deleted_at:type_name -> google.protobuf.Timestamp
+	3,  // 24: flowsk.objective.v1.ObjectiveService.CreateObjective:input_type -> flowsk.objective.v1.CreateObjectiveRequest
+	5,  // 25: flowsk.objective.v1.ObjectiveService.GetObjective:input_type -> flowsk.objective.v1.GetObjectiveRequest
+	7,  // 26: flowsk.objective.v1.ObjectiveService.ListObjectives:input_type -> flowsk.objective.v1.ListObjectivesRequest
+	9,  // 27: flowsk.objective.v1.ObjectiveService.UpdateObjective:input_type -> flowsk.objective.v1.UpdateObjectiveRequest
+	11, // 28: flowsk.objective.v1.ObjectiveService.CloseObjective:input_type -> flowsk.objective.v1.CloseObjectiveRequest
+	13, // 29: flowsk.objective.v1.ObjectiveService.DeleteObjective:input_type -> flowsk.objective.v1.DeleteObjectiveRequest
+	4,  // 30: flowsk.objective.v1.ObjectiveService.CreateObjective:output_type -> flowsk.objective.v1.CreateObjectiveResponse
+	6,  // 31: flowsk.objective.v1.ObjectiveService.GetObjective:output_type -> flowsk.objective.v1.GetObjectiveResponse
+	8,  // 32: flowsk.objective.v1.ObjectiveService.ListObjectives:output_type -> flowsk.objective.v1.ListObjectivesResponse
+	10, // 33: flowsk.objective.v1.ObjectiveService.UpdateObjective:output_type -> flowsk.objective.v1.UpdateObjectiveResponse
+	12, // 34: flowsk.objective.v1.ObjectiveService.CloseObjective:output_type -> flowsk.objective.v1.CloseObjectiveResponse
+	14, // 35: flowsk.objective.v1.ObjectiveService.DeleteObjective:output_type -> flowsk.objective.v1.DeleteObjectiveResponse
+	30, // [30:36] is the sub-list for method output_type
+	24, // [24:30] is the sub-list for method input_type
+	24, // [24:24] is the sub-list for extension type_name
+	24, // [24:24] is the sub-list for extension extendee
+	0,  // [0:24] is the sub-list for field type_name
 }
 
 func init() { file_flowsk_objective_v1_objective_proto_init() }

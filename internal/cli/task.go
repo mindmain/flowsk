@@ -46,9 +46,11 @@ func newTaskCommand(opts *GlobalOptions, deps taskCommandDeps) *cobra.Command {
 	}
 
 	taskCmd := &cobra.Command{
-		Use:     "task",
-		Aliases: []string{"issue", "t"},
-		Short:   "Manage hierarchical tasks, atomic agent claims, blockers, comments, next-queue, and digests",
+		Use:                        "task",
+		Aliases:                    []string{"issue", "t"},
+		Short:                      "Manage hierarchical tasks, atomic agent claims, blockers, comments, next-queue, and digests",
+		SuggestionsMinimumDistance: 2,
+		RunE:                       subcommandGroupRunE,
 		Long: `Manages Linear-style tasks and subtasks optimized for multi-agent software engineering.
 
 Tip for AI Agents:
@@ -63,6 +65,7 @@ Tip for AI Agents:
 		h.newGetSubcommand(),
 		h.newUpdateSubcommand(),
 		h.newMoveSubcommand(),
+		h.newDoneSubcommand(),
 		h.newClaimSubcommand(),
 		h.newReleaseSubcommand(),
 		h.newBlockSubcommand(),
@@ -267,8 +270,9 @@ func (h *taskHandler) newGetSubcommand() *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "get <task-id-or-key>",
-		Short: "Fetch a task by UUID or key (e.g. CORE-42) in token-budgeted detail",
+		Use:     "get <task-id-or-key>",
+		Aliases: []string{"show", "view"},
+		Short:   "Fetch a task by UUID or key (e.g. CORE-42) in token-budgeted detail",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -460,6 +464,47 @@ func (h *taskHandler) newMoveSubcommand() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&note, "note", "", "Optional transition note recorded in audit trail")
+	return cmd
+}
+
+func (h *taskHandler) newDoneSubcommand() *cobra.Command {
+	var note string
+
+	cmd := &cobra.Command{
+		Use:     "done <task-id-or-key>",
+		Aliases: []string{"close", "complete"},
+		Short:   "Mark a task Done, record an optional completion note, and release any active lease",
+		Example: `  flowsk task done CORE-42 --note "Verified with task verify"`,
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("task done context canceled: %w", err)
+			}
+			if h.client == nil {
+				return ErrNotImplemented
+			}
+			ref := strings.TrimSpace(args[0])
+			if ref == "" {
+				return errors.New("task identifier must not be empty")
+			}
+			ws, proj := resolveOptionalProject(ctx, h.opts, h.localPaths)
+			tv, err := h.client.MoveTask(ctx, MoveTaskInput{
+				Workspace: ws,
+				Project:   proj,
+				Task:      ref,
+				State:     "done",
+				Note:      strings.TrimSpace(note),
+				Actor:     strings.TrimSpace(h.opts.Actor),
+			})
+			if err != nil {
+				return err
+			}
+			return renderPayload(cmd.OutOrStdout(), h.formatter, h.opts, tv)
+		},
+	}
+
+	cmd.Flags().StringVar(&note, "note", "", "Optional completion note recorded on the task")
 	return cmd
 }
 

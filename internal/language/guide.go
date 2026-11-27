@@ -235,6 +235,7 @@ const DefaultLanguageGuideMarkdown = "# Flowsk Cloudflare Code Mode — JavaScri
     unbind(parentKey: string, childKey: string): { parentKey: string; childKey: string; removed: boolean };
     bindings(): ProjectBinding[];
     getDoc(slugOrKey?: string): { id: string; key: string; slug: string; markdown: string; hasMarkdownDoc: boolean };
+    setDoc(markdown: string): Project;
     setDoc(slugOrKey: string, markdown: string): Project;
     deleteDoc(slugOrKey?: string): Project;
   };
@@ -247,7 +248,7 @@ const DefaultLanguageGuideMarkdown = "# Flowsk Cloudflare Code Mode — JavaScri
       status?: "planned" | "active" | "at_risk";
       slug?: string;
       summary?: string;
-      priority?: number | "urgent" | "high" | "medium" | "low";
+      priority?: 0 | 1 | 2 | 3 | 4 | "none" | "urgent" | "high" | "medium" | "low";
       targetDate?: string; // YYYY-MM-DD or RFC3339
       successCriteria?: string[];
     }): Goal;

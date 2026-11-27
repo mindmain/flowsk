@@ -47,9 +47,11 @@ func newObjectiveCommand(opts *GlobalOptions, deps objectiveCommandDeps) *cobra.
 	}
 
 	objCmd := &cobra.Command{
-		Use:     "objective",
-		Aliases: []string{"obj", "goal", "goals"},
-		Short:   "Manage strategic goals, project objectives, milestones, and cycles grouping tasks",
+		Use:                        "objective",
+		Aliases:                    []string{"obj", "goal", "goals"},
+		Short:                      "Manage strategic goals, project objectives, milestones, and cycles grouping tasks",
+		SuggestionsMinimumDistance: 2,
+		RunE:                       subcommandGroupRunE,
 		Long: `Manages high-level goals, milestones, and cycles within a logical project and
 displays live task completion progress bars in the terminal so developers and
 AI agents can align daily tasks with measurable project outcomes.`,
@@ -68,17 +70,19 @@ AI agents can align daily tasks with measurable project outcomes.`,
 
 func (h *objectiveHandler) newCreateSubcommand() *cobra.Command {
 	var (
-		kind       string
-		summary    string
-		priority   int
-		targetDate string
-		owner      string
+		kind            string
+		slug            string
+		summary         string
+		successCriteria []string
+		priority        int
+		targetDate      string
+		owner           string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "create <title>",
 		Short: "Create a new strategic goal, milestone, or cycle inside the active project",
-		Example: `  flowsk goal create "Zero-Copy SQLite Sync" --kind goal --priority 1 --target-date 2026-12-01 --owner mario
+		Example: `  flowsk goal create "Zero-Copy SQLite Sync" --kind goal --slug zero-copy-sync --priority 1 --target-date 2026-12-01 --success-criteria "Zero lock contention"
   flowsk objective create "v1.0 Public Beta" --kind milestone --summary "All core CLI and RPC handlers verified"`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -108,15 +112,17 @@ func (h *objectiveHandler) newCreateSubcommand() *cobra.Command {
 				return err
 			}
 			obj, err := h.client.CreateObjective(ctx, CreateObjectiveInput{
-				Workspace:  ws,
-				Project:    proj,
-				Title:      title,
-				Kind:       normKind,
-				Summary:    strings.TrimSpace(summary),
-				Priority:   priority,
-				TargetDate: strings.TrimSpace(targetDate),
-				Owner:      strings.TrimSpace(owner),
-				Actor:      strings.TrimSpace(h.opts.Actor),
+				Workspace:       ws,
+				Project:         proj,
+				Title:           title,
+				Kind:            normKind,
+				Slug:            strings.TrimSpace(slug),
+				Summary:         strings.TrimSpace(summary),
+				SuccessCriteria: cleanStringSlice(successCriteria),
+				Priority:        priority,
+				TargetDate:      strings.TrimSpace(targetDate),
+				Owner:           strings.TrimSpace(owner),
+				Actor:           strings.TrimSpace(h.opts.Actor),
 			})
 			if err != nil {
 				return err
@@ -126,7 +132,9 @@ func (h *objectiveHandler) newCreateSubcommand() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&kind, "kind", "goal", "Objective classification: goal|milestone|cycle")
-	cmd.Flags().StringVar(&summary, "summary", "", "Concise goal or milestone outcome criteria")
+	cmd.Flags().StringVar(&slug, "slug", "", "Optional project-unique slug (derived from title when omitted)")
+	cmd.Flags().StringVar(&summary, "summary", "", "Concise goal or milestone outcome summary")
+	cmd.Flags().StringSliceVar(&successCriteria, "success-criteria", nil, "Verifiable completion criteria (repeatable)")
 	cmd.Flags().IntVar(&priority, "priority", 2, "Priority rank: 0=none, 1=urgent, 2=high, 3=medium, 4=low")
 	cmd.Flags().StringVar(&targetDate, "target-date", "", "Optional target date in YYYY-MM-DD format")
 	cmd.Flags().StringVar(&owner, "owner", "", "Responsible actor handle")
@@ -195,8 +203,9 @@ func (h *objectiveHandler) newListSubcommand() *cobra.Command {
 
 func (h *objectiveHandler) newGetSubcommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "get <objective-id-or-key>",
-		Short: "Inspect an objective and its task completion roll-up",
+		Use:     "get <objective-id-or-key>",
+		Aliases: []string{"show", "view"},
+		Short:   "Inspect an objective and its task completion roll-up",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -222,12 +231,13 @@ func (h *objectiveHandler) newGetSubcommand() *cobra.Command {
 
 func (h *objectiveHandler) newUpdateSubcommand() *cobra.Command {
 	var (
-		title      string
-		summary    string
-		status     string
-		priority   int
-		targetDate string
-		owner      string
+		title           string
+		summary         string
+		successCriteria []string
+		status          string
+		priority        int
+		targetDate      string
+		owner           string
 	)
 
 	cmd := &cobra.Command{
@@ -262,6 +272,14 @@ func (h *objectiveHandler) newUpdateSubcommand() *cobra.Command {
 			if cmd.Flags().Changed("summary") {
 				v := strings.TrimSpace(summary)
 				in.Summary = &v
+				changed = true
+			}
+			if cmd.Flags().Changed("success-criteria") {
+				cleaned := cleanStringSlice(successCriteria)
+				if cleaned == nil {
+					cleaned = []string{}
+				}
+				in.SuccessCriteria = &cleaned
 				changed = true
 			}
 			if cmd.Flags().Changed("status") {
@@ -303,6 +321,7 @@ func (h *objectiveHandler) newUpdateSubcommand() *cobra.Command {
 
 	cmd.Flags().StringVar(&title, "title", "", "Updated objective title")
 	cmd.Flags().StringVar(&summary, "summary", "", "Updated objective outcome summary")
+	cmd.Flags().StringSliceVar(&successCriteria, "success-criteria", nil, "Updated verifiable completion criteria (repeatable; pass \"\" to clear)")
 	cmd.Flags().StringVar(&status, "status", "", "Updated status: planned|active|at_risk|completed|canceled")
 	cmd.Flags().IntVar(&priority, "priority", -1, "Updated priority rank (0..4)")
 	cmd.Flags().StringVar(&targetDate, "target-date", "", "Updated YYYY-MM-DD target date")

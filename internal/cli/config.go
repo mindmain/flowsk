@@ -20,8 +20,10 @@ func newConfigCommand(v *viper.Viper, opts *GlobalOptions, deps FormatterDepende
 	}
 
 	cfgCmd := &cobra.Command{
-		Use:   "config",
-		Short: "Initialize and inspect user-level ~/.flowsk configuration, database, and local path store",
+		Use:                        "config",
+		Short:                      "Initialize and inspect user-level ~/.flowsk configuration, database, and local path store",
+		SuggestionsMinimumDistance: 2,
+		RunE:                       subcommandGroupRunE,
 		Long: `Manages self-contained Flowsk settings and storage in ~/.flowsk/config.yaml,
 ~/.flowsk/local_paths.json, and ~/.flowsk/flowsk.db (or $FLOWSK_HOME).
 

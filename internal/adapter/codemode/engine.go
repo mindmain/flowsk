@@ -666,11 +666,14 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 	}))
 	_ = projectsObj.Set("setDoc", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		var projRef, md string
-		if len(call.Arguments) == 1 {
-			md = rawArgString(call, 0)
-		} else {
-			projRef = optArgString(call, 0)
-			md = rawArgString(call, 1)
+		switch len(call.Arguments) {
+		case 1:
+			md = requireJSStringArg(vm, call, 0, "flowsk.projects.setDoc", "markdown")
+		case 2:
+			projRef = strings.TrimSpace(requireJSStringArg(vm, call, 0, "flowsk.projects.setDoc", "slugOrKey"))
+			md = requireJSStringArg(vm, call, 1, "flowsk.projects.setDoc", "markdown")
+		default:
+			panic(vm.NewTypeError("flowsk.projects.setDoc expects (markdown: string) or (slugOrKey: string, markdown: string)"))
 		}
 		p, err := s.resolveProject(projRef)
 		if err != nil {
@@ -1407,11 +1410,15 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 		})
 	}))
 	_ = tasksObj.Set("setDoc", s.hostFn(func(call goja.FunctionCall) goja.Value {
-		t, err := s.resolveTaskQuiet(optArgString(call, 0))
+		if len(call.Arguments) != 2 {
+			panic(vm.NewTypeError("flowsk.tasks.setDoc expects (keyOrId: string, markdown: string)"))
+		}
+		taskRef := strings.TrimSpace(requireJSStringArg(vm, call, 0, "flowsk.tasks.setDoc", "keyOrId"))
+		md := requireJSStringArg(vm, call, 1, "flowsk.tasks.setDoc", "markdown")
+		t, err := s.resolveTaskQuiet(taskRef)
 		if err != nil {
 			s.throwErr(vm, err)
 		}
-		md := rawArgString(call, 1)
 		var updated task.Task
 		if strings.TrimSpace(md) == "" {
 			updated, err = s.taskSvc.DeleteTaskMarkdown(s.ctx, s.wsID, t.ID)
@@ -1595,25 +1602,17 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			}); err != nil {
 				s.throwErr(vm, err)
 			}
-		} else {
-			if t.Status != task.StatusBlocked && !t.Status.IsTerminal() {
-				if _, err := s.taskSvc.TransitionTask(s.ctx, task.TransitionTaskInput{
-					WorkspaceID:  s.wsID,
-					TaskID:       t.ID,
-					TargetStatus: task.StatusBlocked,
-				}); err != nil {
-					s.throwErr(vm, err)
-				}
-			}
-			if reason != "" {
-				if _, err := s.taskSvc.AddComment(authctx.WithSuppressTaskSignal(s.ctx), task.AddCommentInput{
-					WorkspaceID: s.wsID,
-					TaskID:      t.ID,
-					Kind:        task.CommentKindBlocker,
-					Body:        reason,
-				}); err != nil {
-					s.throwErr(vm, err)
-				}
+		} else if reason != "" {
+			// Keep the task in its workflow column (e.g. ready/Todo with blocked=true)
+			// just like `tasks.create({ dependsOn })` and CLI `task block --by`, so completing
+			// upstream blockers via `tasks.done(...)` automatically unblocks `ready()`/`next()`.
+			if _, err := s.taskSvc.AddComment(authctx.WithSuppressTaskSignal(s.ctx), task.AddCommentInput{
+				WorkspaceID: s.wsID,
+				TaskID:      t.ID,
+				Kind:        task.CommentKindBlocker,
+				Body:        reason,
+			}); err != nil {
+				s.throwErr(vm, err)
 			}
 		}
 		s.mutations++
@@ -2351,13 +2350,6 @@ func optArgString(call goja.FunctionCall, idx int) string {
 	return strings.TrimSpace(call.Arguments[idx].String())
 }
 
-func rawArgString(call goja.FunctionCall, idx int) string {
-	if idx >= len(call.Arguments) || goja.IsUndefined(call.Arguments[idx]) || goja.IsNull(call.Arguments[idx]) {
-		return ""
-	}
-	return call.Arguments[idx].String()
-}
-
 func rawMapString(m map[string]any, keys ...string) string {
 	for _, k := range keys {
 		if raw, ok := m[k]; ok && raw != nil {
@@ -2572,11 +2564,11 @@ func parseJSTaskPriority(raw any) task.Priority {
 			return p
 		}
 	case int64:
-		if v >= 0 && v <= 3 {
+		if v >= 0 && v <= 4 {
 			return task.Priority(v)
 		}
 	case float64:
-		if v >= 0 && v <= 3 {
+		if v >= 0 && v <= 4 {
 			return task.Priority(int32(v))
 		}
 	}
@@ -2587,18 +2579,18 @@ func parseJSPriorityRank(raw any) int32 {
 	switch v := raw.(type) {
 	case string:
 		if p, ok := language.NormalizePriorityToken(v); ok {
-			return int32(p) + 1
+			return int32(p)
 		}
 	case int64:
-		if v >= 0 {
+		if v >= 0 && v <= 4 {
 			return int32(v)
 		}
 	case float64:
-		if v >= 0 {
+		if v >= 0 && v <= 4 {
 			return int32(v)
 		}
 	}
-	return 2
+	return int32(task.PriorityHigh)
 }
 
 func slugify(raw string) string {
@@ -2610,6 +2602,17 @@ func slugify(raw string) string {
 	}
 	if len(s) > 60 {
 		s = strings.Trim(s[:60], "-")
+	}
+	return s
+}
+
+func requireJSStringArg(vm *goja.Runtime, call goja.FunctionCall, idx int, fnName, paramName string) string {
+	if idx < 0 || idx >= len(call.Arguments) || goja.IsUndefined(call.Arguments[idx]) || goja.IsNull(call.Arguments[idx]) {
+		panic(vm.NewTypeError(fmt.Sprintf("%s: %s must be a string", fnName, paramName)))
+	}
+	s, ok := call.Arguments[idx].Export().(string)
+	if !ok {
+		panic(vm.NewTypeError(fmt.Sprintf("%s: %s must be a string", fnName, paramName)))
 	}
 	return s
 }

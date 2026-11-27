@@ -83,6 +83,13 @@ message Objective {
   google.protobuf.Timestamp created_at = 16;
   // UTC timestamp when the objective was last updated.
   google.protobuf.Timestamp updated_at = 17;
+  // Project-scoped short URL and Code Mode SDK slug (for example, "q4-zero-copy-sync").
+  string slug = 18 [(buf.validate.field).string.max_len = 128];
+  // Relative priority rank within the project (0 = none, 1 = urgent .. 4 = low).
+  int32 priority_rank = 19 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 4
+  }];
 }
 
 // ObjectiveService manages project milestones, timeboxed cycles, and goals
@@ -140,6 +147,13 @@ message CreateObjectiveRequest {
   google.protobuf.Timestamp start_date = 10;
   // Optional target completion timestamp.
   google.protobuf.Timestamp target_date = 11;
+  // Optional project-scoped slug; when empty, derived automatically from title.
+  string slug = 12 [(buf.validate.field).string.max_len = 128];
+  // Optional relative priority rank (0 = none, 1 = urgent .. 4 = low; defaults to 2 when omitted).
+  optional int32 priority_rank = 13 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 4
+  }];
 }
 
 // CreateObjectiveResponse wraps the newly created objective.
@@ -222,6 +236,13 @@ message UpdateObjectiveRequest {
   google.protobuf.Timestamp target_date = 11;
   // When true, clears target_date back to unset.
   bool clear_target_date = 12;
+  // Optional updated relative priority rank (0 = none, 1 = urgent .. 4 = low).
+  optional int32 priority_rank = 13 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 4
+  }];
+  // Optional updated objective classification (UNSPECIFIED leaves kind unchanged).
+  ObjectiveKind kind = 14 [(buf.validate.field).enum.defined_only = true];
 }
 
 // UpdateObjectiveResponse wraps the updated objective entity.

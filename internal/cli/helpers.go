@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
 
@@ -356,4 +357,18 @@ func validateDBDriver(driver string) (string, error) {
 	default:
 		return "", fmt.Errorf("invalid --db-driver %q: must be sqlite or postgres", driver)
 	}
+}
+
+// subcommandGroupRunE renders help when a parent command group is invoked with
+// zero arguments and returns a non-zero error (with typo suggestions) when an
+// unknown subcommand token is passed instead of silently exiting 0.
+func subcommandGroupRunE(cmd *cobra.Command, args []string) error {
+	if len(args) == 0 {
+		return cmd.Help()
+	}
+	suggestions := cmd.SuggestionsFor(args[0])
+	if len(suggestions) > 0 {
+		return fmt.Errorf("unknown command %q for %q (did you mean %q?)", args[0], cmd.CommandPath(), suggestions[0])
+	}
+	return fmt.Errorf("unknown command %q for %q (run '%s --help' for usage)", args[0], cmd.CommandPath(), cmd.CommandPath())
 }

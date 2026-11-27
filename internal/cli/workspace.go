@@ -39,9 +39,11 @@ func newWorkspaceCommand(opts *GlobalOptions, deps workspaceCommandDeps) *cobra.
 	}
 
 	wsCmd := &cobra.Command{
-		Use:     "workspace",
-		Aliases: []string{"ws"},
-		Short:   "Manage multi-tenant workspaces and human/AI agent actor identities",
+		Use:                        "workspace",
+		Aliases:                    []string{"ws"},
+		Short:                      "Manage multi-tenant workspaces and human/AI agent actor identities",
+		SuggestionsMinimumDistance: 2,
+		RunE:                       subcommandGroupRunE,
 		Long: `Manages isolated multi-tenant Flowsk workspaces and registers human or AI agent
 actors whose handles are recorded on task claims, handoff comments, and
 immutable audit events.`,
@@ -141,8 +143,9 @@ func (h *workspaceHandler) newListSubcommand() *cobra.Command {
 
 func (h *workspaceHandler) newGetSubcommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "get [workspace-id-or-slug]",
-		Short: "Inspect a workspace by UUID or slug (defaults to active --workspace)",
+		Use:     "get [workspace-id-or-slug]",
+		Aliases: []string{"show", "view"},
+		Short:   "Inspect a workspace by UUID or slug (defaults to active --workspace)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -195,8 +198,10 @@ Never writes files inside the current working directory or target Git repository
 
 func (h *workspaceHandler) newActorSubcommand() *cobra.Command {
 	actorCmd := &cobra.Command{
-		Use:   "actor",
-		Short: "Register and list human, AI agent, and CI actors within a workspace",
+		Use:                        "actor",
+		Short:                      "Register and list human, AI agent, and CI actors within a workspace",
+		SuggestionsMinimumDistance: 2,
+		RunE:                       subcommandGroupRunE,
 	}
 
 	var (

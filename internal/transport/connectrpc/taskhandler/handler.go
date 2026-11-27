@@ -1535,14 +1535,16 @@ func parseTaskPriority(op string, p flowsk_task_pb.TaskPriority, allowUnspecifie
 			Field:       "priority",
 			Description: "priority must not be TASK_PRIORITY_UNSPECIFIED",
 		})
+	case flowsk_task_pb.TaskPriority_TASK_PRIORITY_NONE:
+		v := task.PriorityNone
+		return &v, nil
 	case flowsk_task_pb.TaskPriority_TASK_PRIORITY_URGENT:
-		v := task.PriorityCritical
+		v := task.PriorityUrgent
 		return &v, nil
 	case flowsk_task_pb.TaskPriority_TASK_PRIORITY_HIGH:
 		v := task.PriorityHigh
 		return &v, nil
-	case flowsk_task_pb.TaskPriority_TASK_PRIORITY_MEDIUM,
-		flowsk_task_pb.TaskPriority_TASK_PRIORITY_NONE:
+	case flowsk_task_pb.TaskPriority_TASK_PRIORITY_MEDIUM:
 		v := task.PriorityMedium
 		return &v, nil
 	case flowsk_task_pb.TaskPriority_TASK_PRIORITY_LOW:

@@ -477,28 +477,26 @@ func normalizeKeyPrefix(raw string) string {
 
 func mapCLIPriorityToDomain(cliPrio int) task.Priority {
 	switch cliPrio {
+	case 0:
+		return task.PriorityNone
 	case 1:
-		return task.PriorityCritical
+		return task.PriorityUrgent
 	case 2:
 		return task.PriorityHigh
-	case 3, 0:
+	case 3:
 		return task.PriorityMedium
-	default:
+	case 4:
 		return task.PriorityLow
+	default:
+		return task.PriorityMedium
 	}
 }
 
 func mapDomainPriorityToCLI(p task.Priority) int {
-	switch p {
-	case task.PriorityCritical:
-		return 1
-	case task.PriorityHigh:
-		return 2
-	case task.PriorityMedium:
-		return 3
-	default:
-		return 4
+	if p >= task.PriorityNone && p <= task.PriorityLow {
+		return int(p)
 	}
+	return int(task.PriorityMedium)
 }
 
 func parseCLIWorkflowStatus(raw string) task.Status {
@@ -1226,20 +1224,24 @@ func (c *dualModeClient) CreateObjective(ctx context.Context, in cli.CreateObjec
 		targetDate = &utc
 	}
 	var criteria []string
-	if strings.TrimSpace(in.Summary) != "" {
-		criteria = []string{strings.TrimSpace(in.Summary)}
+	if len(in.SuccessCriteria) > 0 {
+		criteria = append([]string(nil), in.SuccessCriteria...)
+	}
+	slug := slugifyIdentifier(in.Title)
+	if strings.TrimSpace(in.Slug) != "" {
+		slug = slugifyIdentifier(in.Slug)
 	}
 	objKind := mapCLIObjectiveKind(in.Kind)
 	obj, err := eng.objectiveSvc.CreateObjective(authCtx, objective.CreateObjectiveInput{
 		WorkspaceID:     ws.ID,
 		ProjectID:       proj.ID,
 		Kind:            objKind,
-		Slug:            slugifyIdentifier(in.Title),
+		Slug:            slug,
 		Title:           in.Title,
 		Summary:         in.Summary,
 		SuccessCriteria: criteria,
 		Status:          objective.StatusActive,
-		PriorityRank:    int32(max(1, in.Priority)),
+		PriorityRank:    int32(max(0, in.Priority)),
 		TargetDate:      targetDate,
 	})
 	if err != nil {
@@ -1368,14 +1370,22 @@ func (c *dualModeClient) UpdateObjective(ctx context.Context, in cli.UpdateObjec
 			targetDate = &utc
 		}
 	}
+	var criteria []string
+	if in.SuccessCriteria != nil {
+		criteria = append([]string(nil), (*in.SuccessCriteria)...)
+		if criteria == nil {
+			criteria = []string{}
+		}
+	}
 	updated, err := eng.objectiveSvc.UpdateObjective(authCtx, objective.UpdateObjectiveInput{
-		WorkspaceID:  ws.ID,
-		ObjectiveID:  target.ID,
-		Title:        in.Title,
-		Summary:      in.Summary,
-		Status:       stPtr,
-		PriorityRank: prioPtr,
-		TargetDate:   targetDate,
+		WorkspaceID:     ws.ID,
+		ObjectiveID:     target.ID,
+		Title:           in.Title,
+		Summary:         in.Summary,
+		SuccessCriteria: criteria,
+		Status:          stPtr,
+		PriorityRank:    prioPtr,
+		TargetDate:      targetDate,
 	})
 	if err != nil {
 		return cli.ObjectiveView{}, err
@@ -2808,19 +2818,20 @@ func toObjectiveView(o objective.Objective, kind, owner string) cli.ObjectiveVie
 		td = o.TargetDate.UTC().Format("2006-01-02")
 	}
 	return cli.ObjectiveView{
-		ID:         o.ID.String(),
-		WorkspaceID: o.WorkspaceID.String(),
-		ProjectID:  o.ProjectID.String(),
-		Key:        o.Slug,
-		Kind:       firstNonEmpty(kind, "goal"),
-		Title:      o.Title,
-		Summary:    o.Summary,
-		Status:     string(o.Status),
-		Priority:   int(o.PriorityRank),
-		TargetDate: td,
-		Owner:      owner,
-		CreatedAt:  o.CreatedAt,
-		UpdatedAt:  o.UpdatedAt,
+		ID:              o.ID.String(),
+		WorkspaceID:     o.WorkspaceID.String(),
+		ProjectID:       o.ProjectID.String(),
+		Key:             o.Slug,
+		Kind:            firstNonEmpty(kind, "goal"),
+		Title:           o.Title,
+		Summary:         o.Summary,
+		SuccessCriteria: o.SuccessCriteriaCopy(),
+		Status:          string(o.Status),
+		Priority:        int(o.PriorityRank),
+		TargetDate:      td,
+		Owner:           owner,
+		CreatedAt:       o.CreatedAt,
+		UpdatedAt:       o.UpdatedAt,
 	}
 }
 

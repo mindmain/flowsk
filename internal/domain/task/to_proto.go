@@ -33,11 +33,13 @@ func (k Kind) ToProto() flowsk_task_pb.TaskKind {
 	}
 }
 
-// ToProto maps a domain Task Priority (0=Critical .. 3=Low) onto its wire-level
+// ToProto maps a domain Task Priority (0=None, 1=Urgent .. 4=Low) onto its wire-level
 // flowsk.task.v1.TaskPriority enum.
 func (p Priority) ToProto() flowsk_task_pb.TaskPriority {
 	switch p {
-	case PriorityCritical:
+	case PriorityNone:
+		return flowsk_task_pb.TaskPriority_TASK_PRIORITY_NONE
+	case PriorityUrgent:
 		return flowsk_task_pb.TaskPriority_TASK_PRIORITY_URGENT
 	case PriorityHigh:
 		return flowsk_task_pb.TaskPriority_TASK_PRIORITY_HIGH

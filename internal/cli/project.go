@@ -46,9 +46,11 @@ func newProjectCommand(opts *GlobalOptions, deps projectCommandDeps) *cobra.Comm
 	}
 
 	projCmd := &cobra.Command{
-		Use:     "project",
-		Aliases: []string{"proj"},
-		Short:   "Manage logical projects, custom workflow states, labels, and client-only folder bindings",
+		Use:                        "project",
+		Aliases:                    []string{"proj"},
+		Short:                      "Manage logical projects, custom workflow states, labels, and client-only folder bindings",
+		SuggestionsMinimumDistance: 2,
+		RunE:                       subcommandGroupRunE,
 		Long: `Manages logical projects, Linear-style workflow state pipelines, labels, and
 strictly client-local directory bindings.
 
@@ -172,8 +174,9 @@ func (h *projectHandler) newListSubcommand() *cobra.Command {
 
 func (h *projectHandler) newGetSubcommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "get [project-id-or-key]",
-		Short: "Inspect a logical project (defaults to --project or local cwd binding)",
+		Use:     "get [project-id-or-key]",
+		Aliases: []string{"show", "view"},
+		Short:   "Inspect a logical project (defaults to --project or local cwd binding)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -565,8 +568,10 @@ func (h *projectHandler) newWhereSubcommand() *cobra.Command {
 
 func (h *projectHandler) newStateSubcommand() *cobra.Command {
 	stateCmd := &cobra.Command{
-		Use:   "state",
-		Short: "List and create custom workflow states for a project",
+		Use:                        "state",
+		Short:                      "List and create custom workflow states for a project",
+		SuggestionsMinimumDistance: 2,
+		RunE:                       subcommandGroupRunE,
 	}
 
 	listCmd := &cobra.Command{
@@ -648,8 +653,10 @@ func (h *projectHandler) newStateSubcommand() *cobra.Command {
 
 func (h *projectHandler) newLabelSubcommand() *cobra.Command {
 	labelCmd := &cobra.Command{
-		Use:   "label",
-		Short: "List and create classification labels for a project",
+		Use:                        "label",
+		Short:                      "List and create classification labels for a project",
+		SuggestionsMinimumDistance: 2,
+		RunE:                       subcommandGroupRunE,
 	}
 
 	listCmd := &cobra.Command{
