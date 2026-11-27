@@ -1,7 +1,12 @@
 @import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
 
 @layer base {
-  :root {
+  :root:not(.dark) {
+    color-scheme: light;
+  }
+
+  .dark {
     color-scheme: dark;
   }
 
@@ -35,4 +40,80 @@
 
 .kanban-drop-list.cdk-drop-list-dragging .kanban-card:not(.cdk-drag-placeholder) {
   transition: transform 160ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+/* Live Agent Signal Pulsing Green Glow (active within 10m in Todo / In Progress / In Review) */
+@keyframes flowsk-signal-card-pulse-light {
+  0%,
+  100% {
+    border-color: rgba(16, 185, 129, 0.55);
+    box-shadow:
+      0 0 0 1px rgba(16, 185, 129, 0.18),
+      0 0 14px -2px rgba(16, 185, 129, 0.22);
+  }
+  50% {
+    border-color: rgba(16, 185, 129, 0.92);
+    box-shadow:
+      0 0 0 1.5px rgba(16, 185, 129, 0.38),
+      0 0 22px -1px rgba(16, 185, 129, 0.36);
+  }
+}
+
+@keyframes flowsk-signal-card-pulse-dark {
+  0%,
+  100% {
+    border-color: rgba(52, 211, 153, 0.5);
+    box-shadow:
+      0 0 0 1px rgba(16, 185, 129, 0.22),
+      0 0 15px -2px rgba(16, 185, 129, 0.28);
+  }
+  50% {
+    border-color: rgba(52, 211, 153, 0.95);
+    box-shadow:
+      0 0 0 1.5px rgba(52, 211, 153, 0.52),
+      0 0 24px -1px rgba(16, 185, 129, 0.46);
+  }
+}
+
+@keyframes flowsk-signal-row-pulse {
+  0%,
+  100% {
+    box-shadow: inset 3px 0 0 0 rgba(16, 185, 129, 0.55);
+    background-color: rgba(16, 185, 129, 0.04);
+  }
+  50% {
+    box-shadow: inset 3px 0 0 0 rgba(52, 211, 153, 0.95);
+    background-color: rgba(16, 185, 129, 0.09);
+  }
+}
+
+.kanban-card.task-signal-glow {
+  border-color: rgba(16, 185, 129, 0.72);
+  animation: flowsk-signal-card-pulse-light 2.4s ease-in-out infinite;
+}
+
+.dark .kanban-card.task-signal-glow {
+  border-color: rgba(52, 211, 153, 0.75);
+  animation: flowsk-signal-card-pulse-dark 2.4s ease-in-out infinite;
+}
+
+.task-signal-row-glow {
+  animation: flowsk-signal-row-pulse 2.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kanban-card.task-signal-glow,
+  .dark .kanban-card.task-signal-glow {
+    animation: none;
+    border-color: rgba(16, 185, 129, 0.85);
+    box-shadow:
+      0 0 0 1px rgba(16, 185, 129, 0.35),
+      0 0 16px -2px rgba(16, 185, 129, 0.3);
+  }
+
+  .task-signal-row-glow {
+    animation: none;
+    box-shadow: inset 3px 0 0 0 rgba(16, 185, 129, 0.85);
+    background-color: rgba(16, 185, 129, 0.06);
+  }
 }

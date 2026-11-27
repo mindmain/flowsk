@@ -1,6 +1,6 @@
 import { HttpClient } from '@angular/common/http';
 import { Injectable, inject } from '@angular/core';
-import { Observable, map } from 'rxjs';
+import { EMPTY, Observable, defer, expand, map, reduce } from 'rxjs';
 import {
   ActorModel,
   ObjectiveKind,
@@ -103,10 +103,12 @@ interface RawTaskDto {
   claimedByActorId?: string;
   claimExpiresAt?: string;
   labelIds?: string[];
+  tags?: string[];
   hasMarkdownDoc?: boolean;
   createdAt?: string;
   updatedAt?: string;
   completedAt?: string;
+  lastSignalAt?: string;
 }
 
 /**
@@ -118,6 +120,14 @@ export class FlowskRpcService {
 
   getBootstrapConfig(): Observable<RuntimeBootstrapConfig> {
     return this.http.get<RuntimeBootstrapConfig>('/api/ui-config');
+  }
+
+  authenticateSession(token: string): Observable<{ authenticated: boolean }> {
+    return this.http
+      .post<{ authenticated?: boolean }>('/api/ui-auth', {
+        token: token.trim(),
+      })
+      .pipe(map((res) => ({ authenticated: Boolean(res.authenticated) })));
   }
 
   registerActor(workspaceRef: string, handle: string): Observable<ActorModel> {
@@ -150,14 +160,28 @@ export class FlowskRpcService {
   }
 
   listProjects(workspaceId: string, actorId: string): Observable<ProjectModel[]> {
-    return this.http
-      .post<{ projects?: RawProjectDto[] }>('/flowsk.project.v1.ProjectService/ListProjects', {
+    return collectPaginatedPages((pageToken) => {
+      const body: Record<string, unknown> = {
         workspaceId,
         actorId,
         includeArchived: true,
         pageSize: 200,
-      })
-      .pipe(map((res) => (res.projects ?? []).map(mapProject)));
+      };
+      if (pageToken) {
+        body['pageToken'] = pageToken;
+      }
+      return this.http
+        .post<{ projects?: RawProjectDto[]; nextPageToken?: string }>(
+          '/flowsk.project.v1.ProjectService/ListProjects',
+          body,
+        )
+        .pipe(
+          map((res) => ({
+            items: (res.projects ?? []).map(mapProject),
+            nextPageToken: res.nextPageToken ?? '',
+          })),
+        );
+    });
   }
 
   createProject(params: {
@@ -293,17 +317,30 @@ export class FlowskRpcService {
   }
 
   listObjectives(workspaceId: string, actorId: string, projectId?: string | null): Observable<ObjectiveModel[]> {
-    const body: Record<string, unknown> = {
-      workspaceId,
-      actorId,
-      pageSize: 200,
-    };
-    if (projectId) {
-      body['projectId'] = projectId;
-    }
-    return this.http
-      .post<{ objectives?: RawObjectiveDto[] }>('/flowsk.objective.v1.ObjectiveService/ListObjectives', body)
-      .pipe(map((res) => (res.objectives ?? []).map(mapObjective)));
+    return collectPaginatedPages((pageToken) => {
+      const body: Record<string, unknown> = {
+        workspaceId,
+        actorId,
+        pageSize: 200,
+      };
+      if (projectId) {
+        body['projectId'] = projectId;
+      }
+      if (pageToken) {
+        body['pageToken'] = pageToken;
+      }
+      return this.http
+        .post<{ objectives?: RawObjectiveDto[]; nextPageToken?: string }>(
+          '/flowsk.objective.v1.ObjectiveService/ListObjectives',
+          body,
+        )
+        .pipe(
+          map((res) => ({
+            items: (res.objectives ?? []).map(mapObjective),
+            nextPageToken: res.nextPageToken ?? '',
+          })),
+        );
+    });
   }
 
   createObjective(params: {
@@ -327,7 +364,7 @@ export class FlowskRpcService {
       status: statusEnum,
       title: params.title,
       description: params.description,
-      successCriteria: params.successCriteria?.trim() || params.description || params.title,
+      successCriteria: params.successCriteria?.trim() ?? '',
     };
     const isoTarget = toProtoTimestampIso(params.targetDate);
     if (isoTarget) {
@@ -347,6 +384,7 @@ export class FlowskRpcService {
     successCriteria?: string;
     status?: ObjectiveStatus;
     targetDate?: string;
+    clearTargetDate?: boolean;
   }): Observable<ObjectiveModel> {
     const body: Record<string, unknown> = {
       workspaceId: params.workspaceId,
@@ -365,9 +403,13 @@ export class FlowskRpcService {
     if (params.status !== undefined) {
       body['status'] = toObjectiveStatusEnum(params.status);
     }
-    const isoTarget = toProtoTimestampIso(params.targetDate);
-    if (isoTarget) {
-      body['targetDate'] = isoTarget;
+    if (params.clearTargetDate || params.targetDate === '') {
+      body['clearTargetDate'] = true;
+    } else {
+      const isoTarget = toProtoTimestampIso(params.targetDate);
+      if (isoTarget) {
+        body['targetDate'] = isoTarget;
+      }
     }
     return this.http
       .post<{ objective?: RawObjectiveDto }>('/flowsk.objective.v1.ObjectiveService/UpdateObjective', body)
@@ -402,17 +444,30 @@ export class FlowskRpcService {
   }
 
   listTasks(workspaceId: string, actorId: string, projectId?: string): Observable<TaskModel[]> {
-    const body: Record<string, unknown> = {
-      workspaceId,
-      actorId,
-      pageSize: 200,
-    };
-    if (projectId) {
-      body['projectId'] = projectId;
-    }
-    return this.http
-      .post<{ tasks?: RawTaskDto[] }>('/flowsk.task.v1.TaskService/ListTasks', body)
-      .pipe(map((res) => (res.tasks ?? []).map(mapTask)));
+    return collectPaginatedPages((pageToken) => {
+      const body: Record<string, unknown> = {
+        workspaceId,
+        actorId,
+        pageSize: 200,
+      };
+      if (projectId) {
+        body['projectId'] = projectId;
+      }
+      if (pageToken) {
+        body['pageToken'] = pageToken;
+      }
+      return this.http
+        .post<{ tasks?: RawTaskDto[]; nextPageToken?: string }>(
+          '/flowsk.task.v1.TaskService/ListTasks',
+          body,
+        )
+        .pipe(
+          map((res) => ({
+            items: (res.tasks ?? []).map(mapTask),
+            nextPageToken: res.nextPageToken ?? '',
+          })),
+        );
+    });
   }
 
   getTaskDetail(
@@ -512,25 +567,37 @@ export class FlowskRpcService {
       .pipe(map((res) => mapTask(res.task)));
   }
 
-  claimTask(workspaceId: string, actorId: string, taskId: string): Observable<TaskModel> {
+  claimTask(
+    workspaceId: string,
+    actorId: string,
+    taskId: string,
+    forceTakeover = false,
+  ): Observable<TaskModel> {
     return this.http
       .post<{ task?: RawTaskDto }>('/flowsk.task.v1.TaskService/ClaimTask', {
         workspaceId,
         actorId,
         taskId,
         leaseTtlSeconds: 1800,
-        forceTakeover: true,
+        forceTakeover: Boolean(forceTakeover),
       })
       .pipe(map((res) => mapTask(res.task)));
   }
 
-  releaseTaskClaim(workspaceId: string, actorId: string, taskId: string, handoffNote: string): Observable<TaskModel> {
+  releaseTaskClaim(
+    workspaceId: string,
+    actorId: string,
+    taskId: string,
+    handoffNote: string,
+    force = false,
+  ): Observable<TaskModel> {
     return this.http
       .post<{ task?: RawTaskDto }>('/flowsk.task.v1.TaskService/ReleaseTaskClaim', {
         workspaceId,
         actorId,
         taskId,
         handoffNote,
+        force: Boolean(force),
       })
       .pipe(map((res) => mapTask(res.task)));
   }
@@ -883,11 +950,37 @@ function mapTask(raw?: RawTaskDto): TaskModel {
     claimedByActorId: raw?.claimedByActorId,
     claimExpiresAt: raw?.claimExpiresAt,
     labelIds: raw?.labelIds ?? [],
+    tags: raw?.tags ?? [],
     hasMarkdownDoc: Boolean(raw?.hasMarkdownDoc),
     createdAt: raw?.createdAt ?? '',
     updatedAt: raw?.updatedAt ?? '',
     completedAt: raw?.completedAt,
+    lastSignalAt: raw?.lastSignalAt,
   };
+}
+
+const MAX_PAGINATED_PAGES = 10;
+
+function collectPaginatedPages<TItem>(
+  fetchPage: (pageToken: string) => Observable<{ items: TItem[]; nextPageToken: string }>,
+): Observable<TItem[]> {
+  return defer(() => {
+    const seenTokens = new Set<string>();
+    return fetchPage('').pipe(
+      expand((page, pageIndex) => {
+        const nextToken = page.nextPageToken.trim();
+        if (!nextToken || pageIndex + 1 >= MAX_PAGINATED_PAGES || seenTokens.has(nextToken)) {
+          return EMPTY;
+        }
+        seenTokens.add(nextToken);
+        return fetchPage(nextToken);
+      }),
+      reduce((acc, page) => {
+        acc.push(...page.items);
+        return acc;
+      }, [] as TItem[]),
+    );
+  });
 }
 
 function priorityOrder(p: TaskPriority): number {
@@ -900,6 +993,8 @@ function priorityOrder(p: TaskPriority): number {
       return 2;
     case 'TASK_PRIORITY_LOW':
       return 3;
+    case 'TASK_PRIORITY_NONE':
+      return 4;
     default:
       return 2;
   }

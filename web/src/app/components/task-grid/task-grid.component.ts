@@ -38,10 +38,22 @@ import { FlowskStore } from '../../core/store/flowsk.store';
             @for (task of store.filteredTasks(); track task.id) {
               <tr
                 (click)="store.loadTaskInspector({ taskId: task.id })"
+                [class.task-signal-row-glow]="store.isTaskGlowing(task)"
                 class="hover:bg-zinc-50 dark:hover:bg-zinc-900/50 cursor-pointer transition-colors"
               >
                 <td class="py-2.5 px-3 font-mono text-[11px] text-zinc-500 dark:text-zinc-400">
-                  {{ task.identifier }}
+                  <div class="flex items-center gap-1.5">
+                    @if (store.isTaskGlowing(task)) {
+                      <span
+                        class="relative flex h-2 w-2 shrink-0"
+                        [title]="'Active agent signal · ' + store.taskSignalAgeLabel(task)"
+                      >
+                        <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                        <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                      </span>
+                    }
+                    <span>{{ task.identifier }}</span>
+                  </div>
                 </td>
                 <td class="py-2.5 px-3 font-mono text-[11px] text-zinc-700 dark:text-zinc-300">
                   {{ shortPrio(task) }}
@@ -51,7 +63,7 @@ import { FlowskStore } from '../../core/store/flowsk.store';
                     <span class="truncate max-w-md">{{ task.title }}</span>
                     @if (task.hasMarkdownDoc) {
                       <span
-                        class="text-[10px] font-mono px-1.5 py-0.2 rounded bg-sky-500/10 text-sky-600 dark:text-sky-300 border border-sky-500/30"
+                        class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-600 dark:text-sky-300 border border-sky-500/30"
                       >
                         .md
                       </span>
@@ -80,7 +92,7 @@ import { FlowskStore } from '../../core/store/flowsk.store';
                   }
                 </td>
                 <td class="py-2.5 px-3 font-mono text-[11px]">
-                  @if (task.claimedByActorId; as holderId) {
+                  @if (store.activeClaimHolderId(task); as holderId) {
                     <span class="text-emerald-600 dark:text-emerald-400">
                       @{{ store.actorMapById()[holderId]?.handle ?? 'agent' }}
                     </span>

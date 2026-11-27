@@ -58,6 +58,9 @@
         },
         "serve": {
           "builder": "@angular/build:dev-server",
+          "options": {
+            "port": 1616
+          },
           "configurations": {
             "production": {
               "buildTarget": "flowsk-web:build:production"

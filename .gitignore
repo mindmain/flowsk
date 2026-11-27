@@ -6,12 +6,11 @@
 *.out
 *.test
 
-# Frontend package cache and compiled embedded SPA bundle (rebuilt via task build / task install)
+# Frontend package and Angular CLI caches (compiled internal/adapter/webui/dist/ assets are tracked for go:embed / go install)
 /web/node_modules/
 /web/.angular/
 !/internal/adapter/webui/dist/
-/internal/adapter/webui/dist/*
-!/internal/adapter/webui/dist/.gitkeep
+!/internal/adapter/webui/dist/**
 
 # Coverage and profiling
 *.cov

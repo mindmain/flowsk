@@ -51,6 +51,8 @@ export interface RuntimeBootstrapConfig {
   readonly projectSlug?: string;
   readonly actorId?: string;
   readonly actorHandle?: string;
+  readonly authRequired?: boolean;
+  readonly authenticated?: boolean;
 }
 
 export interface ProjectBindingModel {
@@ -75,6 +77,7 @@ export interface ProjectTaskCounts {
 
 export interface ProjectHierarchyNode {
   readonly project: ProjectModel;
+  readonly lineageKey: string;
   readonly depth: number;
   readonly scopeSubpath: string;
   readonly parentProjectId: string | null;
@@ -174,10 +177,12 @@ export interface TaskModel {
   readonly claimedByActorId?: string;
   readonly claimExpiresAt?: string;
   readonly labelIds: readonly string[];
+  readonly tags: readonly string[];
   readonly hasMarkdownDoc: boolean;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly completedAt?: string;
+  readonly lastSignalAt?: string;
 }
 
 export interface TaskRelationModel {
@@ -249,6 +254,8 @@ export function formatPriorityLabel(priority: TaskPriority): string {
       return 'P2 · Medium';
     case 'TASK_PRIORITY_LOW':
       return 'P3 · Low';
+    case 'TASK_PRIORITY_NONE':
+      return 'Unprioritized';
     default:
       return 'P2 · Normal';
   }
@@ -264,9 +271,87 @@ export function formatShortPriority(priority: TaskPriority): string {
       return 'P2';
     case 'TASK_PRIORITY_LOW':
       return 'P3';
+    case 'TASK_PRIORITY_NONE':
+      return '—';
     default:
       return 'P2';
   }
+}
+
+/**
+ * Duration (10 minutes in milliseconds) during which a recent agent/CLI/MCP signal
+ * illuminates the pulsing green task glow on active workflow stages (`ready`, `in_progress`, `in_review`).
+ */
+export const TASK_SIGNAL_GLOW_WINDOW_MS = 10 * 60 * 1000;
+
+/**
+ * Returns true when a task carries an active, unexpired actor lease at `nowMs`.
+ */
+export function isTaskLeaseActive(
+  task: Pick<TaskModel, 'claimedByActorId' | 'claimExpiresAt'>,
+  nowMs: number,
+): boolean {
+  if (!task.claimedByActorId) {
+    return false;
+  }
+  if (!task.claimExpiresAt) {
+    return true;
+  }
+  const expiresMs = Date.parse(task.claimExpiresAt);
+  return Number.isNaN(expiresMs) ? true : expiresMs > nowMs;
+}
+
+/**
+ * Returns true strictly when `task.status` is in an active pre-completion stage
+ * (`ready`, `in_progress`, or `in_review` — never `backlog`, `blocked`, `done`, `cancelled`,
+ * or `archived`) AND `task.lastSignalAt` occurred within the last 10 minutes of `nowMs`.
+ */
+export function isTaskSignalGlowing(
+  task: Pick<TaskModel, 'status' | 'lastSignalAt'>,
+  nowMs: number,
+): boolean {
+  if (
+    task.status !== 'ready' &&
+    task.status !== 'in_progress' &&
+    task.status !== 'in_review'
+  ) {
+    return false;
+  }
+  if (!task.lastSignalAt) {
+    return false;
+  }
+  const signalMs = Date.parse(task.lastSignalAt);
+  if (Number.isNaN(signalMs)) {
+    return false;
+  }
+  return nowMs - signalMs <= TASK_SIGNAL_GLOW_WINDOW_MS;
+}
+
+/**
+ * Formats a concise human-readable relative age for `lastSignalAt` relative to `nowMs`.
+ */
+export function formatSignalAge(lastSignalAt: string | undefined, nowMs: number): string {
+  if (!lastSignalAt) {
+    return '';
+  }
+  const signalMs = Date.parse(lastSignalAt);
+  if (Number.isNaN(signalMs)) {
+    return '';
+  }
+  const diffSec = Math.max(0, Math.floor((nowMs - signalMs) / 1000));
+  if (diffSec < 45) {
+    return 'just now';
+  }
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) {
+    return `${diffMin}m ago`;
+  }
+  const diffHours = Math.floor(diffMin / 60);
+  if (diffHours < 24) {
+    return `${diffHours}h ago`;
+  }
+  const diffDays = Math.floor(diffHours / 24);
+  return `${diffDays}d ago`;
 }
 
 export function formatKindLabel(kind: TaskKind): string {

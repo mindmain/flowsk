@@ -1,59 +1,28 @@
-# FlowskWeb
+# Flowsk Web UI (`web/`)
 
-This project was generated using [Angular CLI](https://github.com/angular/angular-cli) version 21.1.0.
+Real-time single-page web interface for **Flowsk** (`module github.com/mindmain/flowsk`), embedded directly into the single static Go binary via `//go:embed all:dist` in `internal/adapter/webui` and served by `flowsk ui` (`flowsk web`, default `127.0.0.1:1616`) or `flowsk serve --ui` (`FLOWSK_UI=true`).
 
-## Development server
+## Stack & Architecture
 
-To start a local development server, run:
+- **Framework & Reactivity**: Angular `21.1` standalone components with `ChangeDetectionStrategy.OnPush`, Signals, and `@ngrx/signals` `SignalStore` state management.
+- **Styling**: Tailwind CSS `v4.1` (`@tailwindcss/postcss`).
+- **Transport & Live Sync**:
+  - **ConnectRPC** (`@connectrpc/connect` + `@connectrpc/connect-web` + `@bufbuild/protobuf`) communicating with `internal/transport/connectrpc` over HTTP/1.1 & HTTP/2.
+  - **Server-Sent Events (`GET /api/events`)** streaming real-time workspace-scoped updates from both in-process ConnectRPC mutations and cross-process CLI / `stdio` MCP SQLite WAL commits.
+- **Views**: Live drag-and-drop Kanban & Grid task boards, strategic **Goals & Roadmap** (`goal`, `milestone`, `cycle`), hierarchical Project/Subproject selector & unbound-folder Projects Overview, Markdown document viewer/editor, and live agent activity feed.
 
-```bash
-ng serve
+## Build & Development Commands
+
+Run frontend tasks from the repository root via [Task](https://taskfile.dev) (`Taskfile.yml`):
+
+```sh
+# Install frontend dependencies via pnpm (frozen lockfile)
+task ui:install
+
+# Compile production SPA assets into ../internal/adapter/webui/dist/
+task ui:build
 ```
 
-Once the server is running, open your browser and navigate to `http://localhost:4200/`. The application will automatically reload whenever you modify any of the source files.
+The production build outputs directly to `../internal/adapter/webui/dist/` (configured in `angular.json`), which is tracked in Git and embedded by `internal/adapter/webui` so `go install`, `task build`, and `docker build` always include a complete working Web UI bundle.
 
-## Code scaffolding
-
-Angular CLI includes powerful code scaffolding tools. To generate a new component, run:
-
-```bash
-ng generate component component-name
-```
-
-For a complete list of available schematics (such as `components`, `directives`, or `pipes`), run:
-
-```bash
-ng generate --help
-```
-
-## Building
-
-To build the project run:
-
-```bash
-ng build
-```
-
-This will compile your project and store the build artifacts in the `dist/` directory. By default, the production build optimizes your application for performance and speed.
-
-## Running unit tests
-
-To execute unit tests with the [Vitest](https://vitest.dev/) test runner, use the following command:
-
-```bash
-ng test
-```
-
-## Running end-to-end tests
-
-For end-to-end (e2e) testing, run:
-
-```bash
-ng e2e
-```
-
-Angular CLI does not come with an end-to-end testing framework by default. You can choose one that suits your needs.
-
-## Additional Resources
-
-For more information on using the Angular CLI, including detailed command references, visit the [Angular CLI Overview and Command Reference](https://angular.dev/tools/cli) page.
+For iterative local frontend development with Angular CLI (`pnpm start` inside `web/`), run a local Flowsk backend (`flowsk serve --listen 127.0.0.1:8080 --ui`) or launch the embedded UI directly with `flowsk ui`.

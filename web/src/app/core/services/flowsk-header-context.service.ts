@@ -8,13 +8,20 @@ import { Injectable, signal } from '@angular/core';
 export class FlowskHeaderContextService {
   readonly workspaceRef = signal<string>('default');
   readonly actorHandle = signal<string>('web-operator');
+  readonly actorId = signal<string>('');
 
-  setIdentity(workspaceRef: string, actorHandle: string): void {
+  /**
+   * Updates active workspace and actor request header metadata.
+   */
+  setIdentity(workspaceRef: string, actorHandle: string, actorId?: string): void {
     if (workspaceRef.trim()) {
       this.workspaceRef.set(workspaceRef.trim());
     }
     if (actorHandle.trim()) {
       this.actorHandle.set(actorHandle.trim());
+    }
+    if (actorId !== undefined) {
+      this.actorId.set(actorId.trim());
     }
   }
 }

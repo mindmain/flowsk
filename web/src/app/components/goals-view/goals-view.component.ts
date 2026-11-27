@@ -14,7 +14,7 @@ import {
 } from '../../core/models/flowsk.models';
 import { FlowskStore } from '../../core/store/flowsk.store';
 
-type GoalStatusFilter = 'all' | 'open' | 'at_risk' | 'achieved';
+type GoalStatusFilter = 'all' | 'open' | 'at_risk' | 'achieved' | 'dropped';
 
 /**
  * Structured Goals, Milestones & Cycles Roadmap View.
@@ -138,6 +138,14 @@ type GoalStatusFilter = 'all' | 'open' | 'at_risk' | 'achieved';
                 [class]="filterBtnClass(statusFilter() === 'achieved')"
               >
                 Achieved ({{ summary().achievedObjectives }})
+              </button>
+              <button
+                type="button"
+                (click)="statusFilter.set('dropped')"
+                class="px-2.5 py-1 rounded-md text-xs transition-colors"
+                [class]="filterBtnClass(statusFilter() === 'dropped')"
+              >
+                Dropped ({{ summary().droppedObjectives }})
               </button>
               <button
                 type="button"
@@ -385,7 +393,7 @@ type GoalStatusFilter = 'all' | 'open' | 'at_risk' | 'achieved';
                         Success Criteria
                       </div>
                       <ul class="space-y-1 text-xs text-zinc-700 dark:text-zinc-300">
-                        @for (criterion of obj.successCriteria; track criterion) {
+                        @for (criterion of obj.successCriteria; track $index) {
                           <li class="flex items-start gap-2">
                             <span
                               class="font-mono text-[11px] mt-0.5"
@@ -406,14 +414,24 @@ type GoalStatusFilter = 'all' | 'open' | 'at_risk' | 'achieved';
                       @for (task of obj.tasks; track task.id) {
                         <div
                           (click)="store.loadTaskInspector({ taskId: task.id })"
+                          [class.task-signal-row-glow]="store.isTaskGlowing(task)"
                           class="px-5 py-2.5 flex flex-wrap items-center justify-between gap-2.5 hover:bg-zinc-100/70 dark:hover:bg-zinc-900/70 cursor-pointer transition-colors text-xs"
                         >
                           <div class="flex items-center gap-2.5 min-w-0 flex-1">
-                            <span class="font-mono text-[11px] text-zinc-500 dark:text-zinc-400 w-18 shrink-0">
-                              {{ task.identifier }}
+                            <span class="font-mono text-[11px] text-zinc-500 dark:text-zinc-400 w-20 shrink-0 flex items-center gap-1.5">
+                              @if (store.isTaskGlowing(task)) {
+                                <span
+                                  class="relative flex h-2 w-2 shrink-0"
+                                  [title]="'Active agent signal · ' + store.taskSignalAgeLabel(task)"
+                                >
+                                  <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                                  <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                                </span>
+                              }
+                              <span>{{ task.identifier }}</span>
                             </span>
                             <span
-                              class="text-[10px] font-mono px-1.5 py-0.2 rounded border shrink-0"
+                              class="text-[10px] font-mono px-1.5 py-0.5 rounded border shrink-0"
                               [class]="priorityClass(task)"
                             >
                               {{ shortPrio(task) }}
@@ -430,7 +448,7 @@ type GoalStatusFilter = 'all' | 'open' | 'at_risk' | 'achieved';
                             </span>
                             @if (task.hasMarkdownDoc) {
                               <span
-                                class="text-[10px] font-mono px-1.5 py-0.2 rounded bg-sky-500/10 text-sky-600 dark:text-sky-300 border border-sky-500/30 shrink-0"
+                                class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-600 dark:text-sky-300 border border-sky-500/30 shrink-0"
                                 title="Extended Task .md spec stored in ~/.flowsk/tasks"
                               >
                                 .md
@@ -442,7 +460,7 @@ type GoalStatusFilter = 'all' | 'open' | 'at_risk' | 'achieved';
                           </div>
 
                           <div class="flex items-center gap-2 shrink-0" (click)="$event.stopPropagation()">
-                            @if (task.claimedByActorId; as holderId) {
+                            @if (store.activeClaimHolderId(task); as holderId) {
                               <span
                                 class="px-1.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-600 dark:text-emerald-300 font-mono text-[11px] flex items-center gap-1"
                               >
@@ -528,6 +546,7 @@ export class GoalsViewComponent {
     let openObjectives = 0;
     let atRiskObjectives = 0;
     let achievedObjectives = 0;
+    let droppedObjectives = 0;
     let totalTasks = 0;
     let doneTasks = 0;
     let activeAgentClaims = 0;
@@ -535,7 +554,9 @@ export class GoalsViewComponent {
     for (const o of all) {
       if (o.status === 'achieved') {
         achievedObjectives++;
-      } else if (o.status !== 'dropped') {
+      } else if (o.status === 'dropped') {
+        droppedObjectives++;
+      } else {
         openObjectives++;
       }
       if (o.status === 'at_risk') {
@@ -552,6 +573,7 @@ export class GoalsViewComponent {
       openObjectives,
       atRiskObjectives,
       achievedObjectives,
+      droppedObjectives,
       totalTasks,
       doneTasks,
       overallPct,
@@ -572,6 +594,9 @@ export class GoalsViewComponent {
         return false;
       }
       if (sf === 'achieved' && o.status !== 'achieved') {
+        return false;
+      }
+      if (sf === 'dropped' && o.status !== 'dropped') {
         return false;
       }
       if (kf !== 'all' && o.kind !== kf) {

@@ -144,7 +144,7 @@ import { FlowskStore } from '../../core/store/flowsk.store';
             </span>
           </button>
 
-          @for (node of store.flatProjectHierarchy(); track node.project.id + '-' + node.depth) {
+          @for (node of store.flatProjectHierarchy(); track node.lineageKey) {
             <div class="group flex items-center gap-1">
               <button
                 type="button"

@@ -1,4 +1,14 @@
-import { ChangeDetectionStrategy, Component, effect, inject, input, output } from '@angular/core';
+import {
+  ChangeDetectionStrategy,
+  Component,
+  computed,
+  effect,
+  inject,
+  input,
+  output,
+  signal,
+  untracked,
+} from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import {
   CANONICAL_STATUS_COLUMNS,
@@ -11,6 +21,9 @@ import {
 } from '../../core/models/flowsk.models';
 import { FlowskStore } from '../../core/store/flowsk.store';
 
+/**
+ * Discriminated modal dialog identifier displayed by DialogsComponent.
+ */
 export type ActiveDialogType =
   | null
   | 'new-task'
@@ -21,6 +34,10 @@ export type ActiveDialogType =
   | 'purge-archive'
   | 'prune-orphans';
 
+/**
+ * Signal-driven OnPush modal dialogs for creating tasks, projects, charters,
+ * strategic objectives, archive purges, and memory orphan pruning.
+ */
 @Component({
   selector: 'app-dialogs',
   standalone: true,
@@ -40,13 +57,13 @@ export type ActiveDialogType =
           @if (dialog() === 'new-task') {
             <div class="flex items-center justify-between">
               <h2 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">New Task</h2>
-              <button type="button" (click)="close.emit()" class="text-xs text-zinc-400 hover:text-zinc-200">✕</button>
+              <button type="button" (click)="close.emit()" class="text-xs text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200">✕</button>
             </div>
 
             <div class="space-y-3">
               @if (!store.activeProjectId() && store.visibleProjects().length > 1) {
                 <select
-                  [(ngModel)]="taskProjectId"
+                  [ngModel]="taskProjectId()"
                   (ngModelChange)="onTaskProjectChange($event)"
                   class="w-full px-2.5 py-1.5 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
                 >
@@ -58,14 +75,16 @@ export type ActiveDialogType =
 
               <input
                 type="text"
-                [(ngModel)]="taskTitle"
+                [ngModel]="taskTitle()"
+                (ngModelChange)="taskTitle.set($event)"
                 placeholder="Task title (e.g. Implement WAL snapshot compaction)"
                 class="w-full px-3 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100 focus:outline-none"
               />
 
               <div class="grid grid-cols-3 gap-2">
                 <select
-                  [(ngModel)]="taskStatus"
+                  [ngModel]="taskStatus()"
+                  (ngModelChange)="taskStatus.set($event)"
                   class="px-2.5 py-1.5 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
                 >
                   @for (col of statusColumns; track col.status) {
@@ -74,17 +93,20 @@ export type ActiveDialogType =
                 </select>
 
                 <select
-                  [(ngModel)]="taskPriority"
+                  [ngModel]="taskPriority()"
+                  (ngModelChange)="taskPriority.set($event)"
                   class="px-2.5 py-1.5 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
                 >
                   <option value="TASK_PRIORITY_URGENT">P0 · Urgent</option>
                   <option value="TASK_PRIORITY_HIGH">P1 · High</option>
                   <option value="TASK_PRIORITY_MEDIUM">P2 · Medium</option>
                   <option value="TASK_PRIORITY_LOW">P3 · Low</option>
+                  <option value="TASK_PRIORITY_NONE">Unprioritized</option>
                 </select>
 
                 <select
-                  [(ngModel)]="taskKind"
+                  [ngModel]="taskKind()"
+                  (ngModelChange)="taskKind.set($event)"
                   class="px-2.5 py-1.5 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
                 >
                   <option value="TASK_KIND_FEATURE">Feature</option>
@@ -97,7 +119,8 @@ export type ActiveDialogType =
 
               @if (objectivesForTaskForm().length > 0) {
                 <select
-                  [(ngModel)]="taskObjectiveId"
+                  [ngModel]="taskObjectiveId()"
+                  (ngModelChange)="taskObjectiveId.set($event)"
                   class="w-full px-2.5 py-1.5 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
                 >
                   <option value="">No linked objective</option>
@@ -109,14 +132,16 @@ export type ActiveDialogType =
 
               <textarea
                 rows="3"
-                [(ngModel)]="taskDescription"
+                [ngModel]="taskDescription()"
+                (ngModelChange)="taskDescription.set($event)"
                 placeholder="Short summary..."
                 class="w-full px-3 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100 focus:outline-none"
               ></textarea>
 
               <textarea
                 rows="4"
-                [(ngModel)]="taskMarkdownDoc"
+                [ngModel]="taskMarkdownDoc()"
+                (ngModelChange)="taskMarkdownDoc.set($event)"
                 placeholder="Optional Task .md document saved in ~/.flowsk/tasks/ (leave empty if not needed)..."
                 class="w-full px-3 py-2 rounded-md text-xs font-mono bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100 focus:outline-none"
               ></textarea>
@@ -129,7 +154,7 @@ export type ActiveDialogType =
               <button
                 type="button"
                 (click)="submitNewTask()"
-                [disabled]="!taskTitle.trim() || store.saving()"
+                [disabled]="!taskTitle().trim() || store.saving()"
                 class="px-4 py-1.5 rounded-md bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-950 text-xs font-medium disabled:opacity-50"
               >
                 Create Task
@@ -148,14 +173,16 @@ export type ActiveDialogType =
               <div class="grid grid-cols-3 gap-2">
                 <input
                   type="text"
-                  [(ngModel)]="projKey"
+                  [ngModel]="projKey()"
+                  (ngModelChange)="projKey.set($event)"
                   placeholder="KEY (e.g. CORE)"
                   maxlength="10"
                   class="px-3 py-2 rounded-md text-xs font-mono uppercase bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
                 />
                 <input
                   type="text"
-                  [(ngModel)]="projName"
+                  [ngModel]="projName()"
+                  (ngModelChange)="projName.set($event)"
                   placeholder="Project Name"
                   class="col-span-2 px-3 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
                 />
@@ -164,7 +191,8 @@ export type ActiveDialogType =
               @if (store.visibleProjects().length > 0) {
                 <div class="grid grid-cols-2 gap-2">
                   <select
-                    [(ngModel)]="projParentId"
+                    [ngModel]="projParentId()"
+                    (ngModelChange)="onProjParentChange($event)"
                     class="px-2.5 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
                   >
                     <option value="">Standalone Root Project</option>
@@ -174,8 +202,9 @@ export type ActiveDialogType =
                   </select>
                   <input
                     type="text"
-                    [(ngModel)]="projScopeSubpath"
-                    [disabled]="!projParentId"
+                    [ngModel]="projScopeSubpath()"
+                    (ngModelChange)="projScopeSubpath.set($event)"
+                    [disabled]="!projParentId()"
                     placeholder="Relative subpath (e.g. apps/web)"
                     class="px-3 py-2 rounded-md text-xs font-mono bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100 disabled:opacity-45"
                   />
@@ -184,7 +213,8 @@ export type ActiveDialogType =
 
               <textarea
                 rows="3"
-                [(ngModel)]="projDescription"
+                [ngModel]="projDescription()"
+                (ngModelChange)="projDescription.set($event)"
                 placeholder="Logical project scope (never contains host filesystem paths)..."
                 class="w-full px-3 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
               ></textarea>
@@ -197,7 +227,7 @@ export type ActiveDialogType =
               <button
                 type="button"
                 (click)="submitNewProject()"
-                [disabled]="!projName.trim() || store.saving()"
+                [disabled]="!projName().trim() || store.saving()"
                 class="px-4 py-1.5 rounded-md bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-950 text-xs font-medium disabled:opacity-50"
               >
                 Create Project
@@ -217,12 +247,19 @@ export type ActiveDialogType =
               Saved inside <code class="font-mono text-[11px]">~/.flowsk/projects/</code> alongside
               <code class="font-mono text-[11px]">~/.flowsk/tasks/</code>. Clear text and save to remove the file.
             </p>
-            <textarea
-              rows="12"
-              [(ngModel)]="projectCharterMd"
-              placeholder="# {{ proj.name }} Charter&#10;&#10;Architecture invariants and goals..."
-              class="w-full p-3 rounded-lg text-xs font-mono bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
-            ></textarea>
+            @if (store.activeProjectMarkdownLoading()) {
+              <div class="py-8 text-center text-xs text-zinc-400 font-mono">
+                Loading Project .md charter...
+              </div>
+            } @else {
+              <textarea
+                rows="12"
+                [ngModel]="projectCharterMd()"
+                (ngModelChange)="onCharterChange($event)"
+                placeholder="# {{ proj.name }} Charter&#10;&#10;Architecture invariants and goals..."
+                class="w-full p-3 rounded-lg text-xs font-mono bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
+              ></textarea>
+            }
             <div class="flex justify-end gap-2">
               <button type="button" (click)="close.emit()" class="px-3 py-1.5 rounded text-xs text-zinc-500">
                 Cancel
@@ -230,8 +267,8 @@ export type ActiveDialogType =
               <button
                 type="button"
                 (click)="submitProjectCharter(proj.id)"
-                [disabled]="store.saving()"
-                class="px-4 py-1.5 rounded-md bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-950 text-xs font-medium"
+                [disabled]="store.saving() || store.activeProjectMarkdownLoading()"
+                class="px-4 py-1.5 rounded-md bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-950 text-xs font-medium disabled:opacity-50"
               >
                 Save Project .md
               </button>
@@ -248,7 +285,8 @@ export type ActiveDialogType =
             <div class="space-y-3">
               @if (!store.activeProjectId() && store.visibleProjects().length > 1) {
                 <select
-                  [(ngModel)]="objProjectId"
+                  [ngModel]="objProjectId()"
+                  (ngModelChange)="objProjectId.set($event)"
                   class="w-full px-2.5 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
                 >
                   @for (p of store.visibleProjects(); track p.id) {
@@ -259,7 +297,8 @@ export type ActiveDialogType =
 
               <div class="grid grid-cols-3 gap-2">
                 <select
-                  [(ngModel)]="objKind"
+                  [ngModel]="objKind()"
+                  (ngModelChange)="objKind.set($event)"
                   class="px-2.5 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
                 >
                   <option value="goal">Goal</option>
@@ -268,7 +307,8 @@ export type ActiveDialogType =
                 </select>
 
                 <select
-                  [(ngModel)]="objStatus"
+                  [ngModel]="objStatus()"
+                  (ngModelChange)="objStatus.set($event)"
                   class="px-2.5 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
                 >
                   <option value="active">Active</option>
@@ -278,28 +318,32 @@ export type ActiveDialogType =
 
                 <input
                   type="date"
-                  [(ngModel)]="objTargetDate"
+                  [ngModel]="objTargetDate()"
+                  (ngModelChange)="objTargetDate.set($event)"
                   class="px-2.5 py-1.5 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
                 />
               </div>
 
               <input
                 type="text"
-                [(ngModel)]="objTitle"
+                [ngModel]="objTitle()"
+                (ngModelChange)="objTitle.set($event)"
                 placeholder="Objective headline (e.g. Ship Real-Time Streaming & Structured Goals)"
                 class="w-full px-3 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
               />
 
               <textarea
                 rows="2"
-                [(ngModel)]="objSummary"
+                [ngModel]="objSummary()"
+                (ngModelChange)="objSummary.set($event)"
                 placeholder="Strategic context & scope..."
                 class="w-full px-3 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
               ></textarea>
 
               <textarea
                 rows="3"
-                [(ngModel)]="objCriteria"
+                [ngModel]="objCriteria()"
+                (ngModelChange)="objCriteria.set($event)"
                 placeholder="Verifiable success criteria (one per line)..."
                 class="w-full px-3 py-2 rounded-md text-xs font-mono bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
               ></textarea>
@@ -312,7 +356,7 @@ export type ActiveDialogType =
               <button
                 type="button"
                 (click)="submitObjective()"
-                [disabled]="!objTitle.trim() || store.saving()"
+                [disabled]="!objTitle().trim() || store.saving()"
                 class="px-4 py-1.5 rounded-md bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-950 text-xs font-medium disabled:opacity-50"
               >
                 Create Goal
@@ -332,14 +376,16 @@ export type ActiveDialogType =
             <div class="space-y-3">
               <input
                 type="text"
-                [(ngModel)]="objTitle"
+                [ngModel]="objTitle()"
+                (ngModelChange)="objTitle.set($event)"
                 placeholder="Objective headline"
                 class="w-full px-3 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
               />
 
               <div class="grid grid-cols-2 gap-2">
                 <select
-                  [(ngModel)]="objStatus"
+                  [ngModel]="objStatus()"
+                  (ngModelChange)="objStatus.set($event)"
                   class="px-2.5 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
                 >
                   <option value="planned">Planned</option>
@@ -351,21 +397,24 @@ export type ActiveDialogType =
 
                 <input
                   type="date"
-                  [(ngModel)]="objTargetDate"
+                  [ngModel]="objTargetDate()"
+                  (ngModelChange)="objTargetDate.set($event)"
                   class="px-2.5 py-1.5 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
                 />
               </div>
 
               <textarea
                 rows="3"
-                [(ngModel)]="objSummary"
+                [ngModel]="objSummary()"
+                (ngModelChange)="objSummary.set($event)"
                 placeholder="Strategic context & scope..."
                 class="w-full px-3 py-2 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
               ></textarea>
 
               <textarea
                 rows="4"
-                [(ngModel)]="objCriteria"
+                [ngModel]="objCriteria()"
+                (ngModelChange)="objCriteria.set($event)"
                 placeholder="Verifiable success criteria (one per line)..."
                 class="w-full px-3 py-2 rounded-md text-xs font-mono bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
               ></textarea>
@@ -378,7 +427,7 @@ export type ActiveDialogType =
               <button
                 type="button"
                 (click)="submitEditObjective(editObj.id)"
-                [disabled]="!objTitle.trim() || store.saving()"
+                [disabled]="!objTitle().trim() || store.saving()"
                 class="px-4 py-1.5 rounded-md bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-950 text-xs font-medium disabled:opacity-50"
               >
                 Save Changes
@@ -456,7 +505,7 @@ export type ActiveDialogType =
 
             @if (store.orphanReport().issueSummaries.length > 0) {
               <div class="max-h-36 overflow-y-auto p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] font-mono text-amber-700 dark:text-amber-300 space-y-1">
-                @for (item of store.orphanReport().issueSummaries; track item) {
+                @for (item of store.orphanReport().issueSummaries; track $index) {
                   <div>• {{ item }}</div>
                 }
               </div>
@@ -466,12 +515,32 @@ export type ActiveDialogType =
               </div>
             }
 
+            @if (store.lastPruneResult(); as pruneRes) {
+              <div class="p-2.5 rounded-lg bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 space-y-1.5">
+                <div class="flex items-center justify-between text-[11px] font-medium text-zinc-700 dark:text-zinc-300">
+                  <span>{{ pruneRes.dryRun ? 'Dry-Run Check Summary' : 'Pruned Resources Summary' }}</span>
+                  <span class="font-mono">{{ pruneRes.totalCleaned }} item(s)</span>
+                </div>
+                @if (pruneRes.cleanedSummaries.length > 0) {
+                  <div class="max-h-32 overflow-y-auto text-[11px] font-mono text-zinc-600 dark:text-zinc-400 space-y-0.5">
+                    @for (summaryItem of pruneRes.cleanedSummaries; track $index) {
+                      <div>• {{ summaryItem }}</div>
+                    }
+                  </div>
+                } @else {
+                  <div class="text-[11px] text-zinc-500 dark:text-zinc-400">
+                    No orphan items required cleanup.
+                  </div>
+                }
+              </div>
+            }
+
             <div class="flex items-center justify-between pt-2">
               <button
                 type="button"
                 (click)="runPrune(true)"
                 [disabled]="store.saving()"
-                class="px-3 py-1.5 rounded-md border border-zinc-200 dark:border-zinc-800 text-xs text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-900"
+                class="px-3 py-1.5 rounded-md border border-zinc-200 dark:border-zinc-800 text-xs text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-900 disabled:opacity-40"
               >
                 Dry-Run Check
               </button>
@@ -507,29 +576,39 @@ export class DialogsComponent {
 
   readonly statusColumns = CANONICAL_STATUS_COLUMNS;
 
-  taskProjectId = '';
-  taskTitle = '';
-  taskDescription = '';
-  taskMarkdownDoc = '';
-  taskStatus: TaskStatus = 'ready';
-  taskPriority: TaskPriority = 'TASK_PRIORITY_MEDIUM';
-  taskKind: TaskKind = 'TASK_KIND_FEATURE';
-  taskObjectiveId = '';
+  readonly taskProjectId = signal<string>('');
+  readonly taskTitle = signal<string>('');
+  readonly taskDescription = signal<string>('');
+  readonly taskMarkdownDoc = signal<string>('');
+  readonly taskStatus = signal<TaskStatus>('ready');
+  readonly taskPriority = signal<TaskPriority>('TASK_PRIORITY_MEDIUM');
+  readonly taskKind = signal<TaskKind>('TASK_KIND_FEATURE');
+  readonly taskObjectiveId = signal<string>('');
 
-  projKey = '';
-  projName = '';
-  projDescription = '';
-  projParentId = '';
-  projScopeSubpath = '';
-  projectCharterMd = '';
+  readonly projKey = signal<string>('');
+  readonly projName = signal<string>('');
+  readonly projDescription = signal<string>('');
+  readonly projParentId = signal<string>('');
+  readonly projScopeSubpath = signal<string>('');
+  readonly projectCharterMd = signal<string>('');
+  private readonly charterDirty = signal<boolean>(false);
 
-  objProjectId = '';
-  objKind: ObjectiveKind = 'goal';
-  objStatus: ObjectiveStatus = 'active';
-  objTargetDate = '';
-  objTitle = '';
-  objSummary = '';
-  objCriteria = '';
+  readonly objProjectId = signal<string>('');
+  readonly objKind = signal<ObjectiveKind>('goal');
+  readonly objStatus = signal<ObjectiveStatus>('active');
+  readonly objTargetDate = signal<string>('');
+  readonly objTitle = signal<string>('');
+  readonly objSummary = signal<string>('');
+  readonly objCriteria = signal<string>('');
+
+  readonly objectivesForTaskForm = computed<ObjectiveModel[]>(() => {
+    const pid = this.store.activeProjectId() || this.taskProjectId();
+    if (!pid) return [...this.store.scopedObjectives()];
+    return this.store.objectives().filter((o) => o.projectId === pid);
+  });
+
+  private lastDialog: ActiveDialogType = null;
+  private lastEditedObjectiveId: string | null = null;
 
   constructor() {
     effect(() => {
@@ -539,50 +618,115 @@ export class DialogsComponent {
       const presetProj = this.presetProjectId();
       const editObj = this.editingObjective();
 
-      if (current === 'new-task') {
-        this.taskStatus = presetStatus;
-        this.taskProjectId =
-          presetProj || this.store.activeProjectId() || this.store.visibleProjects()[0]?.id || '';
-        this.taskObjectiveId = presetObj;
+      if (current === null) {
+        this.lastDialog = null;
+        this.lastEditedObjectiveId = null;
+        this.charterDirty.set(false);
+        return;
       }
-      if (current === 'new-objective') {
-        this.objProjectId = this.store.activeProjectId() || this.store.visibleProjects()[0]?.id || '';
-        this.objKind = 'goal';
-        this.objStatus = 'active';
-        this.objTargetDate = '';
-        this.objTitle = '';
-        this.objSummary = '';
-        this.objCriteria = '';
+
+      if (current === 'new-task' && this.lastDialog !== 'new-task') {
+        const activePid = untracked(() => this.store.activeProjectId());
+        const firstVisible = untracked(() => this.store.visibleProjects()[0]?.id ?? '');
+        const resolvedProj = presetProj || activePid || firstVisible;
+        const validObj =
+          presetObj &&
+          untracked(() =>
+            this.store.objectives().some((o) => o.id === presetObj && (!resolvedProj || o.projectId === resolvedProj)),
+          )
+            ? presetObj
+            : '';
+        this.taskTitle.set('');
+        this.taskDescription.set('');
+        this.taskMarkdownDoc.set('');
+        this.taskStatus.set(presetStatus);
+        this.taskPriority.set('TASK_PRIORITY_MEDIUM');
+        this.taskKind.set('TASK_KIND_FEATURE');
+        this.taskProjectId.set(resolvedProj);
+        this.taskObjectiveId.set(validObj);
       }
-      if (current === 'edit-objective' && editObj) {
-        this.objProjectId = editObj.projectId;
-        this.objKind = editObj.kind;
-        this.objStatus = editObj.status;
-        this.objTargetDate = editObj.targetDate ? editObj.targetDate.slice(0, 10) : '';
-        this.objTitle = editObj.title;
-        this.objSummary = editObj.description;
-        this.objCriteria = editObj.successCriteria.join('\n');
+
+      if (current === 'new-project' && this.lastDialog !== 'new-project') {
+        this.projKey.set('');
+        this.projName.set('');
+        this.projDescription.set('');
+        this.projParentId.set('');
+        this.projScopeSubpath.set('');
       }
-      if (current === 'project-charter') {
-        this.projectCharterMd = this.store.activeProjectMarkdown();
+
+      if (current === 'new-objective' && this.lastDialog !== 'new-objective') {
+        const activePid = untracked(() => this.store.activeProjectId());
+        const firstVisible = untracked(() => this.store.visibleProjects()[0]?.id ?? '');
+        this.objProjectId.set(activePid || firstVisible);
+        this.objKind.set('goal');
+        this.objStatus.set('active');
+        this.objTargetDate.set('');
+        this.objTitle.set('');
+        this.objSummary.set('');
+        this.objCriteria.set('');
+      }
+
+      if (
+        current === 'edit-objective' &&
+        editObj &&
+        (this.lastDialog !== 'edit-objective' || this.lastEditedObjectiveId !== editObj.id)
+      ) {
+        this.lastEditedObjectiveId = editObj.id;
+        this.objProjectId.set(editObj.projectId);
+        this.objKind.set(editObj.kind);
+        this.objStatus.set(editObj.status);
+        this.objTargetDate.set(editObj.targetDate ? editObj.targetDate.slice(0, 10) : '');
+        this.objTitle.set(editObj.title);
+        this.objSummary.set(editObj.description);
+        this.objCriteria.set(editObj.successCriteria.join('\n'));
+      }
+
+      if (current === 'project-charter' && this.lastDialog !== 'project-charter') {
+        this.charterDirty.set(false);
+      }
+
+      this.lastDialog = current;
+    });
+
+    effect(() => {
+      const current = this.dialog();
+      const loading = this.store.activeProjectMarkdownLoading();
+      const loadedMd = this.store.activeProjectMarkdown();
+
+      if (current !== 'project-charter') {
+        return;
+      }
+      if (loading) {
+        this.projectCharterMd.set('');
+        return;
+      }
+      if (!untracked(() => this.charterDirty())) {
+        this.projectCharterMd.set(loadedMd);
       }
     });
   }
 
-  objectivesForTaskForm(): ObjectiveModel[] {
-    const pid = this.store.activeProjectId() || this.taskProjectId;
-    if (!pid) return [...this.store.scopedObjectives()];
-    return this.store.objectives().filter((o) => o.projectId === pid);
+  onCharterChange(value: string): void {
+    this.charterDirty.set(true);
+    this.projectCharterMd.set(value);
+  }
+
+  onProjParentChange(parentId: string): void {
+    this.projParentId.set(parentId);
+    if (!parentId) {
+      this.projScopeSubpath.set('');
+    }
   }
 
   onTaskProjectChange(projectId: string): void {
-    this.taskProjectId = projectId;
-    if (this.taskObjectiveId) {
+    this.taskProjectId.set(projectId);
+    const currentObjId = this.taskObjectiveId();
+    if (currentObjId) {
       const stillMatches = this.store
         .objectives()
-        .some((o) => o.id === this.taskObjectiveId && o.projectId === projectId);
+        .some((o) => o.id === currentObjId && o.projectId === projectId);
       if (!stillMatches) {
-        this.taskObjectiveId = '';
+        this.taskObjectiveId.set('');
       }
     }
   }
@@ -590,82 +734,93 @@ export class DialogsComponent {
   submitNewTask(): void {
     this.store.createTask({
       payload: {
-        projectId: this.store.activeProjectId() || this.taskProjectId || undefined,
-        title: this.taskTitle,
-        description: this.taskDescription,
+        projectId: this.store.activeProjectId() || this.taskProjectId() || undefined,
+        title: this.taskTitle(),
+        description: this.taskDescription(),
         acceptanceCriteria: '',
-        kind: this.taskKind,
-        priority: this.taskPriority,
-        initialStatus: this.taskStatus,
-        objectiveId: this.taskObjectiveId || undefined,
-        markdownDoc: this.taskMarkdownDoc,
+        kind: this.taskKind(),
+        priority: this.taskPriority(),
+        initialStatus: this.taskStatus(),
+        objectiveId: this.taskObjectiveId() || undefined,
+        markdownDoc: this.taskMarkdownDoc(),
       },
       onSuccess: () => {
-        this.taskTitle = '';
-        this.taskDescription = '';
-        this.taskMarkdownDoc = '';
+        this.taskTitle.set('');
+        this.taskDescription.set('');
+        this.taskMarkdownDoc.set('');
         this.close.emit();
       },
     });
   }
 
   submitNewProject(): void {
+    const name = this.projName();
+    const keyInput = this.projKey();
+    const parentId = this.projParentId();
     this.store.createProject({
       payload: {
-        keyPrefix: this.projKey || this.projName.slice(0, 4),
-        name: this.projName,
-        description: this.projDescription,
-        parentProjectId: this.projParentId || undefined,
-        scopeSubpath: this.projParentId ? this.projScopeSubpath : undefined,
+        keyPrefix: keyInput || name.slice(0, 4),
+        name,
+        description: this.projDescription(),
+        parentProjectId: parentId || undefined,
+        scopeSubpath: parentId ? this.projScopeSubpath() : undefined,
       },
       onSuccess: () => {
-        this.projKey = '';
-        this.projName = '';
-        this.projDescription = '';
-        this.projParentId = '';
-        this.projScopeSubpath = '';
+        this.projKey.set('');
+        this.projName.set('');
+        this.projDescription.set('');
+        this.projParentId.set('');
+        this.projScopeSubpath.set('');
         this.close.emit();
       },
     });
   }
 
   submitProjectCharter(projectId: string): void {
+    if (this.store.activeProjectMarkdownLoading()) {
+      return;
+    }
     this.store.saveProjectMarkdown({
-      payload: { projectId, markdown: this.projectCharterMd },
-      onSuccess: () => this.close.emit(),
+      payload: { projectId, markdown: this.projectCharterMd() },
+      onSuccess: () => {
+        this.charterDirty.set(false);
+        this.close.emit();
+      },
     });
   }
 
   submitObjective(): void {
     this.store.createObjective({
       payload: {
-        projectId: this.store.activeProjectId() || this.objProjectId || undefined,
-        kind: this.objKind,
-        status: this.objStatus,
-        title: this.objTitle,
-        description: this.objSummary,
-        successCriteria: this.objCriteria || this.objSummary,
-        targetDate: this.objTargetDate || undefined,
+        projectId: this.store.activeProjectId() || this.objProjectId() || undefined,
+        kind: this.objKind(),
+        status: this.objStatus(),
+        title: this.objTitle(),
+        description: this.objSummary(),
+        successCriteria: this.objCriteria(),
+        targetDate: this.objTargetDate() || undefined,
       },
       onSuccess: () => {
-        this.objTitle = '';
-        this.objSummary = '';
-        this.objCriteria = '';
-        this.objTargetDate = '';
+        this.objTitle.set('');
+        this.objSummary.set('');
+        this.objCriteria.set('');
+        this.objTargetDate.set('');
         this.close.emit();
       },
     });
   }
 
   submitEditObjective(objectiveId: string): void {
+    const trimmedDate = this.objTargetDate().trim();
     this.store.updateObjective({
       payload: {
         objectiveId,
-        title: this.objTitle,
-        description: this.objSummary,
-        successCriteria: this.objCriteria,
-        status: this.objStatus,
-        targetDate: this.objTargetDate || undefined,
+        title: this.objTitle(),
+        description: this.objSummary(),
+        successCriteria: this.objCriteria(),
+        status: this.objStatus(),
+        targetDate: trimmedDate,
+        clearTargetDate: trimmedDate === '',
       },
       onSuccess: () => {
         this.close.emit();
@@ -683,11 +838,6 @@ export class DialogsComponent {
   runPrune(dryRun: boolean): void {
     this.store.pruneOrphans({
       payload: { dryRun },
-      onSuccess: () => {
-        if (!dryRun) {
-          this.close.emit();
-        }
-      },
     });
   }
 }

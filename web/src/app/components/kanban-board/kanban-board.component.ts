@@ -48,6 +48,7 @@ import { FlowskStore } from '../../core/store/flowsk.store';
           <!-- CDK Drop Zone -->
           <div
             cdkDropList
+            [cdkDropListSortingDisabled]="true"
             [cdkDropListData]="col.status"
             (cdkDropListDropped)="onDrop($event, col.status)"
             class="kanban-drop-list p-2 space-y-2 overflow-y-auto flex-1 min-h-[120px]"
@@ -57,15 +58,25 @@ import { FlowskStore } from '../../core/store/flowsk.store';
                 cdkDrag
                 [cdkDragData]="task"
                 (click)="selectTask(task.id)"
+                [class.task-signal-glow]="store.isTaskGlowing(task)"
                 class="kanban-card group p-3 rounded-lg bg-white dark:bg-zinc-950 border border-zinc-200/90 dark:border-zinc-800/90 hover:border-zinc-400 dark:hover:border-zinc-600 shadow-2xs cursor-pointer transition-colors"
               >
                 <div class="flex items-center justify-between gap-2">
                   <div class="flex items-center gap-1.5 min-w-0">
+                    @if (store.isTaskGlowing(task)) {
+                      <span
+                        class="relative flex h-2 w-2 shrink-0"
+                        [title]="'Active agent signal · ' + store.taskSignalAgeLabel(task)"
+                      >
+                        <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                        <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                      </span>
+                    }
                     <span class="text-[11px] font-mono text-zinc-500 dark:text-zinc-400">
                       {{ task.identifier }}
                     </span>
                     <span
-                      class="text-[10px] font-mono px-1 py-0.2 rounded border"
+                      class="text-[10px] font-mono px-1 py-0.5 rounded border"
                       [class]="priorityBadgeClass(task)"
                     >
                       {{ shortPriority(task) }}
@@ -80,7 +91,7 @@ import { FlowskStore } from '../../core/store/flowsk.store';
                     }
                   </div>
 
-                  <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
                     @if (task.status !== 'archived') {
                       <button
                         type="button"
@@ -111,7 +122,7 @@ import { FlowskStore } from '../../core/store/flowsk.store';
                   <span>{{ kindLabel(task) }}</span>
 
                   <div class="flex items-center gap-1.5 truncate">
-                    @if (task.claimedByActorId; as holderId) {
+                    @if (store.activeClaimHolderId(task); as holderId) {
                       <span
                         class="px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-300 font-mono truncate max-w-[110px]"
                       >

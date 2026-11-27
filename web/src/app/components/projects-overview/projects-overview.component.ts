@@ -86,11 +86,15 @@ import { FlowskStore } from '../../core/store/flowsk.store';
           <div
             class="rounded-xl border border-dashed border-zinc-300 dark:border-zinc-800 p-8 text-center text-xs text-zinc-500"
           >
-            No projects match "{{ filterQuery() }}".
+            @if (filterQuery().trim()) {
+              No projects match "{{ filterQuery().trim() }}".
+            } @else {
+              No active projects visible. Toggle "Show archived projects" in the sidebar or create a new project.
+            }
           </div>
         } @else {
           <div class="grid grid-cols-1 md:grid-cols-2 gap-3.5">
-            @for (root of filteredRoots(); track root.project.id) {
+            @for (root of filteredRoots(); track root.lineageKey) {
               <div
                 class="rounded-xl bg-white dark:bg-zinc-900/60 border border-zinc-200 dark:border-zinc-800/90 hover:border-zinc-300 dark:hover:border-zinc-700 transition-colors flex flex-col overflow-hidden"
               >
@@ -177,7 +181,7 @@ import { FlowskStore } from '../../core/store/flowsk.store';
                     >
                       Subprojects ({{ flattenDescendants(root).length }})
                     </div>
-                    @for (sub of flattenDescendants(root); track sub.project.id + '-' + sub.depth) {
+                    @for (sub of flattenDescendants(root); track sub.lineageKey) {
                       <button
                         type="button"
                         (click)="store.selectProject(sub.project.id)"

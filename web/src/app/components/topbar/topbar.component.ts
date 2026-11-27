@@ -35,7 +35,7 @@ import { FlowskStore } from '../../core/store/flowsk.store';
               <option value="">
                 All Registered Projects ({{ store.visibleProjects().length }})
               </option>
-              @for (node of store.flatProjectHierarchy(); track node.project.id + '-' + node.depth) {
+              @for (node of store.flatProjectHierarchy(); track node.lineageKey) {
                 <option [value]="node.project.id">
                   {{ formatSelectorOption(node) }}
                 </option>
@@ -142,7 +142,7 @@ import { FlowskStore } from '../../core/store/flowsk.store';
                   </div>
                 } @else {
                   <div class="max-h-64 overflow-y-auto space-y-1.5">
-                    @for (ev of store.liveEvents(); track ev.id + ev.occurredAt) {
+                    @for (ev of store.liveEvents(); track (ev.id || $index) + '-' + ev.occurredAt) {
                       <div
                         class="p-2 rounded-lg bg-zinc-50 dark:bg-zinc-900/70 border border-zinc-200/70 dark:border-zinc-800/80 text-[11px] space-y-0.5"
                       >
@@ -272,6 +272,7 @@ import { FlowskStore } from '../../core/store/flowsk.store';
             <option value="TASK_PRIORITY_HIGH">P1 · High</option>
             <option value="TASK_PRIORITY_MEDIUM">P2 · Medium</option>
             <option value="TASK_PRIORITY_LOW">P3 · Low</option>
+            <option value="TASK_PRIORITY_NONE">Unprioritized</option>
           </select>
 
           @if (store.scopedObjectives().length > 0) {
@@ -318,6 +319,14 @@ export class TopbarComponent {
 
   onProjectChange(projectId: string): void {
     this.store.selectProject(projectId ? projectId : null);
+  }
+
+  closeActivityPopover(): boolean {
+    if (!this.activityOpen()) {
+      return false;
+    }
+    this.activityOpen.set(false);
+    return true;
   }
 
   formatSelectorOption(node: ProjectHierarchyNode): string {
