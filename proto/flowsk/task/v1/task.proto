@@ -140,6 +140,13 @@ message Task {
   string status = 26;
   // Optional external tracker identifier (e.g. ClickUp, Linear, Jira, GitHub Issues), unique per (project_id, external_id).
   string external_id = 27 [(buf.validate.field).string.max_len = 255];
+  // Freeform classification tags attached to this task (e.g. "security", "backend").
+  repeated string tags = 28 [(buf.validate.field).repeated.items.string = {
+    min_len: 1
+    max_len: 64
+  }];
+  // Optional UTC timestamp of the most recent agent/CLI/MCP activity signal on this task (unset when NULL).
+  google.protobuf.Timestamp last_signal_at = 29;
 }
 
 // TaskRelation represents a directed dependency or semantic edge between two tasks
@@ -224,6 +231,8 @@ message CompactTaskSummary {
   bool has_markdown_doc = 12;
   // Optional external tracker identifier (e.g., "CU-869abc" or "LIN-142").
   string external_id = 13 [(buf.validate.field).string.max_len = 255];
+  // Optional UTC timestamp of the most recent agent/CLI/MCP activity signal on this task (unset when NULL).
+  google.protobuf.Timestamp last_signal_at = 14;
 }
 
 // StateCategoryCount pairs a canonical WorkflowStateCategory with the number of
@@ -378,6 +387,11 @@ message CreateTaskRequest {
   google.protobuf.Timestamp due_at = 15;
   // Optional external tracker ID (e.g. ClickUp, Linear, Jira), enforced unique per (project_id, external_id).
   string external_id = 16 [(buf.validate.field).string.max_len = 255];
+  // Optional freeform classification tags to attach on creation.
+  repeated string tags = 17 [(buf.validate.field).repeated.items.string = {
+    min_len: 1
+    max_len: 64
+  }];
 }
 
 // CreateTaskResponse wraps the newly created Task.
@@ -522,6 +536,13 @@ message UpdateTaskRequest {
   optional string external_id = 20 [(buf.validate.field).string.max_len = 255];
   // When true, clears external_id back to empty/unset.
   bool clear_external_id = 21;
+  // Replacement set of freeform classification tags when replace_tags is true.
+  repeated string tags = 22 [(buf.validate.field).repeated.items.string = {
+    min_len: 1
+    max_len: 64
+  }];
+  // When true, replaces the task's freeform tags with the supplied tags list (even when empty).
+  bool replace_tags = 23;
 }
 
 // UpdateTaskResponse wraps the updated Task entity.
@@ -588,6 +609,8 @@ message ReleaseTaskClaimRequest {
   string task_id = 3 [(buf.validate.field).string.uuid = true];
   // Optional structured handoff note saved as a TASK_COMMENT_KIND_HANDOFF comment.
   string handoff_note = 4 [(buf.validate.field).string.max_len = 16000];
+  // When true, administratively revokes an active claim lease held by another actor.
+  bool force = 5;
 }
 
 // ReleaseTaskClaimResponse returns the Task with cleared claim lease fields.

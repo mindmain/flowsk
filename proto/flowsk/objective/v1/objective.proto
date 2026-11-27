@@ -220,6 +220,8 @@ message UpdateObjectiveRequest {
   google.protobuf.Timestamp start_date = 10;
   // Optional updated target completion timestamp.
   google.protobuf.Timestamp target_date = 11;
+  // When true, clears target_date back to unset.
+  bool clear_target_date = 12;
 }
 
 // UpdateObjectiveResponse wraps the updated objective entity.

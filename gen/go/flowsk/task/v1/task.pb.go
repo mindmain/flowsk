@@ -334,7 +334,11 @@ type Task struct {
 	// Canonical workflow status slug (`backlog`, `ready`, `in_progress`, `in_review`, `blocked`, `done`, `cancelled`, `archived`).
 	Status string `protobuf:"bytes,26,opt,name=status,proto3" json:"status,omitempty"`
 	// Optional external tracker identifier (e.g. ClickUp, Linear, Jira, GitHub Issues), unique per (project_id, external_id).
-	ExternalId    string `protobuf:"bytes,27,opt,name=external_id,json=externalId,proto3" json:"external_id,omitempty"`
+	ExternalId string `protobuf:"bytes,27,opt,name=external_id,json=externalId,proto3" json:"external_id,omitempty"`
+	// Freeform classification tags attached to this task (e.g. "security", "backend").
+	Tags []string `protobuf:"bytes,28,rep,name=tags,proto3" json:"tags,omitempty"`
+	// Optional UTC timestamp of the most recent agent/CLI/MCP activity signal on this task (unset when NULL).
+	LastSignalAt  *timestamppb.Timestamp `protobuf:"bytes,29,opt,name=last_signal_at,json=lastSignalAt,proto3" json:"last_signal_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -556,6 +560,20 @@ func (x *Task) GetExternalId() string {
 		return x.ExternalId
 	}
 	return ""
+}
+
+func (x *Task) GetTags() []string {
+	if x != nil {
+		return x.Tags
+	}
+	return nil
+}
+
+func (x *Task) GetLastSignalAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.LastSignalAt
+	}
+	return nil
 }
 
 // TaskRelation represents a directed dependency or semantic edge between two tasks
@@ -799,7 +817,9 @@ type CompactTaskSummary struct {
 	// True when an extended Markdown resource document (`<task_id>.md`) is stored for this task.
 	HasMarkdownDoc bool `protobuf:"varint,12,opt,name=has_markdown_doc,json=hasMarkdownDoc,proto3" json:"has_markdown_doc,omitempty"`
 	// Optional external tracker identifier (e.g., "CU-869abc" or "LIN-142").
-	ExternalId    string `protobuf:"bytes,13,opt,name=external_id,json=externalId,proto3" json:"external_id,omitempty"`
+	ExternalId string `protobuf:"bytes,13,opt,name=external_id,json=externalId,proto3" json:"external_id,omitempty"`
+	// Optional UTC timestamp of the most recent agent/CLI/MCP activity signal on this task (unset when NULL).
+	LastSignalAt  *timestamppb.Timestamp `protobuf:"bytes,14,opt,name=last_signal_at,json=lastSignalAt,proto3" json:"last_signal_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -923,6 +943,13 @@ func (x *CompactTaskSummary) GetExternalId() string {
 		return x.ExternalId
 	}
 	return ""
+}
+
+func (x *CompactTaskSummary) GetLastSignalAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.LastSignalAt
+	}
+	return nil
 }
 
 // StateCategoryCount pairs a canonical WorkflowStateCategory with the number of
@@ -1135,7 +1162,9 @@ type CreateTaskRequest struct {
 	// Optional target due timestamp.
 	DueAt *timestamppb.Timestamp `protobuf:"bytes,15,opt,name=due_at,json=dueAt,proto3" json:"due_at,omitempty"`
 	// Optional external tracker ID (e.g. ClickUp, Linear, Jira), enforced unique per (project_id, external_id).
-	ExternalId    string `protobuf:"bytes,16,opt,name=external_id,json=externalId,proto3" json:"external_id,omitempty"`
+	ExternalId string `protobuf:"bytes,16,opt,name=external_id,json=externalId,proto3" json:"external_id,omitempty"`
+	// Optional freeform classification tags to attach on creation.
+	Tags          []string `protobuf:"bytes,17,rep,name=tags,proto3" json:"tags,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1280,6 +1309,13 @@ func (x *CreateTaskRequest) GetExternalId() string {
 		return x.ExternalId
 	}
 	return ""
+}
+
+func (x *CreateTaskRequest) GetTags() []string {
+	if x != nil {
+		return x.Tags
+	}
+	return nil
 }
 
 // CreateTaskResponse wraps the newly created Task.
@@ -1856,8 +1892,12 @@ type UpdateTaskRequest struct {
 	ExternalId *string `protobuf:"bytes,20,opt,name=external_id,json=externalId,proto3,oneof" json:"external_id,omitempty"`
 	// When true, clears external_id back to empty/unset.
 	ClearExternalId bool `protobuf:"varint,21,opt,name=clear_external_id,json=clearExternalId,proto3" json:"clear_external_id,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Replacement set of freeform classification tags when replace_tags is true.
+	Tags []string `protobuf:"bytes,22,rep,name=tags,proto3" json:"tags,omitempty"`
+	// When true, replaces the task's freeform tags with the supplied tags list (even when empty).
+	ReplaceTags   bool `protobuf:"varint,23,opt,name=replace_tags,json=replaceTags,proto3" json:"replace_tags,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *UpdateTaskRequest) Reset() {
@@ -2033,6 +2073,20 @@ func (x *UpdateTaskRequest) GetExternalId() string {
 func (x *UpdateTaskRequest) GetClearExternalId() bool {
 	if x != nil {
 		return x.ClearExternalId
+	}
+	return false
+}
+
+func (x *UpdateTaskRequest) GetTags() []string {
+	if x != nil {
+		return x.Tags
+	}
+	return nil
+}
+
+func (x *UpdateTaskRequest) GetReplaceTags() bool {
+	if x != nil {
+		return x.ReplaceTags
 	}
 	return false
 }
@@ -2361,7 +2415,9 @@ type ReleaseTaskClaimRequest struct {
 	// Target task UUID whose claim lease is being released.
 	TaskId string `protobuf:"bytes,3,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
 	// Optional structured handoff note saved as a TASK_COMMENT_KIND_HANDOFF comment.
-	HandoffNote   string `protobuf:"bytes,4,opt,name=handoff_note,json=handoffNote,proto3" json:"handoff_note,omitempty"`
+	HandoffNote string `protobuf:"bytes,4,opt,name=handoff_note,json=handoffNote,proto3" json:"handoff_note,omitempty"`
+	// When true, administratively revokes an active claim lease held by another actor.
+	Force         bool `protobuf:"varint,5,opt,name=force,proto3" json:"force,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2422,6 +2478,13 @@ func (x *ReleaseTaskClaimRequest) GetHandoffNote() string {
 		return x.HandoffNote
 	}
 	return ""
+}
+
+func (x *ReleaseTaskClaimRequest) GetForce() bool {
+	if x != nil {
+		return x.Force
+	}
+	return false
 }
 
 // ReleaseTaskClaimResponse returns the Task with cleared claim lease fields.
@@ -4268,7 +4331,7 @@ var File_flowsk_task_v1_task_proto protoreflect.FileDescriptor
 
 const file_flowsk_task_v1_task_proto_rawDesc = "" +
 	"\n" +
-	"\x19flowsk/task/v1/task.proto\x12\x0eflowsk.task.v1\x1a\x1bbuf/validate/validate.proto\x1a\x1fflowsk/project/v1/project.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xf4\v\n" +
+	"\x19flowsk/task/v1/task.proto\x12\x0eflowsk.task.v1\x1a\x1bbuf/validate/validate.proto\x1a\x1fflowsk/project/v1/project.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xda\f\n" +
 	"\x04Task\x12\x18\n" +
 	"\x02id\x18\x01 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\x02id\x12+\n" +
 	"\fworkspace_id\x18\x02 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\vworkspaceId\x12'\n" +
@@ -4307,7 +4370,9 @@ const file_flowsk_task_v1_task_proto_rawDesc = "" +
 	"\x10has_markdown_doc\x18\x19 \x01(\bR\x0ehasMarkdownDoc\x12\x16\n" +
 	"\x06status\x18\x1a \x01(\tR\x06status\x12)\n" +
 	"\vexternal_id\x18\x1b \x01(\tB\b\xbaH\x05r\x03\x18\xff\x01R\n" +
-	"externalIdB\x0f\n" +
+	"externalId\x12\"\n" +
+	"\x04tags\x18\x1c \x03(\tB\x0e\xbaH\v\x92\x01\b\"\x06r\x04\x10\x01\x18@R\x04tags\x12@\n" +
+	"\x0elast_signal_at\x18\x1d \x01(\v2\x1a.google.protobuf.TimestampR\flastSignalAtB\x0f\n" +
 	"\r_objective_idB\x11\n" +
 	"\x0f_parent_task_idB\x14\n" +
 	"\x12_assignee_actor_idB\x16\n" +
@@ -4334,7 +4399,7 @@ const file_flowsk_task_v1_task_proto_rawDesc = "" +
 	"\n" +
 	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x129\n" +
 	"\n" +
-	"updated_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\"\xb8\x05\n" +
+	"updated_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\"\xfa\x05\n" +
 	"\x12CompactTaskSummary\x12\x18\n" +
 	"\x02id\x18\x01 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\x02id\x12)\n" +
 	"\n" +
@@ -4354,7 +4419,8 @@ const file_flowsk_task_v1_task_proto_rawDesc = "" +
 	"\fobjective_id\x18\v \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01H\x01R\vobjectiveId\x88\x01\x01\x12(\n" +
 	"\x10has_markdown_doc\x18\f \x01(\bR\x0ehasMarkdownDoc\x12)\n" +
 	"\vexternal_id\x18\r \x01(\tB\b\xbaH\x05r\x03\x18\xff\x01R\n" +
-	"externalIdB\x16\n" +
+	"externalId\x12@\n" +
+	"\x0elast_signal_at\x18\x0e \x01(\v2\x1a.google.protobuf.TimestampR\flastSignalAtB\x16\n" +
 	"\x14_claimed_by_actor_idB\x0f\n" +
 	"\r_objective_id\"\x83\x01\n" +
 	"\x12StateCategoryCount\x12N\n" +
@@ -4371,7 +4437,7 @@ const file_flowsk_task_v1_task_proto_rawDesc = "" +
 	"\x0factive_blockers\x18\x06 \x03(\v2\".flowsk.task.v1.CompactTaskSummaryR\x0eactiveBlockers\x12e\n" +
 	"\x1dunclaimed_high_priority_tasks\x18\a \x03(\v2\".flowsk.task.v1.CompactTaskSummaryR\x1aunclaimedHighPriorityTasks\x127\n" +
 	"\x13active_agent_claims\x18\b \x01(\x05B\a\xbaH\x04\x1a\x02(\x00R\x11activeAgentClaims\x12=\n" +
-	"\fgenerated_at\x18\t \x01(\v2\x1a.google.protobuf.TimestampR\vgeneratedAt\"\xfd\x06\n" +
+	"\fgenerated_at\x18\t \x01(\v2\x1a.google.protobuf.TimestampR\vgeneratedAt\"\xa1\a\n" +
 	"\x11CreateTaskRequest\x12+\n" +
 	"\fworkspace_id\x18\x01 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\vworkspaceId\x12#\n" +
 	"\bactor_id\x18\x02 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\aactorId\x12'\n" +
@@ -4393,7 +4459,8 @@ const file_flowsk_task_v1_task_proto_rawDesc = "" +
 	"\x0festimate_points\x18\x0e \x01(\x05B\a\xbaH\x04\x1a\x02(\x00R\x0eestimatePoints\x121\n" +
 	"\x06due_at\x18\x0f \x01(\v2\x1a.google.protobuf.TimestampR\x05dueAt\x12)\n" +
 	"\vexternal_id\x18\x10 \x01(\tB\b\xbaH\x05r\x03\x18\xff\x01R\n" +
-	"externalIdB\x14\n" +
+	"externalId\x12\"\n" +
+	"\x04tags\x18\x11 \x03(\tB\x0e\xbaH\v\x92\x01\b\"\x06r\x04\x10\x01\x18@R\x04tagsB\x14\n" +
 	"\x12_workflow_state_idB\x0f\n" +
 	"\r_objective_idB\x11\n" +
 	"\x0f_parent_task_idB\x14\n" +
@@ -4449,7 +4516,7 @@ const file_flowsk_task_v1_task_proto_rawDesc = "" +
 	"\x13_external_id_filter\"g\n" +
 	"\x11ListTasksResponse\x12*\n" +
 	"\x05tasks\x18\x01 \x03(\v2\x14.flowsk.task.v1.TaskR\x05tasks\x12&\n" +
-	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\x86\t\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xcd\t\n" +
 	"\x11UpdateTaskRequest\x12+\n" +
 	"\fworkspace_id\x18\x01 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\vworkspaceId\x12#\n" +
 	"\bactor_id\x18\x02 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\aactorId\x12!\n" +
@@ -4476,7 +4543,9 @@ const file_flowsk_task_v1_task_proto_rawDesc = "" +
 	"clearDueAt\x12.\n" +
 	"\vexternal_id\x18\x14 \x01(\tB\b\xbaH\x05r\x03\x18\xff\x01H\aR\n" +
 	"externalId\x88\x01\x01\x12*\n" +
-	"\x11clear_external_id\x18\x15 \x01(\bR\x0fclearExternalIdB\b\n" +
+	"\x11clear_external_id\x18\x15 \x01(\bR\x0fclearExternalId\x12\"\n" +
+	"\x04tags\x18\x16 \x03(\tB\x0e\xbaH\v\x92\x01\b\"\x06r\x04\x10\x01\x18@R\x04tags\x12!\n" +
+	"\freplace_tags\x18\x17 \x01(\bR\vreplaceTagsB\b\n" +
 	"\x06_titleB\x0e\n" +
 	"\f_descriptionB\x16\n" +
 	"\x14_acceptance_criteriaB\x0f\n" +
@@ -4503,12 +4572,13 @@ const file_flowsk_task_v1_task_proto_rawDesc = "" +
 	"\x11lease_ttl_seconds\x18\x04 \x01(\x05B\v\xbaH\b\x1a\x06\x18\x80\xa3\x05(\x00R\x0fleaseTtlSeconds\x12%\n" +
 	"\x0eforce_takeover\x18\x05 \x01(\bR\rforceTakeover\"=\n" +
 	"\x11ClaimTaskResponse\x12(\n" +
-	"\x04task\x18\x01 \x01(\v2\x14.flowsk.task.v1.TaskR\x04task\"\xbb\x01\n" +
+	"\x04task\x18\x01 \x01(\v2\x14.flowsk.task.v1.TaskR\x04task\"\xd1\x01\n" +
 	"\x17ReleaseTaskClaimRequest\x12+\n" +
 	"\fworkspace_id\x18\x01 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\vworkspaceId\x12#\n" +
 	"\bactor_id\x18\x02 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\aactorId\x12!\n" +
 	"\atask_id\x18\x03 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\x06taskId\x12+\n" +
-	"\fhandoff_note\x18\x04 \x01(\tB\b\xbaH\x05r\x03\x18\x80}R\vhandoffNote\"D\n" +
+	"\fhandoff_note\x18\x04 \x01(\tB\b\xbaH\x05r\x03\x18\x80}R\vhandoffNote\x12\x14\n" +
+	"\x05force\x18\x05 \x01(\bR\x05force\"D\n" +
 	"\x18ReleaseTaskClaimResponse\x12(\n" +
 	"\x04task\x18\x01 \x01(\v2\x14.flowsk.task.v1.TaskR\x04task\"\x9d\x02\n" +
 	"\x16AddTaskRelationRequest\x12+\n" +
@@ -4772,102 +4842,104 @@ var file_flowsk_task_v1_task_proto_depIdxs = []int32{
 	55, // 5: flowsk.task.v1.Task.completed_at:type_name -> google.protobuf.Timestamp
 	55, // 6: flowsk.task.v1.Task.created_at:type_name -> google.protobuf.Timestamp
 	55, // 7: flowsk.task.v1.Task.updated_at:type_name -> google.protobuf.Timestamp
-	2,  // 8: flowsk.task.v1.TaskRelation.relation_type:type_name -> flowsk.task.v1.TaskRelationType
-	55, // 9: flowsk.task.v1.TaskRelation.created_at:type_name -> google.protobuf.Timestamp
-	3,  // 10: flowsk.task.v1.TaskComment.kind:type_name -> flowsk.task.v1.TaskCommentKind
-	55, // 11: flowsk.task.v1.TaskComment.created_at:type_name -> google.protobuf.Timestamp
-	55, // 12: flowsk.task.v1.TaskComment.updated_at:type_name -> google.protobuf.Timestamp
-	0,  // 13: flowsk.task.v1.CompactTaskSummary.kind:type_name -> flowsk.task.v1.TaskKind
-	1,  // 14: flowsk.task.v1.CompactTaskSummary.priority:type_name -> flowsk.task.v1.TaskPriority
-	54, // 15: flowsk.task.v1.CompactTaskSummary.state_category:type_name -> flowsk.project.v1.WorkflowStateCategory
-	55, // 16: flowsk.task.v1.CompactTaskSummary.claim_expires_at:type_name -> google.protobuf.Timestamp
-	54, // 17: flowsk.task.v1.StateCategoryCount.category:type_name -> flowsk.project.v1.WorkflowStateCategory
-	8,  // 18: flowsk.task.v1.ProjectDigest.counts_by_state_category:type_name -> flowsk.task.v1.StateCategoryCount
-	7,  // 19: flowsk.task.v1.ProjectDigest.active_blockers:type_name -> flowsk.task.v1.CompactTaskSummary
-	7,  // 20: flowsk.task.v1.ProjectDigest.unclaimed_high_priority_tasks:type_name -> flowsk.task.v1.CompactTaskSummary
-	55, // 21: flowsk.task.v1.ProjectDigest.generated_at:type_name -> google.protobuf.Timestamp
-	0,  // 22: flowsk.task.v1.CreateTaskRequest.kind:type_name -> flowsk.task.v1.TaskKind
-	1,  // 23: flowsk.task.v1.CreateTaskRequest.priority:type_name -> flowsk.task.v1.TaskPriority
-	55, // 24: flowsk.task.v1.CreateTaskRequest.due_at:type_name -> google.protobuf.Timestamp
-	4,  // 25: flowsk.task.v1.CreateTaskResponse.task:type_name -> flowsk.task.v1.Task
-	4,  // 26: flowsk.task.v1.GetTaskResponse.task:type_name -> flowsk.task.v1.Task
-	5,  // 27: flowsk.task.v1.GetTaskResponse.relations:type_name -> flowsk.task.v1.TaskRelation
-	4,  // 28: flowsk.task.v1.GetTaskByIdentifierResponse.task:type_name -> flowsk.task.v1.Task
-	5,  // 29: flowsk.task.v1.GetTaskByIdentifierResponse.relations:type_name -> flowsk.task.v1.TaskRelation
-	54, // 30: flowsk.task.v1.ListTasksRequest.state_category_filter:type_name -> flowsk.project.v1.WorkflowStateCategory
-	0,  // 31: flowsk.task.v1.ListTasksRequest.kind_filter:type_name -> flowsk.task.v1.TaskKind
-	1,  // 32: flowsk.task.v1.ListTasksRequest.priority_filter:type_name -> flowsk.task.v1.TaskPriority
-	4,  // 33: flowsk.task.v1.ListTasksResponse.tasks:type_name -> flowsk.task.v1.Task
-	0,  // 34: flowsk.task.v1.UpdateTaskRequest.kind:type_name -> flowsk.task.v1.TaskKind
-	1,  // 35: flowsk.task.v1.UpdateTaskRequest.priority:type_name -> flowsk.task.v1.TaskPriority
-	55, // 36: flowsk.task.v1.UpdateTaskRequest.due_at:type_name -> google.protobuf.Timestamp
-	4,  // 37: flowsk.task.v1.UpdateTaskResponse.task:type_name -> flowsk.task.v1.Task
-	4,  // 38: flowsk.task.v1.TransitionTaskStateResponse.task:type_name -> flowsk.task.v1.Task
-	4,  // 39: flowsk.task.v1.ClaimTaskResponse.task:type_name -> flowsk.task.v1.Task
-	4,  // 40: flowsk.task.v1.ReleaseTaskClaimResponse.task:type_name -> flowsk.task.v1.Task
-	2,  // 41: flowsk.task.v1.AddTaskRelationRequest.relation_type:type_name -> flowsk.task.v1.TaskRelationType
-	5,  // 42: flowsk.task.v1.AddTaskRelationResponse.relation:type_name -> flowsk.task.v1.TaskRelation
-	3,  // 43: flowsk.task.v1.AddTaskCommentRequest.kind:type_name -> flowsk.task.v1.TaskCommentKind
-	6,  // 44: flowsk.task.v1.AddTaskCommentResponse.comment:type_name -> flowsk.task.v1.TaskComment
-	3,  // 45: flowsk.task.v1.ListTaskCommentsRequest.kind_filter:type_name -> flowsk.task.v1.TaskCommentKind
-	6,  // 46: flowsk.task.v1.ListTaskCommentsResponse.comments:type_name -> flowsk.task.v1.TaskComment
-	7,  // 47: flowsk.task.v1.GetAgentWorkQueueResponse.ready_tasks:type_name -> flowsk.task.v1.CompactTaskSummary
-	7,  // 48: flowsk.task.v1.GetAgentWorkQueueResponse.claimed_by_caller:type_name -> flowsk.task.v1.CompactTaskSummary
-	9,  // 49: flowsk.task.v1.GetProjectDigestResponse.digest:type_name -> flowsk.task.v1.ProjectDigest
-	55, // 50: flowsk.task.v1.DeleteTaskResponse.deleted_at:type_name -> google.protobuf.Timestamp
-	4,  // 51: flowsk.task.v1.PutTaskMarkdownResponse.task:type_name -> flowsk.task.v1.Task
-	4,  // 52: flowsk.task.v1.DeleteTaskMarkdownResponse.task:type_name -> flowsk.task.v1.Task
-	4,  // 53: flowsk.task.v1.GetTaskByExternalIdResponse.task:type_name -> flowsk.task.v1.Task
-	5,  // 54: flowsk.task.v1.GetTaskByExternalIdResponse.relations:type_name -> flowsk.task.v1.TaskRelation
-	10, // 55: flowsk.task.v1.TaskService.CreateTask:input_type -> flowsk.task.v1.CreateTaskRequest
-	12, // 56: flowsk.task.v1.TaskService.GetTask:input_type -> flowsk.task.v1.GetTaskRequest
-	14, // 57: flowsk.task.v1.TaskService.GetTaskByIdentifier:input_type -> flowsk.task.v1.GetTaskByIdentifierRequest
-	52, // 58: flowsk.task.v1.TaskService.GetTaskByExternalId:input_type -> flowsk.task.v1.GetTaskByExternalIdRequest
-	16, // 59: flowsk.task.v1.TaskService.ListTasks:input_type -> flowsk.task.v1.ListTasksRequest
-	18, // 60: flowsk.task.v1.TaskService.UpdateTask:input_type -> flowsk.task.v1.UpdateTaskRequest
-	20, // 61: flowsk.task.v1.TaskService.TransitionTaskState:input_type -> flowsk.task.v1.TransitionTaskStateRequest
-	22, // 62: flowsk.task.v1.TaskService.ClaimTask:input_type -> flowsk.task.v1.ClaimTaskRequest
-	24, // 63: flowsk.task.v1.TaskService.ReleaseTaskClaim:input_type -> flowsk.task.v1.ReleaseTaskClaimRequest
-	26, // 64: flowsk.task.v1.TaskService.AddTaskRelation:input_type -> flowsk.task.v1.AddTaskRelationRequest
-	28, // 65: flowsk.task.v1.TaskService.RemoveTaskRelation:input_type -> flowsk.task.v1.RemoveTaskRelationRequest
-	30, // 66: flowsk.task.v1.TaskService.AddTaskComment:input_type -> flowsk.task.v1.AddTaskCommentRequest
-	32, // 67: flowsk.task.v1.TaskService.ListTaskComments:input_type -> flowsk.task.v1.ListTaskCommentsRequest
-	34, // 68: flowsk.task.v1.TaskService.GetAgentWorkQueue:input_type -> flowsk.task.v1.GetAgentWorkQueueRequest
-	36, // 69: flowsk.task.v1.TaskService.GetProjectDigest:input_type -> flowsk.task.v1.GetProjectDigestRequest
-	38, // 70: flowsk.task.v1.TaskService.DeleteTask:input_type -> flowsk.task.v1.DeleteTaskRequest
-	40, // 71: flowsk.task.v1.TaskService.GetTaskMarkdown:input_type -> flowsk.task.v1.GetTaskMarkdownRequest
-	42, // 72: flowsk.task.v1.TaskService.PutTaskMarkdown:input_type -> flowsk.task.v1.PutTaskMarkdownRequest
-	44, // 73: flowsk.task.v1.TaskService.DeleteTaskMarkdown:input_type -> flowsk.task.v1.DeleteTaskMarkdownRequest
-	46, // 74: flowsk.task.v1.TaskService.PurgeArchivedTasks:input_type -> flowsk.task.v1.PurgeArchivedTasksRequest
-	48, // 75: flowsk.task.v1.TaskService.InspectOrphanResources:input_type -> flowsk.task.v1.InspectOrphanResourcesRequest
-	50, // 76: flowsk.task.v1.TaskService.PruneOrphanResources:input_type -> flowsk.task.v1.PruneOrphanResourcesRequest
-	11, // 77: flowsk.task.v1.TaskService.CreateTask:output_type -> flowsk.task.v1.CreateTaskResponse
-	13, // 78: flowsk.task.v1.TaskService.GetTask:output_type -> flowsk.task.v1.GetTaskResponse
-	15, // 79: flowsk.task.v1.TaskService.GetTaskByIdentifier:output_type -> flowsk.task.v1.GetTaskByIdentifierResponse
-	53, // 80: flowsk.task.v1.TaskService.GetTaskByExternalId:output_type -> flowsk.task.v1.GetTaskByExternalIdResponse
-	17, // 81: flowsk.task.v1.TaskService.ListTasks:output_type -> flowsk.task.v1.ListTasksResponse
-	19, // 82: flowsk.task.v1.TaskService.UpdateTask:output_type -> flowsk.task.v1.UpdateTaskResponse
-	21, // 83: flowsk.task.v1.TaskService.TransitionTaskState:output_type -> flowsk.task.v1.TransitionTaskStateResponse
-	23, // 84: flowsk.task.v1.TaskService.ClaimTask:output_type -> flowsk.task.v1.ClaimTaskResponse
-	25, // 85: flowsk.task.v1.TaskService.ReleaseTaskClaim:output_type -> flowsk.task.v1.ReleaseTaskClaimResponse
-	27, // 86: flowsk.task.v1.TaskService.AddTaskRelation:output_type -> flowsk.task.v1.AddTaskRelationResponse
-	29, // 87: flowsk.task.v1.TaskService.RemoveTaskRelation:output_type -> flowsk.task.v1.RemoveTaskRelationResponse
-	31, // 88: flowsk.task.v1.TaskService.AddTaskComment:output_type -> flowsk.task.v1.AddTaskCommentResponse
-	33, // 89: flowsk.task.v1.TaskService.ListTaskComments:output_type -> flowsk.task.v1.ListTaskCommentsResponse
-	35, // 90: flowsk.task.v1.TaskService.GetAgentWorkQueue:output_type -> flowsk.task.v1.GetAgentWorkQueueResponse
-	37, // 91: flowsk.task.v1.TaskService.GetProjectDigest:output_type -> flowsk.task.v1.GetProjectDigestResponse
-	39, // 92: flowsk.task.v1.TaskService.DeleteTask:output_type -> flowsk.task.v1.DeleteTaskResponse
-	41, // 93: flowsk.task.v1.TaskService.GetTaskMarkdown:output_type -> flowsk.task.v1.GetTaskMarkdownResponse
-	43, // 94: flowsk.task.v1.TaskService.PutTaskMarkdown:output_type -> flowsk.task.v1.PutTaskMarkdownResponse
-	45, // 95: flowsk.task.v1.TaskService.DeleteTaskMarkdown:output_type -> flowsk.task.v1.DeleteTaskMarkdownResponse
-	47, // 96: flowsk.task.v1.TaskService.PurgeArchivedTasks:output_type -> flowsk.task.v1.PurgeArchivedTasksResponse
-	49, // 97: flowsk.task.v1.TaskService.InspectOrphanResources:output_type -> flowsk.task.v1.InspectOrphanResourcesResponse
-	51, // 98: flowsk.task.v1.TaskService.PruneOrphanResources:output_type -> flowsk.task.v1.PruneOrphanResourcesResponse
-	77, // [77:99] is the sub-list for method output_type
-	55, // [55:77] is the sub-list for method input_type
-	55, // [55:55] is the sub-list for extension type_name
-	55, // [55:55] is the sub-list for extension extendee
-	0,  // [0:55] is the sub-list for field type_name
+	55, // 8: flowsk.task.v1.Task.last_signal_at:type_name -> google.protobuf.Timestamp
+	2,  // 9: flowsk.task.v1.TaskRelation.relation_type:type_name -> flowsk.task.v1.TaskRelationType
+	55, // 10: flowsk.task.v1.TaskRelation.created_at:type_name -> google.protobuf.Timestamp
+	3,  // 11: flowsk.task.v1.TaskComment.kind:type_name -> flowsk.task.v1.TaskCommentKind
+	55, // 12: flowsk.task.v1.TaskComment.created_at:type_name -> google.protobuf.Timestamp
+	55, // 13: flowsk.task.v1.TaskComment.updated_at:type_name -> google.protobuf.Timestamp
+	0,  // 14: flowsk.task.v1.CompactTaskSummary.kind:type_name -> flowsk.task.v1.TaskKind
+	1,  // 15: flowsk.task.v1.CompactTaskSummary.priority:type_name -> flowsk.task.v1.TaskPriority
+	54, // 16: flowsk.task.v1.CompactTaskSummary.state_category:type_name -> flowsk.project.v1.WorkflowStateCategory
+	55, // 17: flowsk.task.v1.CompactTaskSummary.claim_expires_at:type_name -> google.protobuf.Timestamp
+	55, // 18: flowsk.task.v1.CompactTaskSummary.last_signal_at:type_name -> google.protobuf.Timestamp
+	54, // 19: flowsk.task.v1.StateCategoryCount.category:type_name -> flowsk.project.v1.WorkflowStateCategory
+	8,  // 20: flowsk.task.v1.ProjectDigest.counts_by_state_category:type_name -> flowsk.task.v1.StateCategoryCount
+	7,  // 21: flowsk.task.v1.ProjectDigest.active_blockers:type_name -> flowsk.task.v1.CompactTaskSummary
+	7,  // 22: flowsk.task.v1.ProjectDigest.unclaimed_high_priority_tasks:type_name -> flowsk.task.v1.CompactTaskSummary
+	55, // 23: flowsk.task.v1.ProjectDigest.generated_at:type_name -> google.protobuf.Timestamp
+	0,  // 24: flowsk.task.v1.CreateTaskRequest.kind:type_name -> flowsk.task.v1.TaskKind
+	1,  // 25: flowsk.task.v1.CreateTaskRequest.priority:type_name -> flowsk.task.v1.TaskPriority
+	55, // 26: flowsk.task.v1.CreateTaskRequest.due_at:type_name -> google.protobuf.Timestamp
+	4,  // 27: flowsk.task.v1.CreateTaskResponse.task:type_name -> flowsk.task.v1.Task
+	4,  // 28: flowsk.task.v1.GetTaskResponse.task:type_name -> flowsk.task.v1.Task
+	5,  // 29: flowsk.task.v1.GetTaskResponse.relations:type_name -> flowsk.task.v1.TaskRelation
+	4,  // 30: flowsk.task.v1.GetTaskByIdentifierResponse.task:type_name -> flowsk.task.v1.Task
+	5,  // 31: flowsk.task.v1.GetTaskByIdentifierResponse.relations:type_name -> flowsk.task.v1.TaskRelation
+	54, // 32: flowsk.task.v1.ListTasksRequest.state_category_filter:type_name -> flowsk.project.v1.WorkflowStateCategory
+	0,  // 33: flowsk.task.v1.ListTasksRequest.kind_filter:type_name -> flowsk.task.v1.TaskKind
+	1,  // 34: flowsk.task.v1.ListTasksRequest.priority_filter:type_name -> flowsk.task.v1.TaskPriority
+	4,  // 35: flowsk.task.v1.ListTasksResponse.tasks:type_name -> flowsk.task.v1.Task
+	0,  // 36: flowsk.task.v1.UpdateTaskRequest.kind:type_name -> flowsk.task.v1.TaskKind
+	1,  // 37: flowsk.task.v1.UpdateTaskRequest.priority:type_name -> flowsk.task.v1.TaskPriority
+	55, // 38: flowsk.task.v1.UpdateTaskRequest.due_at:type_name -> google.protobuf.Timestamp
+	4,  // 39: flowsk.task.v1.UpdateTaskResponse.task:type_name -> flowsk.task.v1.Task
+	4,  // 40: flowsk.task.v1.TransitionTaskStateResponse.task:type_name -> flowsk.task.v1.Task
+	4,  // 41: flowsk.task.v1.ClaimTaskResponse.task:type_name -> flowsk.task.v1.Task
+	4,  // 42: flowsk.task.v1.ReleaseTaskClaimResponse.task:type_name -> flowsk.task.v1.Task
+	2,  // 43: flowsk.task.v1.AddTaskRelationRequest.relation_type:type_name -> flowsk.task.v1.TaskRelationType
+	5,  // 44: flowsk.task.v1.AddTaskRelationResponse.relation:type_name -> flowsk.task.v1.TaskRelation
+	3,  // 45: flowsk.task.v1.AddTaskCommentRequest.kind:type_name -> flowsk.task.v1.TaskCommentKind
+	6,  // 46: flowsk.task.v1.AddTaskCommentResponse.comment:type_name -> flowsk.task.v1.TaskComment
+	3,  // 47: flowsk.task.v1.ListTaskCommentsRequest.kind_filter:type_name -> flowsk.task.v1.TaskCommentKind
+	6,  // 48: flowsk.task.v1.ListTaskCommentsResponse.comments:type_name -> flowsk.task.v1.TaskComment
+	7,  // 49: flowsk.task.v1.GetAgentWorkQueueResponse.ready_tasks:type_name -> flowsk.task.v1.CompactTaskSummary
+	7,  // 50: flowsk.task.v1.GetAgentWorkQueueResponse.claimed_by_caller:type_name -> flowsk.task.v1.CompactTaskSummary
+	9,  // 51: flowsk.task.v1.GetProjectDigestResponse.digest:type_name -> flowsk.task.v1.ProjectDigest
+	55, // 52: flowsk.task.v1.DeleteTaskResponse.deleted_at:type_name -> google.protobuf.Timestamp
+	4,  // 53: flowsk.task.v1.PutTaskMarkdownResponse.task:type_name -> flowsk.task.v1.Task
+	4,  // 54: flowsk.task.v1.DeleteTaskMarkdownResponse.task:type_name -> flowsk.task.v1.Task
+	4,  // 55: flowsk.task.v1.GetTaskByExternalIdResponse.task:type_name -> flowsk.task.v1.Task
+	5,  // 56: flowsk.task.v1.GetTaskByExternalIdResponse.relations:type_name -> flowsk.task.v1.TaskRelation
+	10, // 57: flowsk.task.v1.TaskService.CreateTask:input_type -> flowsk.task.v1.CreateTaskRequest
+	12, // 58: flowsk.task.v1.TaskService.GetTask:input_type -> flowsk.task.v1.GetTaskRequest
+	14, // 59: flowsk.task.v1.TaskService.GetTaskByIdentifier:input_type -> flowsk.task.v1.GetTaskByIdentifierRequest
+	52, // 60: flowsk.task.v1.TaskService.GetTaskByExternalId:input_type -> flowsk.task.v1.GetTaskByExternalIdRequest
+	16, // 61: flowsk.task.v1.TaskService.ListTasks:input_type -> flowsk.task.v1.ListTasksRequest
+	18, // 62: flowsk.task.v1.TaskService.UpdateTask:input_type -> flowsk.task.v1.UpdateTaskRequest
+	20, // 63: flowsk.task.v1.TaskService.TransitionTaskState:input_type -> flowsk.task.v1.TransitionTaskStateRequest
+	22, // 64: flowsk.task.v1.TaskService.ClaimTask:input_type -> flowsk.task.v1.ClaimTaskRequest
+	24, // 65: flowsk.task.v1.TaskService.ReleaseTaskClaim:input_type -> flowsk.task.v1.ReleaseTaskClaimRequest
+	26, // 66: flowsk.task.v1.TaskService.AddTaskRelation:input_type -> flowsk.task.v1.AddTaskRelationRequest
+	28, // 67: flowsk.task.v1.TaskService.RemoveTaskRelation:input_type -> flowsk.task.v1.RemoveTaskRelationRequest
+	30, // 68: flowsk.task.v1.TaskService.AddTaskComment:input_type -> flowsk.task.v1.AddTaskCommentRequest
+	32, // 69: flowsk.task.v1.TaskService.ListTaskComments:input_type -> flowsk.task.v1.ListTaskCommentsRequest
+	34, // 70: flowsk.task.v1.TaskService.GetAgentWorkQueue:input_type -> flowsk.task.v1.GetAgentWorkQueueRequest
+	36, // 71: flowsk.task.v1.TaskService.GetProjectDigest:input_type -> flowsk.task.v1.GetProjectDigestRequest
+	38, // 72: flowsk.task.v1.TaskService.DeleteTask:input_type -> flowsk.task.v1.DeleteTaskRequest
+	40, // 73: flowsk.task.v1.TaskService.GetTaskMarkdown:input_type -> flowsk.task.v1.GetTaskMarkdownRequest
+	42, // 74: flowsk.task.v1.TaskService.PutTaskMarkdown:input_type -> flowsk.task.v1.PutTaskMarkdownRequest
+	44, // 75: flowsk.task.v1.TaskService.DeleteTaskMarkdown:input_type -> flowsk.task.v1.DeleteTaskMarkdownRequest
+	46, // 76: flowsk.task.v1.TaskService.PurgeArchivedTasks:input_type -> flowsk.task.v1.PurgeArchivedTasksRequest
+	48, // 77: flowsk.task.v1.TaskService.InspectOrphanResources:input_type -> flowsk.task.v1.InspectOrphanResourcesRequest
+	50, // 78: flowsk.task.v1.TaskService.PruneOrphanResources:input_type -> flowsk.task.v1.PruneOrphanResourcesRequest
+	11, // 79: flowsk.task.v1.TaskService.CreateTask:output_type -> flowsk.task.v1.CreateTaskResponse
+	13, // 80: flowsk.task.v1.TaskService.GetTask:output_type -> flowsk.task.v1.GetTaskResponse
+	15, // 81: flowsk.task.v1.TaskService.GetTaskByIdentifier:output_type -> flowsk.task.v1.GetTaskByIdentifierResponse
+	53, // 82: flowsk.task.v1.TaskService.GetTaskByExternalId:output_type -> flowsk.task.v1.GetTaskByExternalIdResponse
+	17, // 83: flowsk.task.v1.TaskService.ListTasks:output_type -> flowsk.task.v1.ListTasksResponse
+	19, // 84: flowsk.task.v1.TaskService.UpdateTask:output_type -> flowsk.task.v1.UpdateTaskResponse
+	21, // 85: flowsk.task.v1.TaskService.TransitionTaskState:output_type -> flowsk.task.v1.TransitionTaskStateResponse
+	23, // 86: flowsk.task.v1.TaskService.ClaimTask:output_type -> flowsk.task.v1.ClaimTaskResponse
+	25, // 87: flowsk.task.v1.TaskService.ReleaseTaskClaim:output_type -> flowsk.task.v1.ReleaseTaskClaimResponse
+	27, // 88: flowsk.task.v1.TaskService.AddTaskRelation:output_type -> flowsk.task.v1.AddTaskRelationResponse
+	29, // 89: flowsk.task.v1.TaskService.RemoveTaskRelation:output_type -> flowsk.task.v1.RemoveTaskRelationResponse
+	31, // 90: flowsk.task.v1.TaskService.AddTaskComment:output_type -> flowsk.task.v1.AddTaskCommentResponse
+	33, // 91: flowsk.task.v1.TaskService.ListTaskComments:output_type -> flowsk.task.v1.ListTaskCommentsResponse
+	35, // 92: flowsk.task.v1.TaskService.GetAgentWorkQueue:output_type -> flowsk.task.v1.GetAgentWorkQueueResponse
+	37, // 93: flowsk.task.v1.TaskService.GetProjectDigest:output_type -> flowsk.task.v1.GetProjectDigestResponse
+	39, // 94: flowsk.task.v1.TaskService.DeleteTask:output_type -> flowsk.task.v1.DeleteTaskResponse
+	41, // 95: flowsk.task.v1.TaskService.GetTaskMarkdown:output_type -> flowsk.task.v1.GetTaskMarkdownResponse
+	43, // 96: flowsk.task.v1.TaskService.PutTaskMarkdown:output_type -> flowsk.task.v1.PutTaskMarkdownResponse
+	45, // 97: flowsk.task.v1.TaskService.DeleteTaskMarkdown:output_type -> flowsk.task.v1.DeleteTaskMarkdownResponse
+	47, // 98: flowsk.task.v1.TaskService.PurgeArchivedTasks:output_type -> flowsk.task.v1.PurgeArchivedTasksResponse
+	49, // 99: flowsk.task.v1.TaskService.InspectOrphanResources:output_type -> flowsk.task.v1.InspectOrphanResourcesResponse
+	51, // 100: flowsk.task.v1.TaskService.PruneOrphanResources:output_type -> flowsk.task.v1.PruneOrphanResourcesResponse
+	79, // [79:101] is the sub-list for method output_type
+	57, // [57:79] is the sub-list for method input_type
+	57, // [57:57] is the sub-list for extension type_name
+	57, // [57:57] is the sub-list for extension extendee
+	0,  // [0:57] is the sub-list for field type_name
 }
 
 func init() { file_flowsk_task_v1_task_proto_init() }

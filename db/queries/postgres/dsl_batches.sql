@@ -39,5 +39,12 @@ WHERE workspace_id = sqlc.arg('workspace_id')
 SELECT *
 FROM dsl_execution_batches
 WHERE workspace_id = sqlc.arg('workspace_id')
+  AND mode <> 'relation_meta'
 ORDER BY created_at DESC, id DESC
 LIMIT sqlc.arg('limit') OFFSET sqlc.arg('offset');
+
+-- DeleteDSLExecutionBatchByIdempotencyKey deletes a sidecar metadata row keyed by workspace_id and idempotency_key.
+-- name: DeleteDSLExecutionBatchByIdempotencyKey :exec
+DELETE FROM dsl_execution_batches
+WHERE workspace_id = sqlc.arg('workspace_id')
+  AND idempotency_key = sqlc.arg('idempotency_key');

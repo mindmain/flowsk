@@ -25,7 +25,8 @@ INSERT INTO tasks (
     claimed_by_actor_id,
     claim_token,
     claim_expires_at,
-    completed_at
+    completed_at,
+    last_signal_at
 ) VALUES (
     sqlc.arg('id'),
     sqlc.arg('workspace_id'),
@@ -47,34 +48,56 @@ INSERT INTO tasks (
     sqlc.narg('claimed_by_actor_id'),
     sqlc.narg('claim_token'),
     sqlc.narg('claim_expires_at'),
-    sqlc.narg('completed_at')
+    sqlc.narg('completed_at'),
+    sqlc.narg('last_signal_at')
 )
 RETURNING *;
 
--- GetTaskByExternalID retrieves a single active task within a project by its external tracker ID (e.g. 'CU-869abc').
+-- GetTaskByExternalID retrieves a single active task within an active project by its external tracker ID (e.g. 'CU-869abc').
 -- name: GetTaskByExternalID :one
-SELECT *
-FROM tasks
-WHERE workspace_id = sqlc.arg('workspace_id')
-  AND project_id = sqlc.arg('project_id')
-  AND external_id = sqlc.arg('external_id')
-  AND deleted_at IS NULL;
+SELECT t.*
+FROM tasks t
+WHERE t.workspace_id = sqlc.arg('workspace_id')
+  AND t.project_id = sqlc.arg('project_id')
+  AND t.external_id = sqlc.arg('external_id')
+  AND t.deleted_at IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM projects p
+      WHERE p.id = t.project_id
+        AND p.workspace_id = t.workspace_id
+        AND p.deleted_at IS NULL
+  );
 
--- GetTaskByID retrieves a single active task within a workspace by its UUID string.
+-- GetTaskByID retrieves a single active task within an active project by its UUID string.
 -- name: GetTaskByID :one
-SELECT *
-FROM tasks
-WHERE workspace_id = sqlc.arg('workspace_id')
-  AND id = sqlc.arg('id')
-  AND deleted_at IS NULL;
+SELECT t.*
+FROM tasks t
+WHERE t.workspace_id = sqlc.arg('workspace_id')
+  AND t.id = sqlc.arg('id')
+  AND t.deleted_at IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM projects p
+      WHERE p.id = t.project_id
+        AND p.workspace_id = t.workspace_id
+        AND p.deleted_at IS NULL
+  );
 
--- GetTaskByIdentifier retrieves a single active task within a workspace by its human key (e.g. 'FLW-42').
+-- GetTaskByIdentifier retrieves a single active task within an active project by its human key (e.g. 'FLW-42').
 -- name: GetTaskByIdentifier :one
-SELECT *
-FROM tasks
-WHERE workspace_id = sqlc.arg('workspace_id')
-  AND identifier = sqlc.arg('identifier')
-  AND deleted_at IS NULL;
+SELECT t.*
+FROM tasks t
+WHERE t.workspace_id = sqlc.arg('workspace_id')
+  AND t.identifier = sqlc.arg('identifier')
+  AND t.deleted_at IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM projects p
+      WHERE p.id = t.project_id
+        AND p.workspace_id = t.workspace_id
+        AND p.deleted_at IS NULL
+  );
 
 -- ListTasksByProject lists active tasks in a project with optional filters for state, objective,
 -- parent task, assignee, kind, and priority, sorting urgent items (priority 1..4) ahead of unprioritized (0).
@@ -155,20 +178,31 @@ ORDER BY
     t.id ASC
 LIMIT sqlc.arg('limit');
 
--- UpdateTask performs an atomic partial update on mutable metadata fields of an active task.
+-- UpdateTask performs an atomic update on mutable metadata fields (including nullable foreign keys) of an active task.
 -- name: UpdateTask :one
 UPDATE tasks
 SET
-    objective_id = COALESCE(sqlc.narg('objective_id'), objective_id),
-    parent_task_id = COALESCE(sqlc.narg('parent_task_id'), parent_task_id),
+    objective_id = sqlc.narg('objective_id'),
+    parent_task_id = sqlc.narg('parent_task_id'),
     kind = COALESCE(sqlc.narg('kind'), kind),
     priority = COALESCE(sqlc.narg('priority'), priority),
     title = COALESCE(sqlc.narg('title'), title),
     description = COALESCE(sqlc.narg('description'), description),
     acceptance_criteria = COALESCE(sqlc.narg('acceptance_criteria'), acceptance_criteria),
-    estimate_points = COALESCE(sqlc.narg('estimate_points'), estimate_points),
-    assignee_actor_id = COALESCE(sqlc.narg('assignee_actor_id'), assignee_actor_id),
+    estimate_points = sqlc.narg('estimate_points'),
+    assignee_actor_id = sqlc.narg('assignee_actor_id'),
+    last_signal_at = sqlc.narg('last_signal_at'),
     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE workspace_id = sqlc.arg('workspace_id')
+  AND id = sqlc.arg('id')
+  AND deleted_at IS NULL
+RETURNING *;
+
+-- TouchTaskLastSignal updates last_signal_at on an active task within a workspace without mutating updated_at.
+-- name: TouchTaskLastSignal :one
+UPDATE tasks
+SET
+    last_signal_at = sqlc.narg('last_signal_at')
 WHERE workspace_id = sqlc.arg('workspace_id')
   AND id = sqlc.arg('id')
   AND deleted_at IS NULL
@@ -402,3 +436,29 @@ WHERE workspace_id = sqlc.arg('workspace_id')
 DELETE FROM tasks
 WHERE workspace_id = sqlc.arg('workspace_id')
   AND id = sqlc.arg('id');
+
+-- SoftDeleteTasksByProject soft-deletes all active tasks belonging to a project and clears their active claim leases.
+-- name: SoftDeleteTasksByProject :exec
+UPDATE tasks
+SET
+    deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    claimed_by_actor_id = NULL,
+    claim_token = NULL,
+    claim_expires_at = NULL
+WHERE workspace_id = sqlc.arg('workspace_id')
+  AND project_id = sqlc.arg('project_id')
+  AND deleted_at IS NULL;
+
+-- CheckTaskSequenceOrIdentifierConflict reports whether an active task already uses sequence_number in project_id or identifier in workspace_id.
+-- name: CheckTaskSequenceOrIdentifierConflict :one
+SELECT EXISTS (
+    SELECT 1
+    FROM tasks
+    WHERE workspace_id = sqlc.arg('workspace_id')
+      AND deleted_at IS NULL
+      AND (
+          (project_id = sqlc.arg('project_id') AND sequence_number = sqlc.arg('sequence_number'))
+          OR identifier = sqlc.arg('identifier')
+      )
+);

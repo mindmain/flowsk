@@ -30,13 +30,20 @@ INSERT INTO objectives (
 )
 RETURNING *;
 
--- GetObjectiveByID retrieves an active objective within a workspace by its UUID string.
+-- GetObjectiveByID retrieves an active objective within an active project by its UUID string.
 -- name: GetObjectiveByID :one
-SELECT *
-FROM objectives
-WHERE workspace_id = sqlc.arg('workspace_id')
-  AND id = sqlc.arg('id')
-  AND deleted_at IS NULL;
+SELECT o.*
+FROM objectives o
+WHERE o.workspace_id = sqlc.arg('workspace_id')
+  AND o.id = sqlc.arg('id')
+  AND o.deleted_at IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM projects p
+      WHERE p.id = o.project_id
+        AND p.workspace_id = o.workspace_id
+        AND p.deleted_at IS NULL
+  );
 
 -- ListObjectivesByProject lists active objectives for a project with optional kind and status filters,
 -- sorting objectives with explicit target dates ahead of undated objectives.
@@ -54,17 +61,17 @@ ORDER BY
     created_at ASC,
     id ASC;
 
--- UpdateObjective performs an atomic partial update on an active objective within a workspace.
+-- UpdateObjective performs an atomic update on an active objective (including nullable dates and parent_objective_id).
 -- name: UpdateObjective :one
 UPDATE objectives
 SET
-    parent_objective_id = COALESCE(sqlc.narg('parent_objective_id'), parent_objective_id),
+    parent_objective_id = sqlc.narg('parent_objective_id'),
     title = COALESCE(sqlc.narg('title'), title),
     description = COALESCE(sqlc.narg('description'), description),
     kind = COALESCE(sqlc.narg('kind'), kind),
     status = COALESCE(sqlc.narg('status'), status),
-    starts_at = COALESCE(sqlc.narg('starts_at'), starts_at),
-    target_date = COALESCE(sqlc.narg('target_date'), target_date),
+    starts_at = sqlc.narg('starts_at'),
+    target_date = sqlc.narg('target_date'),
     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 WHERE workspace_id = sqlc.arg('workspace_id')
   AND id = sqlc.arg('id')
@@ -79,4 +86,14 @@ SET
     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 WHERE workspace_id = sqlc.arg('workspace_id')
   AND id = sqlc.arg('id')
+  AND deleted_at IS NULL;
+
+-- SoftDeleteObjectivesByProject soft-deletes all active objectives belonging to a project.
+-- name: SoftDeleteObjectivesByProject :exec
+UPDATE objectives
+SET
+    deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE workspace_id = sqlc.arg('workspace_id')
+  AND project_id = sqlc.arg('project_id')
   AND deleted_at IS NULL;

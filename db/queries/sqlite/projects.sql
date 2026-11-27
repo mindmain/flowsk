@@ -200,13 +200,14 @@ WHERE workspace_id = sqlc.arg('workspace_id')
   AND deleted_at IS NULL
 ORDER BY name ASC, id ASC;
 
--- SoftDeleteLabel marks an active label within a workspace as soft-deleted.
+-- SoftDeleteLabel marks an active label within a workspace (and optional project scope) as soft-deleted.
 -- name: SoftDeleteLabel :execrows
 UPDATE labels
 SET
     deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 WHERE workspace_id = sqlc.arg('workspace_id')
+  AND (project_id = sqlc.narg('project_id') OR sqlc.narg('project_id') IS NULL)
   AND id = sqlc.arg('id')
   AND deleted_at IS NULL;
 

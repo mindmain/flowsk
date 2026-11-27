@@ -810,9 +810,11 @@ type UpdateObjectiveRequest struct {
 	// Optional updated start timestamp.
 	StartDate *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=start_date,json=startDate,proto3" json:"start_date,omitempty"`
 	// Optional updated target completion timestamp.
-	TargetDate    *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=target_date,json=targetDate,proto3" json:"target_date,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	TargetDate *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=target_date,json=targetDate,proto3" json:"target_date,omitempty"`
+	// When true, clears target_date back to unset.
+	ClearTargetDate bool `protobuf:"varint,12,opt,name=clear_target_date,json=clearTargetDate,proto3" json:"clear_target_date,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *UpdateObjectiveRequest) Reset() {
@@ -920,6 +922,13 @@ func (x *UpdateObjectiveRequest) GetTargetDate() *timestamppb.Timestamp {
 		return x.TargetDate
 	}
 	return nil
+}
+
+func (x *UpdateObjectiveRequest) GetClearTargetDate() bool {
+	if x != nil {
+		return x.ClearTargetDate
+	}
+	return false
 }
 
 // UpdateObjectiveResponse wraps the updated objective entity.
@@ -1292,7 +1301,7 @@ const file_flowsk_objective_v1_objective_proto_rawDesc = "" +
 	"\n" +
 	"objectives\x18\x01 \x03(\v2\x1e.flowsk.objective.v1.ObjectiveR\n" +
 	"objectives\x12&\n" +
-	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\x8c\x05\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"\xb8\x05\n" +
 	"\x16UpdateObjectiveRequest\x12+\n" +
 	"\fworkspace_id\x18\x01 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\vworkspaceId\x12#\n" +
 	"\bactor_id\x18\x02 \x01(\tB\b\xbaH\x05r\x03\xb0\x01\x01R\aactorId\x12+\n" +
@@ -1308,7 +1317,8 @@ const file_flowsk_objective_v1_objective_proto_rawDesc = "" +
 	"start_date\x18\n" +
 	" \x01(\v2\x1a.google.protobuf.TimestampR\tstartDate\x12;\n" +
 	"\vtarget_date\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"targetDateB\b\n" +
+	"targetDate\x12*\n" +
+	"\x11clear_target_date\x18\f \x01(\bR\x0fclearTargetDateB\b\n" +
 	"\x06_titleB\x0e\n" +
 	"\f_descriptionB\x13\n" +
 	"\x11_success_criteriaB\x11\n" +

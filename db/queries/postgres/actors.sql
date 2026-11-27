@@ -70,3 +70,11 @@ SET
 WHERE workspace_id = sqlc.arg('workspace_id')
   AND id = sqlc.arg('id')
   AND deleted_at IS NULL;
+
+-- CheckActorIDExists reports whether an actor primary key UUID is already allocated in any workspace.
+-- name: CheckActorIDExists :one
+SELECT EXISTS (
+    SELECT 1
+    FROM actors
+    WHERE id = sqlc.arg('id')
+);
