@@ -490,3 +490,79 @@ func TestAntigravityCanonicalConfigPathsAndLegacySkillCleanup(t *testing.T) {
 		t.Fatalf("expected Installed=true and UpToDate=true after install, got %+v", post)
 	}
 }
+
+func TestAntigravityT3CodeSecondaryMCPSyncAndDriftDetection(t *testing.T) {
+	home := t.TempDir()
+
+	// Simulate T3 Code's isolated Antigravity ACP profile folder with a 0-byte mcp_config.json
+	// while skills is symlinked to ~/.gemini/config/skills.
+	agSkillsDir := filepath.Join(home, ".gemini", "config", "skills")
+	t3ConfigDir := filepath.Join(home, ".t3", "userdata", "providers", "antigravity", "ac0a3dfd6dddb20962ce", "config")
+	if err := os.MkdirAll(agSkillsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(t3ConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(agSkillsDir, filepath.Join(t3ConfigDir, "skills")); err != nil {
+		t.Fatal(err)
+	}
+	t3MCPPath := filepath.Join(t3ConfigDir, "mcp_config.json")
+	if err := os.WriteFile(t3MCPPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed primary ~/.gemini/config/mcp_config.json with flowsk already configured, leaving T3 0-byte.
+	primaryMCPPath := filepath.Join(home, ".gemini", "config", "mcp_config.json")
+	primaryInitial := `{"mcpServers":{"flowsk":{"command":"/usr/local/bin/flowsk","args":["mcp","serve","--transport","stdio"]}}}` + "\n"
+	if err := os.WriteFile(primaryMCPPath, []byte(primaryInitial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	targets, err := skill.ResolveMCPProvidersByIDs(home, []string{"antigravity"})
+	if err != nil || len(targets) != 1 {
+		t.Fatalf("ResolveMCPProvidersByIDs(antigravity): %v", err)
+	}
+	ag := targets[0]
+	if len(ag.SecondaryMCPConfigPaths) != 1 || ag.SecondaryMCPConfigPaths[0] != t3MCPPath {
+		t.Fatalf("expected T3 secondary MCP path %q discovered, got %+v", t3MCPPath, ag.SecondaryMCPConfigPaths)
+	}
+
+	// Before syncing, InspectProvider must report MCPConfigured=true AND UnsyncedMCPPaths=[t3MCPPath].
+	driftStatus := skill.InspectProvider(ag)
+	if !driftStatus.MCPConfigured || len(driftStatus.UnsyncedMCPPaths) != 1 || driftStatus.UnsyncedMCPPaths[0] != t3MCPPath {
+		t.Fatalf("expected drift detected on T3 profile MCP config, got %+v", driftStatus)
+	}
+
+	// InstallMCPToProvider synchronizes the 0-byte T3 mcp_config.json and reports Action="updated".
+	instRes, err := skill.InstallMCPToProvider(ag, "/usr/local/bin/flowsk")
+	if err != nil {
+		t.Fatalf("InstallMCPToProvider(antigravity): %v", err)
+	}
+	if instRes.Action != "updated" || len(instRes.SyncedSecondaryPaths) != 1 || instRes.SyncedSecondaryPaths[0] != t3MCPPath {
+		t.Fatalf("expected Action=updated and SyncedSecondaryPaths=[%s], got %+v", t3MCPPath, instRes)
+	}
+
+	syncedStatus := skill.InspectProvider(ag)
+	if !syncedStatus.MCPConfigured || len(syncedStatus.UnsyncedMCPPaths) != 0 || len(syncedStatus.SyncedMCPPaths) != 1 {
+		t.Fatalf("expected 0 unsynced paths after install, got %+v", syncedStatus)
+	}
+
+	// UninstallMCPFromProvider removes flowsk from both primary and T3 profile while keeping T3 mcp_config.json valid JSON on disk.
+	unRes, err := skill.UninstallMCPFromProvider(ag)
+	if err != nil || unRes.Action != "removed" {
+		t.Fatalf("UninstallMCPFromProvider(antigravity): res=%+v err=%v", unRes, err)
+	}
+	afterUninstall := skill.InspectProvider(ag)
+	if afterUninstall.MCPConfigured || len(afterUninstall.SyncedMCPPaths) != 0 {
+		t.Fatalf("expected flowsk removed from primary and T3 profile configs, got %+v", afterUninstall)
+	}
+	rawT3After, err := os.ReadFile(t3MCPPath)
+	if err != nil {
+		t.Fatalf("expected T3 mcp_config.json file preserved on disk: %v", err)
+	}
+	var parsedT3 map[string]any
+	if err := json.Unmarshal(rawT3After, &parsedT3); err != nil {
+		t.Fatalf("expected T3 mcp_config.json to remain valid JSON after uninstall, got %q: %v", string(rawT3After), err)
+	}
+}

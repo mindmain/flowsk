@@ -32,21 +32,26 @@ func DefaultMCPArgs() []string {
 
 // ResolveMCPCommand resolves the executable command string written into MCP client
 // configurations. When customCommand is empty, it checks `os.Executable()` first
-// (when its basename is `flowsk` and not a `.test` or `go-build` temporary binary,
-// converted via `filepath.Abs`), falling back to `exec.LookPath("flowsk")` (also
-// converted via `filepath.Abs`) or `"flowsk"`.
+// (preserving stable user-facing symlinks like `/opt/homebrew/bin/flowsk` when the
+// executable basename is `flowsk`, or resolving `filepath.EvalSymlinks` when invoked
+// via an alias wrapper pointing to `flowsk`, while excluding `.test` and `go-build`
+// binaries), falling back to `exec.LookPath("flowsk")` (via `filepath.Abs`) or `"flowsk"`.
 func ResolveMCPCommand(customCommand string) string {
 	if trimmed := strings.TrimSpace(customCommand); trimmed != "" {
 		return trimmed
 	}
 	if exe, err := os.Executable(); err == nil && strings.TrimSpace(exe) != "" {
-		rawBase := filepath.Base(exe)
-		base := strings.TrimSuffix(rawBase, ".exe")
-		if base == "flowsk" && !strings.HasSuffix(rawBase, ".test") && !strings.Contains(exe, "go-build") {
+		if isFlowskExecutablePath(exe) {
 			if absExe, absErr := filepath.Abs(exe); absErr == nil {
 				return filepath.Clean(absExe)
 			}
 			return filepath.Clean(exe)
+		}
+		if evalExe, evalErr := filepath.EvalSymlinks(exe); evalErr == nil && isFlowskExecutablePath(evalExe) {
+			if absExe, absErr := filepath.Abs(evalExe); absErr == nil {
+				return filepath.Clean(absExe)
+			}
+			return filepath.Clean(evalExe)
 		}
 	}
 	if resolved, err := exec.LookPath("flowsk"); err == nil && strings.TrimSpace(resolved) != "" {
@@ -56,6 +61,15 @@ func ResolveMCPCommand(customCommand string) string {
 		return filepath.Clean(resolved)
 	}
 	return "flowsk"
+}
+
+func isFlowskExecutablePath(p string) bool {
+	rawBase := filepath.Base(p)
+	if strings.HasSuffix(rawBase, ".test") || strings.Contains(p, "go-build") {
+		return false
+	}
+	base := strings.TrimSuffix(rawBase, ".exe")
+	return strings.EqualFold(base, "flowsk")
 }
 
 // MCPInstallResult summarizes an atomic MCP server registration write for one ProviderTarget.
@@ -68,6 +82,9 @@ type MCPInstallResult struct {
 
 	// ResolvedPath is the real underlying file path written on disk after symlink resolution.
 	ResolvedPath string `json:"resolved_path"`
+
+	// SyncedSecondaryPaths lists secondary profile MCP config files synchronized alongside ConfigPath.
+	SyncedSecondaryPaths []string `json:"synced_secondary_paths,omitempty"`
 
 	// Command is the executable command configured for `flowsk`.
 	Command string `json:"command"`
@@ -171,21 +188,55 @@ func InstallMCPToProvider(target ProviderTarget, customCommand string) (MCPInsta
 		return MCPInstallResult{}, err
 	}
 
+	writtenReal := map[string]bool{filepath.Clean(realPath): true}
+	var syncedSecondary []string
+	for _, secCfg := range target.SecondaryMCPConfigPaths {
+		if strings.TrimSpace(secCfg) == "" {
+			continue
+		}
+		secReal, _, sErr := resolveWritableTargetPath(secCfg)
+		if sErr != nil {
+			return MCPInstallResult{}, fmt.Errorf("resolve secondary MCP config path %s: %w", secCfg, sErr)
+		}
+		cleanedSec := filepath.Clean(secReal)
+		if writtenReal[cleanedSec] {
+			syncedSecondary = append(syncedSecondary, secCfg)
+			continue
+		}
+		writtenReal[cleanedSec] = true
+
+		var secAction string
+		switch target.MCPFormat {
+		case MCPFormatJSON:
+			secAction, sErr = upsertJSONMCPServer(secReal, cmd, args)
+		case MCPFormatTOML:
+			secAction, sErr = upsertTOMLMCPServer(secReal, cmd, args)
+		}
+		if sErr != nil {
+			return MCPInstallResult{}, sErr
+		}
+		syncedSecondary = append(syncedSecondary, secCfg)
+		if action == "unchanged" && (secAction == "installed" || secAction == "updated") {
+			action = "updated"
+		}
+	}
+
 	return MCPInstallResult{
-		Target:       target,
-		ConfigPath:   target.MCPConfigPath,
-		ResolvedPath: realPath,
-		Command:      cmd,
-		Args:         args,
-		Action:       action,
+		Target:               target,
+		ConfigPath:           target.MCPConfigPath,
+		ResolvedPath:         realPath,
+		SyncedSecondaryPaths: syncedSecondary,
+		Command:              cmd,
+		Args:                 args,
+		Action:               action,
 	}, nil
 }
 
 // UninstallMCPFromProvider non-destructively removes the `flowsk` MCP server entry
-// from `target.MCPConfigPath`, preserving all other MCP servers, unrelated settings,
-// comments, permissions, and symbolic links. When a non-symlink config file becomes
-// completely empty (e.g. a standalone `mcp.json` created solely for `flowsk`), the
-// empty file is removed cleanly.
+// from `target.MCPConfigPath` (plus any secondary profile configs), preserving all
+// other MCP servers, unrelated settings, comments, permissions, and symbolic links.
+// When a non-symlink primary config file becomes completely empty (e.g. a standalone
+// `mcp.json` created solely for `flowsk`), the empty file is removed cleanly.
 func UninstallMCPFromProvider(target ProviderTarget) (MCPUninstallResult, error) {
 	if !target.SupportsMCP() {
 		return MCPUninstallResult{}, fmt.Errorf("provider %q does not have a managed MCP config file", target.ID)
@@ -209,9 +260,12 @@ func UninstallMCPFromProvider(target ProviderTarget) (MCPUninstallResult, error)
 		return MCPUninstallResult{}, err
 	}
 
+	visitedReal := map[string]bool{filepath.Clean(realPath): true}
+
 	// Best-effort cleanup of a distinct pre-migration MCP config file when present.
 	if legacyCfg := strings.TrimSpace(target.LegacyMCPConfigPath); legacyCfg != "" {
-		if legacyReal, legacySym, lErr := resolveWritableTargetPath(legacyCfg); lErr == nil && filepath.Clean(legacyReal) != filepath.Clean(realPath) {
+		if legacyReal, legacySym, lErr := resolveWritableTargetPath(legacyCfg); lErr == nil && !visitedReal[filepath.Clean(legacyReal)] {
+			visitedReal[filepath.Clean(legacyReal)] = true
 			var legacyAction string
 			switch target.MCPFormat {
 			case MCPFormatJSON:
@@ -222,6 +276,35 @@ func UninstallMCPFromProvider(target ProviderTarget) (MCPUninstallResult, error)
 			if action == "not_found" && legacyAction == "removed" {
 				action = "removed"
 			}
+		}
+	}
+
+	// Synchronize removal across any secondary profile MCP config files (e.g. T3 Code ACP profiles),
+	// passing preserveFile=true (isSymlink=true semantics) so the host tool's config file remains valid JSON on disk.
+	for _, secCfg := range target.SecondaryMCPConfigPaths {
+		if strings.TrimSpace(secCfg) == "" {
+			continue
+		}
+		secReal, _, sErr := resolveWritableTargetPath(secCfg)
+		if sErr != nil {
+			return MCPUninstallResult{}, fmt.Errorf("resolve secondary MCP config path %s: %w", secCfg, sErr)
+		}
+		if visitedReal[filepath.Clean(secReal)] {
+			continue
+		}
+		visitedReal[filepath.Clean(secReal)] = true
+		var secAction string
+		switch target.MCPFormat {
+		case MCPFormatJSON:
+			secAction, sErr = removeJSONMCPServer(secReal, true)
+		case MCPFormatTOML:
+			secAction, sErr = removeTOMLMCPServer(secReal, true)
+		}
+		if sErr != nil {
+			return MCPUninstallResult{}, sErr
+		}
+		if action == "not_found" && secAction == "removed" {
+			action = "removed"
 		}
 	}
 

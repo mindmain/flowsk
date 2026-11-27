@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -114,6 +115,11 @@ type ProviderTarget struct {
 	// LegacyMCPConfigPath is an optional pre-migration MCP configuration file cleaned up on uninstall when distinct.
 	LegacyMCPConfigPath string `json:"legacy_mcp_config_path,omitempty"`
 
+	// SecondaryMCPConfigPaths lists additional isolated client profile MCP config files
+	// discovered on disk (such as T3 Code's `~/.t3/userdata/providers/antigravity/*/config/mcp_config.json`)
+	// that are synchronized alongside MCPConfigPath during install/uninstall and checked for drift in `flowsk doctor`.
+	SecondaryMCPConfigPaths []string `json:"secondary_mcp_config_paths,omitempty"`
+
 	// MCPFormat identifies the configuration file syntax ("json" or "toml") when MCPConfigPath is non-empty.
 	MCPFormat string `json:"mcp_format,omitempty"`
 }
@@ -130,7 +136,7 @@ type ProviderStatus struct {
 	// Target holds the resolved provider metadata and paths.
 	Target ProviderTarget `json:"target"`
 
-	// Detected is true when the provider's HomeMarkerDir or SkillsDir exists on the machine.
+	// Detected is true when the provider's HomeMarkerDir, SkillsDir, or secondary profile directory exists on the machine.
 	Detected bool `json:"detected"`
 
 	// Installed is true when `<SkillsDir>/flowsk/SKILL.md` exists on disk.
@@ -147,6 +153,13 @@ type ProviderStatus struct {
 
 	// MCPConfigured reports whether the provider's primary MCP config file exists and mentions "flowsk".
 	MCPConfigured bool `json:"mcp_configured"`
+
+	// SyncedMCPPaths lists existing secondary profile MCP config files that register "flowsk".
+	SyncedMCPPaths []string `json:"synced_mcp_paths,omitempty"`
+
+	// UnsyncedMCPPaths lists existing secondary profile MCP config files (e.g. T3 Code ACP profiles)
+	// where "flowsk" is missing or empty.
+	UnsyncedMCPPaths []string `json:"unsynced_mcp_paths,omitempty"`
 }
 
 // InstallResult summarizes an atomic skill write to one ProviderTarget.
@@ -216,6 +229,7 @@ func SupportedProviders(homeDir string) ([]ProviderTarget, error) {
 	antigravityTarget.LegacyHomeMarkerDir = filepath.Join(home, ".gemini", "antigravity")
 	antigravityTarget.LegacySkillFilePath = filepath.Join(home, ".gemini", "antigravity", "skills", SkillName, "SKILL.md")
 	antigravityTarget.LegacyMCPConfigPath = filepath.Join(home, ".gemini", "antigravity", "mcp_config.json")
+	antigravityTarget.SecondaryMCPConfigPaths = discoverAntigravityT3MCPConfigPaths(home)
 
 	return []ProviderTarget{
 		mk(ProviderAgents, "Universal Agents (~/.agents)", "~/.agents/skills/flowsk/SKILL.md", ".agents", filepath.Join(".agents", "skills"), filepath.Join(".agents", "mcp.json"), MCPFormatJSON),
@@ -275,7 +289,8 @@ func InspectProvider(target ProviderTarget) ProviderStatus {
 		dirExists(target.LegacyHomeMarkerDir) ||
 		dirExists(target.SkillsDir) ||
 		(target.LegacySkillFilePath != "" && fileExists(target.LegacySkillFilePath)) ||
-		(target.MCPConfigPath != "" && fileExists(target.MCPConfigPath)) {
+		(target.MCPConfigPath != "" && fileExists(target.MCPConfigPath)) ||
+		len(target.SecondaryMCPConfigPaths) > 0 {
 		st.Detected = true
 	}
 
@@ -289,7 +304,35 @@ func InspectProvider(target ProviderTarget) ProviderStatus {
 	if target.MCPConfigPath != "" {
 		st.MCPConfigured = fileMentionsFlowskMCP(target.MCPConfigPath)
 	}
+	for _, secPath := range target.SecondaryMCPConfigPaths {
+		if strings.TrimSpace(secPath) == "" {
+			continue
+		}
+		if fileMentionsFlowskMCP(secPath) {
+			st.SyncedMCPPaths = append(st.SyncedMCPPaths, secPath)
+		} else {
+			st.UnsyncedMCPPaths = append(st.UnsyncedMCPPaths, secPath)
+		}
+	}
 	return st
+}
+
+// discoverAntigravityT3MCPConfigPaths discovers isolated T3 Code Antigravity ACP profile
+// MCP configuration files (`~/.t3/userdata/providers/antigravity/*/config/mcp_config.json`).
+func discoverAntigravityT3MCPConfigPaths(home string) []string {
+	pattern := filepath.Join(home, ".t3", "userdata", "providers", "antigravity", "*", "config")
+	matches, err := filepath.Glob(pattern)
+	if err != nil || len(matches) == 0 {
+		return nil
+	}
+	slices.Sort(matches)
+	out := make([]string, 0, len(matches))
+	for _, cfgDir := range matches {
+		if dirExists(cfgDir) {
+			out = append(out, filepath.Join(cfgDir, "mcp_config.json"))
+		}
+	}
+	return out
 }
 
 // InspectAll inspects all SupportedProviders under homeDir.

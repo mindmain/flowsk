@@ -50,7 +50,8 @@ flowsk init --yes                                              # Bind current re
 flowsk status                                                  # Project or workspace task/worktree overview
 flowsk task next --actor <agent-handle> --claim                # Claim next unblocked ready task
 flowsk task create "<title>" --external-id <EXT-ID> --priority 1
+flowsk task done <KEY> --note "Verified"                       # Close task and release lease
 flowsk search "ext:<EXT-ID>"                                   # Lookup task by external tracker ID
-flowsk code -e 'return flowsk.tasks.done("FLW-1", "Verified");'
+flowsk code -c 'return flowsk.tasks.done("FLW-1", "Verified");'
 flowsk doctor                                                  # Verify DB, orphans, MCP, and skill hashes
 ```
