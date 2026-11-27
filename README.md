@@ -19,7 +19,7 @@ task build
 # Bind the current Git repository/worktree to a logical project in ~/.flowsk
 ./bin/flowsk init CORE --name "Core Platform"
 
-# Inspect global or project status in the terminal, or open the embedded Kanban/Grid Web UI
+# Inspect global or project status in the terminal, or open the embedded Kanban/Grid Web UI (http://127.0.0.1:1616)
 ./bin/flowsk status
 ./bin/flowsk ui
 
@@ -33,7 +33,7 @@ task build
 
 ### 1. Register the MCP Server
 
-Run `flowsk install` to interactively register `flowsk` across your AI clients (or `flowsk mcp guide` to print copy-paste snippets for `.mcp.json`, `~/.claude.json`, `~/.gemini/settings.json`, `~/.gemini/antigravity/mcp_config.json`, or `~/.codex/config.toml`):
+Run `flowsk install` to interactively register `flowsk` across your AI clients (or `flowsk mcp guide` to print copy-paste snippets for `.mcp.json`, `~/.claude.json`, `~/.gemini/settings.json`, `~/.gemini/config/mcp_config.json`, or `~/.codex/config.toml`):
 
 ```json
 {
@@ -171,7 +171,7 @@ FLOWSK_SERVER_URL="http://192.168.1.50:8080" flowsk status
 ## Stack & Governance Catalog
 
 - [STACK.md](./STACK.md) — Canonical technology, protocol, domain, adapter, and tooling directory map.
-- [AGENTS.md](./AGENTS.md) — Root repository architecture rules, `~/.flowsk` local/network dual mode, English commenting mandate, `.prompts` lifecycle, and executive orders.
+- [AGENTS.md](./AGENTS.md) — Root repository architecture rules, `~/.flowsk` local/network dual mode, English commenting mandate, Flowsk MCP task lifecycle, and executive orders.
 - [proto/AGENTS.md](./proto/AGENTS.md) — Protobuf v3, `protovalidate`, mandatory English docstrings, and Buf Connect contract rules.
 - [db/AGENTS.md](./db/AGENTS.md) — Goose reversible migrations, English SQL comments, and dual-engine SQLC query rules.
 - [internal/AGENTS.md](./internal/AGENTS.md) — Strict 3-layer internal package boundaries, English comment mandate, and dependency direction.

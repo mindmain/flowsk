@@ -6,10 +6,10 @@ Single source of truth mapping every language, execution topology, upper transpo
 
 | Component | Technology / Package | Exact Path |
 | :--- | :--- | :--- |
-| Language & Module | Go `1.26.0` (`GOTOOLCHAIN=go1.26.11`, `CGO_ENABLED=0` static pure-Go build) | `go.mod`, `Taskfile.yml` |
-| Unified Binary Entrypoint | `flowsk` CLI (local embedded `~/.flowsk/flowsk.db` default + remote ConnectRPC client), `flowsk install` & `flowsk uninstall` (Lip Gloss + Bubble Tea 3-stage Skill + MCP wizard defaulting to Universal `~/.agents`), `flowsk doctor`, `flowsk update`, `flowsk ui` / `flowsk web` (embedded Angular SPA), `flowsk serve` (`--ui`), `flowsk mcp serve` (Cloudflare Code Mode MCP) | `cmd/flowsk/main.go`, `internal/app/`, `internal/version/` |
-| Embedded Minimalist Web UI | Angular `21.1.x` (standalone `OnPush` + strict templates) + Tailwind CSS `v4.1` (`@tailwindcss/postcss`) + `@ngrx/signals` (`21.0.x` SignalStore) + `@angular/cdk/drag-drop` (`21.1.x`) + TypeScript `~5.9.2`, real-time SSE `EventSource` stream (`FlowskStreamService`), structured **Goals & Roadmap** view (`GoalsViewComponent`), built via `pnpm@12.21.0` into `embed.FS` | `web/`, `internal/adapter/webui/dist/` |
-| Embedded AI Agent Skill & MCP Installer | `//go:embed embed/flowsk/SKILL.md` + SHA-256 digest & non-destructive JSON/TOML Skill + MCP install/uninstall (`agents` `~/.agents/mcp.json`, `claude`, `codex`, `antigravity`, `gemini`, `cursor`) | `internal/skill/`, `internal/skill/embed/flowsk/SKILL.md` |
+| Language & Module | Go `1.26.0` (`toolchain go1.26.11`, `GOTOOLCHAIN=go1.26.11`, `CGO_ENABLED=0` static pure-Go build) | `go.mod`, `Taskfile.yml` |
+| Unified Binary Entrypoint | `flowsk` CLI (local embedded `~/.flowsk/flowsk.db` default + remote ConnectRPC client), `flowsk install` & `flowsk uninstall` (Lip Gloss + Bubble Tea 3-stage Skill + MCP wizard defaulting to Universal `~/.agents`), `flowsk doctor`, `flowsk update`, `flowsk ui` / `flowsk web` (embedded Angular SPA on `127.0.0.1:1616` default + `/api/ui-auth` HMAC session cookie), `flowsk serve` (`--ui`), `flowsk mcp serve` (Cloudflare Code Mode MCP) | `cmd/flowsk/main.go`, `internal/app/`, `internal/version/` |
+| Embedded Minimalist Web UI | Angular `21.1.x` (standalone `OnPush` + strict templates) + Tailwind CSS `v4.1` (`@tailwindcss/postcss`, `@custom-variant dark`) + `@ngrx/signals` (`21.0.x` SignalStore) + `@angular/cdk/drag-drop` (`21.1.x`) + TypeScript `~5.9.2`, real-time SSE `EventSource` stream (`FlowskStreamService`), 10m pulsing green agent-signal glow on active tasks (`Todo`/`In Progress`/`In Review`), structured **Goals & Roadmap** view (`GoalsViewComponent`), built via `pnpm@12.21.0` into tracked `embed.FS` | `web/`, `internal/adapter/webui/dist/` |
+| Embedded AI Agent Skill & MCP Installer | `//go:embed embed/flowsk/SKILL.md` + SHA-256 digest & non-destructive JSON/TOML Skill + MCP install/uninstall (`agents` `~/.agents/mcp.json`, `claude`, `codex`, `antigravity` `~/.gemini/config/{skills,mcp_config.json}` with legacy `~/.gemini/antigravity` cleanup, `gemini`, `cursor`) | `internal/skill/`, `internal/skill/embed/flowsk/SKILL.md` |
 | Typed Runtime Configuration | `github.com/spf13/viper` (`v1.21.0`, `FLOWSK_*` env + `~/.flowsk/config.yaml` + flags, DSN/token redaction) | `internal/config/` |
 | Container & Multi-Profile Compose | 3-stage `node:22-alpine` + `golang:1.26-alpine` + non-root `alpine:3.21` (`10001:10001`, `/data/flowsk` volume) + optional `postgres:17-alpine` profile | `Dockerfile`, `docker-compose.yml`, `.env.example` |
 
@@ -20,15 +20,15 @@ Single source of truth mapping every language, execution topology, upper transpo
 | RPC & Validation Contracts | Protobuf v3 + `buf.build/bufbuild/protovalidate` (100% English `STANDARD` + `COMMENTS` lint enforced) | `proto/flowsk/{workspace,project,objective,task,language,audit}/v1/*.proto` |
 | Buf Workspace & Codegen Config | Buf v2 (`protoc-gen-go`, `protoc-gen-connect-go`) | `buf.yaml`, `buf.gen.yaml`, `buf.lock` |
 | Generated Go Proto & Connect Stubs | `google.golang.org/protobuf` (`v1.36.12`), `connectrpc.com/connect` (`v1.21.1`) | `gen/go/flowsk/{workspace,project,objective,task,language,audit}/v1/` |
-| Reversible Embedded DDL Schemas | Goose v3 (`github.com/pressly/goose/v3` `v3.30.1`, `//go:embed` in `db/embed.go`): initial schema + `project_bindings` DAG + `has_markdown_doc` & archived workflow support + project-unique `tasks.external_id` | `db/embed.go`, `db/migrations/{sqlite,postgres}/{20261115190000_initial_schema,20261125130757_project_bindings,20261125150000_archived_and_markdown_docs,20261125155201_task_external_id}.sql` |
+| Reversible Embedded DDL Schemas | Goose v3 (`github.com/pressly/goose/v3` `v3.30.1`, `//go:embed` in `db/embed.go`): initial schema + `project_bindings` DAG + `has_markdown_doc` & archived workflow support + project-unique `tasks.external_id` + nullable `tasks.last_signal_at` (`DEFAULT NULL`) | `db/embed.go`, `db/migrations/{sqlite,postgres}/{20261115190000_initial_schema,20261125130757_project_bindings,20261125150000_archived_and_markdown_docs,20261125155201_task_external_id,20261126110000_task_last_signal_at}.sql` |
 | Parameterized SQL Queries | SQLC v2 (`sqlc.yaml` dual-engine `sqlite` + `postgresql`: `workspaces`, `actors`, `projects`, `objectives`, `tasks`, `audit_logs`, `dsl_batches`) | `db/queries/{sqlite,postgres}/*.sql` |
 
 ## 3. Upper Transport Layer (Strictly Isolated from Domain)
 
 | Protocol / Surface | Technology / Package | Exact Path |
 | :--- | :--- | :--- |
-| ConnectRPC & Real-Time SSE Stream (`HTTP/1.1`, `h2c` `HTTP/2`, gRPC-compatible) | `connectrpc.com/connect` (`v1.21.1`), `AuthContextInterceptor`, `ProtoValidator`, sanitized `MapDomainError`, Go-channel `EventBroker` + cross-process audit relay (`GET /api/events`), `/healthz`, and 6 bounded-context handlers | `internal/transport/connectrpc/`, `internal/transport/connectrpc/{workspace,project,objective,task,language,audit}handler/` |
-| Model Context Protocol (`stdio`, Streamable `HTTP`) | Pure-Go JSON-RPC 2.0 Cloudflare Code Mode MCP server (`flowsk_search`, `flowsk_execute` ES6 JS, `flowsk_language_guide`, `flowsk_digest`, `flowsk://language/guide`) | `internal/transport/mcp/` |
+| ConnectRPC & Real-Time SSE Stream (`HTTP/1.1`, `h2c` `HTTP/2`, gRPC-compatible) | `connectrpc.com/connect` (`v1.21.1`), `NewOriginAndHostGuard`, `AuthContextInterceptor`, `ProtoValidator`, sanitized `MapDomainError`, Go-channel `EventBroker` + cross-process audit relay (`GET /api/events`), `/healthz`, and 6 bounded-context handlers | `internal/transport/connectrpc/`, `internal/transport/connectrpc/{workspace,project,objective,task,language,audit}handler/` |
+| Model Context Protocol (`stdio`, Streamable `HTTP`) | Pure-Go JSON-RPC 2.0 Cloudflare Code Mode MCP server (`flowsk_search`, `flowsk_execute` ES6 JS, `flowsk_language_guide`, `flowsk_digest`, `flowsk://language/guide`) with `Bearer` token, `Origin`/`Host`, and `application/json` HTTP guards | `internal/transport/mcp/` |
 | Command-Line Interface (`CLI`) | `github.com/spf13/cobra` (`v1.10.2`) + `github.com/spf13/viper` (`v1.21.0`) + `github.com/charmbracelet/lipgloss` (`v1.1.0`) + `github.com/charmbracelet/bubbletea` (`v1.3.10`): `init`, `install`, `uninstall`, `doctor`, `update`, `board`/`status` (`--all` + yellow orphan warning), `ui`/`web`, `prune`, `search`/`find`/`s`, `code`/`exec`, `serve` (`--ui`), `mcp` (`serve`/`tools`/`guide`), `workspace`/`ws` (`actor`), `project` (`link`/`unlink`/`where`/`bind`/`unbind`/`bindings`/`state`/`label`/`doc`), `objective`/`goal`, `task`/`issue` (`--external-id`, `next`/`digest`/`claim`/`release`/`move`/`block`/`unblock`/`comment`/`archive`/`purge-archived`/`doc`), `audit`, `db`, `config` | `internal/cli/` |
 
 ## 4. Pure Core Domain & Search / SDK Catalog (Zero Transport / Driver Imports)
@@ -36,12 +36,12 @@ Single source of truth mapping every language, execution topology, upper transpo
 | Package | Responsibility | Exact Path |
 | :--- | :--- | :--- |
 | Domain Errors | Canonical transport-agnostic error sentinels, violation descriptors & safe wrappers | `internal/domain/errs/` |
-| Workspace Auth Context | Typed caller `Identity` & `RequireWorkspaceOwnership` context guards (`github.com/google/uuid` `v1.6.0`) | `internal/domain/authctx/` |
+| Workspace Auth Context | Typed caller `Identity`, `RequireWorkspaceOwnership`, and Web UI/internal `WithSuppressTaskSignal` context guards (`github.com/google/uuid` `v1.6.0`) | `internal/domain/authctx/` |
 | Transaction Abstraction | ACID unit-of-work contract (`WithTransaction` / `WithNoAuditTransaction`) & atomic `AuditRecorder` decoupled from SQL drivers | `internal/domain/tx/` |
 | Workspace Domain | Multi-tenant workspace & actor membership entities, `ToProto()`, `Service`, local `Repository` | `internal/domain/workspace/` |
 | Project Domain | Logical project lifecycle, Markdown doc port & acyclic `project_bindings` sub-project DAG (zero host paths), `ToProto()`, `Service`, local `Repository` | `internal/domain/project/` |
 | Objective Domain | Strategic goal, milestone, and cycle state machine, `ToProto()`, `Service`, local `Repository` | `internal/domain/objective/` |
-| Task Domain | Hierarchical task execution, project-unique `ExternalID`, DAG dependencies, `ClaimLease` locks, orphan hygiene & digests, `ToProto()`, `Service`, local `Repository` | `internal/domain/task/` |
+| Task Domain | Hierarchical task execution, project-unique `ExternalID`, nullable `LastSignalAt` (`10m` active glow window up to `in_review`), DAG dependencies, `ClaimLease` locks, orphan hygiene & digests, `ToProto()`, `Service`, local `Repository` | `internal/domain/task/` |
 | Audit Domain | Append-only atomic mutation audit log, `ToProto()`, `Service`, local `Repository` | `internal/domain/audit/` |
 | Search Parser & Code Mode SDK Catalog | GitHub/Linear structured search parser (`ParseSearchQuery`), `flowsk.*` TypeScript `.d.ts` specification (`CodeModeTypeScriptSpec`), progressive SDK method catalog (`SearchCodeModeSDK`), and `GuideProvider` ES6 recipes | `internal/language/` |
 
@@ -74,9 +74,9 @@ Single source of truth mapping every language, execution topology, upper transpo
 | `govulncheck` | Call-graph vulnerability scanning against the Go vulnerability database | `task vuln` |
 | Docker & Compose | Hardened multi-stage container build & SQLite / PostgreSQL 17 multi-profile stack | `docker compose up -d` / `docker compose --profile postgres up -d` |
 
-## 7. Governance & Untracked Operational Plans
+## 7. Governance & Operational Task Memory
 
 | Artifact | Purpose | Exact Path |
 | :--- | :--- | :--- |
 | Subsystem Agent Rules | Scoped architectural invariants, mandatory English commenting mandate & executive directives (explicitly unignored in `.gitignore` via `!AGENTS.md`) | `AGENTS.md`, `{proto,db,internal}/AGENTS.md`, `internal/{domain,adapter,language,transport,cli}/AGENTS.md` |
-| Hierarchical `.prompts` Tree | Untracked (`.gitignore`) Italian architectural docs & `ocin-ai` MCP plans | `.prompts/`, `<subsystem>/.prompts/` |
+| Flowsk Operational Memory | External local-first goals, hierarchical tasks, `ClaimLease` locks & Markdown specs managed via `flowsk` MCP (`flowsk_digest`, `flowsk_search`, `flowsk_execute`) | `~/.flowsk/` (`$FLOWSK_HOME`, outside Git repository) |

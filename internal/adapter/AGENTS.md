@@ -9,15 +9,13 @@ Owns external infrastructure wrappers in `internal/adapter/{db,codemode,volume,m
 - **Hermetic Code Mode Sandbox (`codemode`) & Zero Target-Repo Footprint (`localpath`)**: `internal/adapter/codemode` runs `dop251/goja` ES6 JavaScript (`Engine.Execute` and static `ValidateSyntax`) with zero filesystem/network/env access, preemptive timeout cancellation, single-transaction ACID semantics, and staged `DryRun`-safe `.md` document persistence (`stagedMarkdownStore` flushed to `MarkdownStore` only after SQL commit); `internal/adapter/localpath` reads/writes `~/.flowsk/local_paths.json` atomically (`0600` perms, temp-file rename) on the client machine only, inspects local `.git` presence, `git worktree list --porcelain`, and subpath commits (`git log -1`) without writing inside target repositories, and is never wired into server handlers.
 - **Terminal-Readable & Token-Frugal Output (`formatter`)**: `formatter` renders workspaces, projects, goals/objectives (with task progress bars), tasks, task queues, digests, full terminal boards (`BoardView`), and audit trails across `human` (aligned terminal tables), `compact` (ultra-low-token agent lines), `tsv`, `jsonl`, `json`, and `markdown`/`md`. Never manually edit `internal/adapter/db/*/sqlcgen/**` and write all adapter comments strictly in English.
 
-## 3. Hierarchical `.prompts` Tree & MCP Lifecycle
-- Single-adapter plans belong in `internal/adapter/.prompts/` (or `internal/adapter/<pkg>/.prompts/`); cross-layer plans spanning `db/` or `domain/` belong in root `.prompts/`.
-- Manage creation, progression, and status transitions of all `.prompts` plans and tasks exclusively via `ocin-ai` MCP tools; never delete `.md` files in `.prompts`.
+## 3. Flowsk Operational Plans & MCP Lifecycle
+- Track adapter implementation tasks and Markdown specs in `~/.flowsk/` via the `flowsk` MCP tools (`flowsk_digest`, `flowsk_search`, `flowsk_execute`) without creating plan files inside `internal/adapter/`.
 
 ## 4. Executive Orders & Verification Commands
 1. **Ordine Esecutivo 1: Aggiorna sempre `AGENTS.md` e `STACK.md` ad ogni modifica rilevante di stack, architettura, adapter, comandi o struttura prima di concludere il task.**
-2. **Ordine Esecutivo 2: Non cancellare mai file `.md` in `.prompts`; posiziona `.prompts` nel perimetro minimo del lavoro (servizio, dominio padre o root) e gestisci creazione, avanzamento e stato esclusivamente tramite i tool MCP di `ocin-ai`.**
-3. **Direct English Commenting Mandate**: Document every non-generated `.go` file header, exported type, field, and method strictly in English.
-4. Verify SQLC parity, race-safe SQLite/PostgreSQL/codemode/volume/localpath/formatter tests, and linter checks:
+2. **Direct English Commenting Mandate**: Document every non-generated `.go` file header, exported type, field, and method strictly in English.
+3. Verify SQLC parity, race-safe SQLite/PostgreSQL/codemode/volume/localpath/formatter tests, and linter checks:
    ```sh
    task sqlc:compile
    go test -race -count=1 ./internal/adapter/...

@@ -9,15 +9,13 @@ Owns all Protobuf v3 service and message schemas in `proto/flowsk/{workspace,pro
 - **Direct Mandate — Comprehensive English Proto Comments & Validation**: Every `.proto` file MUST include an English package header comment and clear English doc-comments on every `service`, `rpc` method (behavior, auth, error conditions), `message`, `enum`, enum value, and `field`, enforced by `buf.yaml` (`STANDARD` + `COMMENTS`), alongside declarative `buf.validate` constraints (`buf.build/bufbuild/protovalidate`).
 - **Backward Compatibility & Clean Codegen**: Never reuse field numbers or change wire types; regenerate `gen/go/` exclusively via `task proto:gen` and never manually edit generated `.pb.go` or `.connect.go` files.
 
-## 3. Hierarchical `.prompts` Tree & MCP Lifecycle
-- Contract-only design plans belong in `proto/.prompts/`; cross-layer contract + domain/transport plans belong in root `.prompts/`.
-- Manage creation, progression, and completion of all `.prompts` plans and tasks exclusively via `ocin-ai` MCP tools; never delete `.md` files in `.prompts`.
+## 3. Flowsk Operational Plans & MCP Lifecycle
+- Track contract design specs, tasks, and cross-layer dependencies in `~/.flowsk/` via the `flowsk` MCP tools (`flowsk_digest`, `flowsk_search`, `flowsk_execute`) without creating plan files inside `proto/`.
 
 ## 4. Executive Orders & Verification Commands
 1. **Ordine Esecutivo 1: Aggiorna sempre `AGENTS.md` e `STACK.md` ad ogni modifica rilevante di stack, architettura, adapter, comandi o struttura prima di concludere il task.**
-2. **Ordine Esecutivo 2: Non cancellare mai file `.md` in `.prompts`; posiziona `.prompts` nel perimetro minimo del lavoro (servizio, dominio padre o root) e gestisci creazione, avanzamento e stato esclusivamente tramite i tool MCP di `ocin-ai`.**
-3. **Direct English Commenting Mandate**: Document every `.proto` service, RPC, message, enum, enum constant, and field strictly in English; zero uncommented declarations are permitted.
-4. Run Buf linting, compatibility checks, and stub generation after every `.proto` edit:
+2. **Direct English Commenting Mandate**: Document every `.proto` service, RPC, message, enum, enum constant, and field strictly in English; zero uncommented declarations are permitted.
+3. Run Buf linting, compatibility checks, and stub generation after every `.proto` edit:
    ```sh
    task proto:lint
    task proto:breaking
