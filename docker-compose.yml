@@ -2,15 +2,18 @@
 # Flowsk Docker Compose Topology
 # ==============================================================================
 # Usage:
-#   1. Standalone / Shared-Volume SQLite Mode (default, zero external services):
+#   1. Standalone / Shared-Volume SQLite Mode + Embedded Web UI (default):
 #        docker compose up -d --build
-#      Persists the SQLite WAL database, advisory lockfiles, and snapshots inside
-#      the named volume `flowsk_data` mounted at `/data/flowsk`.
+#      Serves ConnectRPC, SSE (`/api/events`), and the embedded Angular Web UI
+#      (`FLOWSK_UI=true`) on `http://localhost:8080`, persisting the SQLite WAL
+#      database, Markdown docs (`FLOWSK_HOME=/data/flowsk`), advisory lockfiles,
+#      and snapshots inside the named volume `flowsk_data` mounted at `/data/flowsk`.
 #
 #   2. Office / Multi-Replica PostgreSQL Mode (seamless adapter switch):
 #        FLOWSK_DB_DRIVER=postgres \
-#        FLOWSK_POSTGRES_DSN=postgres://flowsk:flowsk@postgres:5432/flowsk?sslmode=disable \
+#        FLOWSK_DB_DSN=postgres://flowsk:flowsk@postgres:5432/flowsk?sslmode=disable \
 #        docker compose --profile postgres up -d --build
+#      (Also accepts legacy `FLOWSK_POSTGRES_DSN` as a fallback for `FLOWSK_DB_DSN`.)
 #      Starts `postgres:17-alpine` alongside `flowsk` using the exact same binary
 #      and domain services via `internal/adapter/db/postgres`.
 # ==============================================================================
@@ -19,7 +22,7 @@ name: flowsk
 
 services:
   # ----------------------------------------------------------------------------
-  # Primary Flowsk API & ConnectRPC Server
+  # Primary Flowsk API, Embedded Web UI & ConnectRPC Server
   # Runs SQLite on the shared `flowsk_data` volume out-of-the-box, or connects
   # to PostgreSQL when `FLOWSK_DB_DRIVER=postgres` is provided via `.env` / CLI.
   # ----------------------------------------------------------------------------
@@ -33,8 +36,11 @@ services:
     ports:
       - "${FLOWSK_PORT:-8080}:8080"
     environment:
-      # Transport & observability settings
+      # Transport, embedded Web UI & observability settings
+      FLOWSK_LISTEN: ":8080"
       FLOWSK_HTTP_ADDR: ":8080"
+      FLOWSK_UI: "${FLOWSK_UI:-true}"
+      FLOWSK_HOME: "${FLOWSK_VOLUME_DIR:-/data/flowsk}"
       FLOWSK_LOG_LEVEL: "${FLOWSK_LOG_LEVEL:-info}"
       FLOWSK_LOG_FORMAT: "${FLOWSK_LOG_FORMAT:-json}"
       FLOWSK_AUTH_TOKEN: "${FLOWSK_AUTH_TOKEN:-}"
@@ -43,6 +49,7 @@ services:
 
       # Persistence adapter selection (`sqlite` default | `postgres` office mode)
       FLOWSK_DB_DRIVER: "${FLOWSK_DB_DRIVER:-sqlite}"
+      FLOWSK_DB_DSN: "${FLOWSK_DB_DSN:-${FLOWSK_POSTGRES_DSN:-${FLOWSK_SQLITE_PATH:-/data/flowsk/flowsk.db}}}"
 
       # Shared-volume SQLite configuration (`internal/adapter/db/sqlite` + `volume`)
       FLOWSK_VOLUME_DIR: "${FLOWSK_VOLUME_DIR:-/data/flowsk}"

@@ -24,6 +24,7 @@ WORKDIR /src/web
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml web/.postcssrc.json web/angular.json web/tsconfig*.json ./
 RUN pnpm install --frozen-lockfile
 
+COPY web/public ./public
 COPY web/src ./src
 RUN mkdir -p /src/internal/adapter/webui/dist && pnpm run build
 
@@ -33,6 +34,10 @@ RUN mkdir -p /src/internal/adapter/webui/dist && pnpm run build
 # debug symbols for minimal attack surface and deterministic builds.
 # ------------------------------------------------------------------------------
 FROM golang:${GO_VERSION}-alpine AS builder
+
+ARG VERSION=0.2.0
+ARG COMMIT=dev
+ARG BUILD_DATE=unknown
 
 # Allow Go toolchain auto-selection if go.mod specifies a newer patch release.
 ENV GOTOOLCHAIN=auto \
@@ -56,7 +61,7 @@ COPY --from=ui-builder /src/internal/adapter/webui/dist ./internal/adapter/webui
 # Build a static, reproducible binary into /out/flowsk.
 RUN go build \
     -trimpath \
-    -ldflags="-s -w" \
+    -ldflags="-s -w -X github.com/mindmain/flowsk/internal/version.Version=${VERSION} -X github.com/mindmain/flowsk/internal/version.Commit=${COMMIT} -X github.com/mindmain/flowsk/internal/version.BuildDate=${BUILD_DATE}" \
     -o /out/flowsk \
     ./cmd/flowsk
 
@@ -82,11 +87,17 @@ RUN apk add --no-cache ca-certificates tzdata && \
 COPY --from=builder /out/flowsk /usr/local/bin/flowsk
 
 # Default server configuration:
-# - SQLite primary engine stored inside the shared `/data/flowsk` Docker volume.
+# - SQLite primary engine and Markdown docs stored directly inside `/data/flowsk` (`FLOWSK_HOME`).
+# - Embedded Angular Web UI enabled out-of-the-box on `:8080` (`FLOWSK_UI=true`).
 # - Switch seamlessly to PostgreSQL at runtime by setting `FLOWSK_DB_DRIVER=postgres`
-#   and `FLOWSK_POSTGRES_DSN=postgres://...` without rebuilding this image.
-ENV FLOWSK_HTTP_ADDR=":8080" \
+#   and `FLOWSK_DB_DSN=postgres://...` (or `FLOWSK_POSTGRES_DSN`) without rebuilding this image.
+ENV HOME="/data/flowsk" \
+    FLOWSK_HOME="/data/flowsk" \
+    FLOWSK_LISTEN=":8080" \
+    FLOWSK_HTTP_ADDR=":8080" \
+    FLOWSK_UI="true" \
     FLOWSK_DB_DRIVER="sqlite" \
+    FLOWSK_DB_DSN="/data/flowsk/flowsk.db" \
     FLOWSK_SQLITE_PATH="/data/flowsk/flowsk.db" \
     FLOWSK_VOLUME_DIR="/data/flowsk" \
     FLOWSK_AUTO_MIGRATE="true" \
