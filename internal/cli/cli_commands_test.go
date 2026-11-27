@@ -556,21 +556,25 @@ func (e *inMemoryEnv) CreateObjective(_ context.Context, in cli.CreateObjectiveI
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.checkNoHostPath(in.Project)
-	key := fmt.Sprintf("%s-O%d", strings.ToUpper(in.Project), len(e.objectives)+1)
+	key := strings.TrimSpace(in.Slug)
+	if key == "" {
+		key = fmt.Sprintf("%s-O%d", strings.ToUpper(in.Project), len(e.objectives)+1)
+	}
 	obj := cli.ObjectiveView{
-		ID:          e.nextID("obj"),
-		WorkspaceID: in.Workspace,
-		ProjectID:   strings.ToUpper(in.Project),
-		Key:         key,
-		Kind:        in.Kind,
-		Title:       in.Title,
-		Summary:     in.Summary,
-		Status:      "active",
-		Priority:    in.Priority,
-		TargetDate:  in.TargetDate,
-		Owner:       in.Owner,
-		CreatedAt:   e.now,
-		UpdatedAt:   e.now,
+		ID:              e.nextID("obj"),
+		WorkspaceID:     in.Workspace,
+		ProjectID:       strings.ToUpper(in.Project),
+		Key:             key,
+		Kind:            in.Kind,
+		Title:           in.Title,
+		Summary:         in.Summary,
+		SuccessCriteria: append([]string(nil), in.SuccessCriteria...),
+		Status:          "active",
+		Priority:        in.Priority,
+		TargetDate:      in.TargetDate,
+		Owner:           in.Owner,
+		CreatedAt:       e.now,
+		UpdatedAt:       e.now,
 	}
 	e.objectives[key] = obj
 	return obj, nil
@@ -1857,6 +1861,27 @@ func TestCodeModeDBConfigMCPAndServeCommands(t *testing.T) {
 	doneOut := mustExecCLI(t, env, "", "--project", "WEBUI", "--format", "compact", "task", "done", createdTask.Key, "--note", "Shipped")
 	if !strings.Contains(strings.ToLower(doneOut), "done") || !strings.Contains(doneOut, "P1") {
 		t.Fatalf("expected `flowsk task done` to transition %s to done with P1, got: %q", createdTask.Key, doneOut)
+	}
+
+	// 7. Composed Goal & Project Markdown blueprints (`flowsk goal bundle` / `flowsk project bundle`).
+	mustExecCLI(t, env, "", "--project", "WEBUI", "project", "doc", "--set", "# WebUI Charter\n\nStrict OnPush architecture.")
+	mustExecCLI(t, env, "", "--project", "WEBUI", "goal", "create", "Bundle Goal", "--slug", "bundle-goal", "--priority", "1", "--success-criteria", "Pass gate A")
+	bundledCreateJSON := mustExecCLI(t, env, "", "--project", "WEBUI", "--format", "json", "task", "create", "Bundle Task Spec", "--objective", "bundle-goal", "--priority", "1")
+	var bundledTask cli.TaskView
+	if err := json.Unmarshal([]byte(bundledCreateJSON), &bundledTask); err != nil || bundledTask.Key == "" {
+		t.Fatalf("failed to parse bundled task JSON %q: %v", bundledCreateJSON, err)
+	}
+	mustExecCLI(t, env, "", "--project", "WEBUI", "task", "doc", bundledTask.Key, "--set", "## Target Files\n- internal/cli/bundle.go")
+
+	goalBundleOut := mustExecCLI(t, env, "", "--project", "WEBUI", "--format", "human", "goal", "bundle", "bundle-goal")
+	for _, want := range []string{"# Goal Blueprint: Bundle Goal", "WebUI Charter", "Pass gate A", "internal/cli/bundle.go"} {
+		if !strings.Contains(goalBundleOut, want) {
+			t.Fatalf("expected %q in `flowsk goal bundle` output, got:\n%s", want, goalBundleOut)
+		}
+	}
+	projBundleOut := mustExecCLI(t, env, "", "--project", "WEBUI", "--format", "human", "project", "bundle")
+	if !strings.Contains(projBundleOut, "# Project Blueprint: WEBUI") || !strings.Contains(projBundleOut, "internal/cli/bundle.go") {
+		t.Fatalf("unexpected `flowsk project bundle` output:\n%s", projBundleOut)
 	}
 	for _, unknownCmd := range [][]string{
 		{"bogus-root"},

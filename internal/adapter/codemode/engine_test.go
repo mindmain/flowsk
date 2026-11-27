@@ -708,3 +708,117 @@ func TestCodeModeEngine_SDKParameterAndErrorFidelity(t *testing.T) {
 		t.Fatalf("expected tasks.done NOT to advance lastSignalAt (want %q, got %q)", sig1, sig2)
 	}
 }
+
+func TestCodeModeEngine_GoalAndProjectMarkdownBundles(t *testing.T) {
+	t.Parallel()
+	_, adapter, ctx, wsID, projID := setupCodeModeTestEnv(t)
+
+	mdRoot := t.TempDir()
+	store, err := mdstore.NewFileStore(mdRoot)
+	if err != nil {
+		t.Fatalf("mdstore.NewFileStore: %v", err)
+	}
+	eng := codemode.NewEngine(codemode.Dependencies{
+		TxManager:     adapter.TxManager(),
+		ProjectRepo:   adapter.ProjectRepository(),
+		ObjectiveRepo: adapter.ObjectiveRepository(),
+		TaskRepo:      adapter.TaskRepository(),
+		MarkdownStore: store,
+	})
+
+	res, err := eng.Execute(ctx, codemode.ExecuteInput{
+		WorkspaceID:      wsID,
+		DefaultProjectID: &projID,
+		Script: `
+			flowsk.projects.setDoc("# Core Architecture Charter\n\n- Strict 3-layer separation\n- Zero host paths");
+			const g = flowsk.goals.create({
+				title: "Auth Session Hardening",
+				slug: "auth-session-hardening",
+				priority: 1,
+				summary: "Replace legacy tokens with HMAC HttpOnly cookies.",
+				successCriteria: ["Zero XSS surface", "Strict SameSite cookies"]
+			});
+			const t1 = flowsk.tasks.create({
+				title: "Add HMAC cookie signer",
+				objective: g.slug,
+				priority: 1,
+				tags: ["security", "http"],
+				acceptance: ["Unit tests pass with -race"],
+				markdown: "## Target Files\n- internal/transport/connectrpc/cookie.go\n\n## Details\nSign payload with SHA-256."
+			});
+			const t2 = flowsk.tasks.create({
+				title: "Wire cookie middleware into SPA bootstrap",
+				objective: g.slug,
+				priority: 2,
+				parent: t1.key,
+				dependsOn: [t1.key],
+				markdown: "## Target Files\n- internal/adapter/webui/handler.go"
+			});
+			const unscoped = flowsk.tasks.create({
+				title: "Update Taskfile lint target",
+				priority: 3,
+				markdown: "## Target Files\n- Taskfile.yml"
+			});
+
+			flowsk.tasks.claim(t1.key, 1800);
+			flowsk.tasks.comment(t1.key, "Chose 32-byte HKDF key derivation", "decision");
+			const doneT1 = flowsk.tasks.done(t1.key, "Signer verified");
+
+			const goalSingle = flowsk.goals.get("auth-session-hardening");
+			const goalBundleAll = flowsk.goals.bundle("auth-session-hardening");
+			const goalBundleOpen = flowsk.goals.getDoc("auth-session-hardening", { includeDone: false, includeProjectDoc: false });
+			const projBundle = flowsk.projects.bundle({ includeDone: true });
+			const claimedT2 = flowsk.tasks.claim(t2.key, 1800);
+
+			return {
+				doneT1MarkdownInline: doneT1.markdown.includes("cookie.go"),
+				claimedT2MarkdownInline: claimedT2.markdown.includes("webui/handler.go"),
+				goalTotal: goalSingle.totalTasks,
+				goalCompleted: goalSingle.completedTasks,
+				bundleAllTaskCount: goalBundleAll.tasks.length,
+				bundleOpenTaskCount: goalBundleOpen.tasks.length,
+				t2DependsOn: goalBundleAll.tasks[1].dependsOn,
+				t1Blocks: goalBundleAll.tasks[0].blocks,
+				goalMD: goalBundleAll.markdown,
+				goalOpenMD: goalBundleOpen.markdown,
+				projMD: projBundle.markdown,
+				unscopedKey: unscoped.key
+			};
+		`,
+	})
+	if err != nil {
+		t.Fatalf("Execute bundle workflow failed: %v", err)
+	}
+	m := res.Value.(map[string]any)
+	if m["doneT1MarkdownInline"] != true || m["claimedT2MarkdownInline"] != true {
+		t.Fatalf("expected inline TaskDetail.markdown on get/claim/done, got %+v", m)
+	}
+	if m["goalTotal"] != int64(2) || m["goalCompleted"] != int64(1) {
+		t.Fatalf("unexpected goals.get counts: %+v", m)
+	}
+	if m["bundleAllTaskCount"] != int64(2) || m["bundleOpenTaskCount"] != int64(1) {
+		t.Fatalf("unexpected bundle task counts: all=%v open=%v", m["bundleAllTaskCount"], m["bundleOpenTaskCount"])
+	}
+	goalMD, _ := m["goalMD"].(string)
+	for _, token := range []string{
+		"# Goal Blueprint: Auth Session Hardening (`auth-session-hardening`)",
+		"## Project Charter (`CORE.md`)",
+		"Strict 3-layer separation",
+		"Zero XSS surface",
+		"internal/transport/connectrpc/cookie.go",
+		"internal/adapter/webui/handler.go",
+		"Chose 32-byte HKDF key derivation",
+	} {
+		if !strings.Contains(goalMD, token) {
+			t.Fatalf("expected %q in goalBundleAll.markdown, got:\n%s", token, goalMD)
+		}
+	}
+	goalOpenMD, _ := m["goalOpenMD"].(string)
+	if strings.Contains(goalOpenMD, "Project Charter") || strings.Contains(goalOpenMD, "cookie.go") || !strings.Contains(goalOpenMD, "webui/handler.go") {
+		t.Fatalf("expected includeDone=false & includeProjectDoc=false to omit done task and charter, got:\n%s", goalOpenMD)
+	}
+	projMD, _ := m["projMD"].(string)
+	if !strings.Contains(projMD, "# Project Blueprint: CORE") || !strings.Contains(projMD, "Unscoped Project Tasks") || !strings.Contains(projMD, "Taskfile.yml") {
+		t.Fatalf("expected project bundle markdown to include goals and unscoped tasks, got:\n%s", projMD)
+	}
+}

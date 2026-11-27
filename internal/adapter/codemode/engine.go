@@ -703,8 +703,50 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 		s.mutations++
 		return vm.ToValue(projectMap(updated))
 	}))
+	_ = projectsObj.Set("bundle", s.hostFn(func(call goja.FunctionCall) goja.Value {
+		opts := parseProjectBundleArgs(vm, call)
+		bundle, err := s.buildProjectBundle(opts)
+		if err != nil {
+			s.throwErr(vm, err)
+		}
+		return vm.ToValue(bundle)
+	}))
 
 	goalsObj := vm.NewObject()
+	_ = goalsObj.Set("get", s.hostFn(func(call goja.FunctionCall) goja.Value {
+		ref := strings.TrimSpace(requireJSStringArg(vm, call, 0, "flowsk.goals.get", "slugOrId"))
+		var projRef string
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) && !goja.IsNull(call.Arguments[1]) {
+			if m, ok := exportJSValue(call.Arguments[1]).(map[string]any); ok {
+				projRef = strField(m, "project")
+			} else if raw, okS := exportJSValue(call.Arguments[1]).(string); okS {
+				projRef = strings.TrimSpace(raw)
+			}
+		}
+		p, err := s.resolveProject(projRef)
+		if err != nil {
+			s.throwErr(vm, err)
+		}
+		obj, err := s.resolveObjective(p.ID, ref)
+		if err != nil {
+			s.throwErr(vm, err)
+		}
+		tasks, err := s.listAllProjectTasks(p.ID)
+		if err != nil {
+			s.throwErr(vm, err)
+		}
+		return vm.ToValue(objectiveMap(obj, tasks))
+	}))
+	goalBundleFn := s.hostFn(func(call goja.FunctionCall) goja.Value {
+		ref, opts := parseGoalBundleArgs(vm, call, "flowsk.goals.bundle")
+		bundle, err := s.buildGoalBundle(ref, opts)
+		if err != nil {
+			s.throwErr(vm, err)
+		}
+		return vm.ToValue(bundle)
+	})
+	_ = goalsObj.Set("bundle", goalBundleFn)
+	_ = goalsObj.Set("getDoc", goalBundleFn)
 	_ = goalsObj.Set("list", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		rawFilter := optArgString(call, 0)
 		p, err := s.resolveProject("")
@@ -2178,6 +2220,12 @@ func (s *scriptSession) fullTaskMap(t task.Task) map[string]any {
 	if t.LastSignalAt != nil && !t.LastSignalAt.IsZero() {
 		lastSignalAt = t.LastSignalAt.UTC().Format(time.RFC3339Nano)
 	}
+	markdown := ""
+	if t.HasMarkdownDoc {
+		if md, hasDoc, mdErr := s.taskSvc.GetTaskMarkdown(s.ctx, s.wsID, t.ID); mdErr == nil && hasDoc {
+			markdown = md
+		}
+	}
 	return map[string]any{
 		"id":             t.ID.String(),
 		"key":            t.Key,
@@ -2185,6 +2233,7 @@ func (s *scriptSession) fullTaskMap(t task.Task) map[string]any {
 		"externalId":     t.ExternalID,
 		"title":          t.Title,
 		"description":    t.Description,
+		"markdown":       markdown,
 		"status":         string(t.Status),
 		"state":          string(t.Status),
 		"priority":       int(t.Priority),
@@ -2213,12 +2262,15 @@ func projectMap(p project.Project) map[string]any {
 }
 
 func objectiveMap(o objective.Objective, tasks []task.CompactTaskSummary) map[string]any {
-	total, done := 0, 0
+	total, done, blocked := 0, 0, 0
 	for _, t := range tasks {
 		if strings.EqualFold(t.ObjectiveSlug, o.Slug) {
 			total++
 			if t.Status == task.StatusDone {
 				done++
+			}
+			if t.UnresolvedBlockerCount > 0 || t.Status == task.StatusBlocked {
+				blocked++
 			}
 		}
 	}
@@ -2247,6 +2299,7 @@ func objectiveMap(o objective.Objective, tasks []task.CompactTaskSummary) map[st
 		"successCriteria": criteria,
 		"totalTasks":      total,
 		"completedTasks":  done,
+		"blockedTasks":    blocked,
 	}
 }
 

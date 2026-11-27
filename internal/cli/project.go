@@ -13,6 +13,8 @@ import (
 
 type projectCommandDeps interface {
 	ProjectDependency
+	ObjectiveDependency
+	TaskDependency
 	LocalPathDependency
 	FormatterDependency
 }
@@ -20,27 +22,35 @@ type projectCommandDeps interface {
 type projectHandler struct {
 	opts       *GlobalOptions
 	client     ProjectClient
+	objectives ObjectiveClient
+	tasks      TaskClient
 	localPaths LocalPathRegistry
 	formatter  OutputFormatter
 }
 
 // newProjectCommand constructs `flowsk project` (`create`, `list`, `get`,
-// `update`, `archive`, `link`, `unlink`, `where`, `state list|create`,
-// `label list|create`).
+// `update`, `archive`, `link`, `unlink`, `where`, `doc`, `bundle`,
+// `state list|create`, `label list|create`).
 func newProjectCommand(opts *GlobalOptions, deps projectCommandDeps) *cobra.Command {
 	var (
 		client     ProjectClient
+		objectives ObjectiveClient
+		tasks      TaskClient
 		localPaths LocalPathRegistry
 		formatter  OutputFormatter
 	)
 	if deps != nil {
 		client = deps.ProjectClient()
+		objectives = deps.ObjectiveClient()
+		tasks = deps.TaskClient()
 		localPaths = deps.LocalPathRegistry()
 		formatter = deps.OutputFormatter()
 	}
 	h := &projectHandler{
 		opts:       opts,
 		client:     client,
+		objectives: objectives,
+		tasks:      tasks,
 		localPaths: localPaths,
 		formatter:  formatter,
 	}
@@ -75,6 +85,7 @@ Zero Repo & Server Path Footprint:
 		h.newUnlinkSubcommand(),
 		h.newWhereSubcommand(),
 		h.newDocSubcommand(),
+		h.newBundleSubcommand(),
 		h.newStateSubcommand(),
 		h.newLabelSubcommand(),
 	)
@@ -733,11 +744,13 @@ func (h *projectHandler) newDocSubcommand() *cobra.Command {
 		setMarkdown string
 		fromStdin   bool
 		clearDoc    bool
+		asBundle    bool
+		excludeDone bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "doc [project-id-or-key]",
-		Short: "Read, write, or clear the extended Markdown (.md) document for a project in ~/.flowsk/projects/",
+		Short: "Read, write, or clear the extended Markdown (.md) document for a project (or --bundle all goals & tasks)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -754,6 +767,20 @@ func (h *projectHandler) newDocSubcommand() *cobra.Command {
 			ws, proj, err := resolveActiveProject(ctx, h.opts, h.localPaths, explicit)
 			if err != nil {
 				return err
+			}
+			if asBundle {
+				if clearDoc || cmd.Flags().Changed("set") || fromStdin {
+					return errors.New("--bundle cannot be combined with --set, --stdin, or --clear")
+				}
+				bundle, bErr := composeCLIProjectBundle(ctx, ws, proj, cliBundleOptions{
+					IncludeDone:       !excludeDone,
+					IncludeProjectDoc: true,
+					IncludeComments:   true,
+				}, h.client, h.objectives, h.tasks)
+				if bErr != nil {
+					return bErr
+				}
+				return renderPayload(cmd.OutOrStdout(), h.formatter, h.opts, bundle)
 			}
 			if clearDoc {
 				if cmd.Flags().Changed("set") || fromStdin {
@@ -787,6 +814,55 @@ func (h *projectHandler) newDocSubcommand() *cobra.Command {
 	cmd.Flags().StringVarP(&setMarkdown, "set", "m", "", "Write Markdown content to the project's .md document")
 	cmd.Flags().BoolVar(&fromStdin, "stdin", false, "Read Markdown content from standard input")
 	cmd.Flags().BoolVar(&clearDoc, "clear", false, "Delete the project's .md document")
+	cmd.Flags().BoolVar(&asBundle, "bundle", false, "Compose full project Markdown blueprint including all goals and task .md specs")
+	cmd.Flags().BoolVar(&excludeDone, "exclude-done", false, "When --bundle is set, omit completed goals and tasks")
+	return cmd
+}
+
+func (h *projectHandler) newBundleSubcommand() *cobra.Command {
+	var (
+		excludeDone bool
+		noComments  bool
+	)
+
+	cmd := &cobra.Command{
+		Use:     "bundle [project-id-or-key]",
+		Aliases: []string{"dossier"},
+		Short:   "Compose the complete Project Markdown blueprint (project charter, all goals, DAG tables, and all task .md specs)",
+		Example: `  flowsk project bundle
+  flowsk project bundle CORE --exclude-done
+  flowsk project bundle --format json`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("project bundle context canceled: %w", err)
+			}
+			if h.client == nil {
+				return ErrNotImplemented
+			}
+			explicit := ""
+			if len(args) == 1 {
+				explicit = args[0]
+			}
+			ws, proj, err := resolveActiveProject(ctx, h.opts, h.localPaths, explicit)
+			if err != nil {
+				return err
+			}
+			bundle, err := composeCLIProjectBundle(ctx, ws, proj, cliBundleOptions{
+				IncludeDone:       !excludeDone,
+				IncludeProjectDoc: true,
+				IncludeComments:   !noComments,
+			}, h.client, h.objectives, h.tasks)
+			if err != nil {
+				return err
+			}
+			return renderPayload(cmd.OutOrStdout(), h.formatter, h.opts, bundle)
+		},
+	}
+
+	cmd.Flags().BoolVar(&excludeDone, "exclude-done", false, "Omit completed/dropped goals and terminal tasks from the blueprint")
+	cmd.Flags().BoolVar(&noComments, "no-comments", false, "Omit task timeline comments from the composed blueprint")
 	return cmd
 }
 

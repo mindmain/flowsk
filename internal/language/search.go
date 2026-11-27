@@ -225,9 +225,13 @@ declare const flowsk: {
     setDoc(markdown: string): Project;
     setDoc(slugOrKey: string, markdown: string): Project;
     deleteDoc(slugOrKey?: string): Project;
+    bundle(slugOrKeyOrOpts?: string | { project?: string; includeDone?: boolean; includeProjectDoc?: boolean; includeComments?: boolean }, opts?: { includeDone?: boolean; includeProjectDoc?: boolean; includeComments?: boolean }): ProjectBundle;
   };
   goals: { // alias: flowsk.objectives
     list(filter?: string): Goal[];
+    get(slugOrId: string, opts?: { project?: string }): Goal;
+    bundle(slugOrId: string, opts?: { project?: string; includeDone?: boolean; includeProjectDoc?: boolean; includeComments?: boolean }): GoalBundle;
+    getDoc(slugOrId: string, opts?: { project?: string; includeDone?: boolean; includeProjectDoc?: boolean; includeComments?: boolean }): GoalBundle;
     create(in: { title: string; project?: string; kind?: "goal" | "milestone" | "cycle"; status?: "planned" | "active" | "at_risk"; slug?: string; summary?: string; priority?: 0 | 1 | 2 | 3 | 4 | "none" | "urgent" | "high" | "medium" | "low"; targetDate?: string; successCriteria?: string[] }): Goal;
     update(slugOrId: string, patch: { title?: string; kind?: "goal" | "milestone" | "cycle"; status?: "planned" | "active" | "at_risk" | "achieved" | "dropped"; summary?: string; priority?: number | string; targetDate?: string | null; successCriteria?: string[] }): Goal;
     close(slugOrId: string, note?: string): Goal;
@@ -338,11 +342,39 @@ func CodeModeSDKCatalog() []SDKMethodDoc {
 			Example:   `flowsk.projects.deleteDoc("CORE");`,
 		},
 		{
+			Name:      "flowsk.projects.bundle",
+			Category:  "projects",
+			Signature: "flowsk.projects.bundle(slugOrKeyOrOpts?: string | { includeDone?, includeProjectDoc?, includeComments? }, opts?): ProjectBundle",
+			Summary:   "Composes the complete Project Markdown blueprint (project charter, all goals & success criteria, DAG dependency table, and every task's .md specification) in one call.",
+			Example:   `return flowsk.projects.bundle("CORE", { includeDone: false }).markdown;`,
+		},
+		{
 			Name:      "flowsk.goals.list",
 			Category:  "goals",
 			Signature: "flowsk.goals.list(filter?: string): Goal[]",
 			Summary:   "Lists strategic goals/objectives with live task completion progress counts.",
 			Example:   `return flowsk.goals.list();`,
+		},
+		{
+			Name:      "flowsk.goals.get",
+			Category:  "goals",
+			Signature: "flowsk.goals.get(slugOrId: string, opts?: { project?: string }): Goal",
+			Summary:   "Fetches a single strategic goal/milestone/cycle with live total, completed, and blocked task counts.",
+			Example:   `return flowsk.goals.get("launch-v1");`,
+		},
+		{
+			Name:      "flowsk.goals.bundle",
+			Category:  "goals",
+			Signature: "flowsk.goals.bundle(slugOrId: string, opts?: { project?, includeDone?, includeProjectDoc?, includeComments? }): GoalBundle",
+			Summary:   "Composes a supervisor-ready Markdown blueprint for a goal (project charter + goal criteria + task execution table + DAG blockers + every task's .md spec & handoff notes) in one call.",
+			Example:   `return flowsk.goals.bundle("launch-v1").markdown;`,
+		},
+		{
+			Name:      "flowsk.goals.getDoc",
+			Category:  "goals",
+			Signature: "flowsk.goals.getDoc(slugOrId: string, opts?: { project?, includeDone?, includeProjectDoc?, includeComments? }): GoalBundle",
+			Summary:   "Alias for flowsk.goals.bundle returning the composed Markdown blueprint and hydrated tasks for a goal.",
+			Example:   `return flowsk.goals.getDoc("launch-v1").markdown;`,
 		},
 		{
 			Name:      "flowsk.goals.create",

@@ -465,6 +465,9 @@ func renderCompact(w io.Writer, payload any) error {
 		}
 		_, err := fmt.Fprintf(w, "doc %s:%s action=%s exists=%t\n", v.EntityKind, v.EntityKey, v.Action, v.HasMarkdownDoc)
 		return err
+	case BlueprintBundleView:
+		_, err := io.WriteString(w, ensureTrailingNewline(v.Markdown))
+		return err
 	case PurgeArchivedView:
 		_, err := fmt.Fprintf(w, "purged_archived tasks=%d md_files=%d keys=%s\n",
 			v.DeletedTaskCount, v.DeletedMarkdownCount, strings.Join(v.DeletedTaskKeys, ","))
@@ -755,6 +758,9 @@ func renderMarkdown(w io.Writer, payload any) error {
 			_, err := fmt.Fprintf(w, "Wrote Flowsk Code Mode (%s) guide to `%s`.\n", v.Section, v.WrittenToPath)
 			return err
 		}
+		_, err := io.WriteString(w, ensureTrailingNewline(v.Markdown))
+		return err
+	case BlueprintBundleView:
 		_, err := io.WriteString(w, ensureTrailingNewline(v.Markdown))
 		return err
 	default:
@@ -1192,6 +1198,9 @@ func renderHumanAdminAndSystem(w io.Writer, payload any) error {
 			_, err := fmt.Fprintf(w, "Saved Markdown document for %s %s (%d bytes).\n", v.EntityKind, v.EntityKey, len(v.Markdown))
 			return err
 		}
+	case BlueprintBundleView:
+		_, err := io.WriteString(w, ensureTrailingNewline(v.Markdown))
+		return err
 	case PurgeArchivedView:
 		if v.DeletedTaskCount == 0 {
 			_, err := fmt.Fprintln(w, "No archived tasks to purge.")

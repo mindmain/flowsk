@@ -238,9 +238,13 @@ const DefaultLanguageGuideMarkdown = "# Flowsk Cloudflare Code Mode — JavaScri
     setDoc(markdown: string): Project;
     setDoc(slugOrKey: string, markdown: string): Project;
     deleteDoc(slugOrKey?: string): Project;
+    bundle(slugOrKeyOrOpts?: string | { project?: string; includeDone?: boolean; includeProjectDoc?: boolean; includeComments?: boolean }, opts?: { includeDone?: boolean; includeProjectDoc?: boolean; includeComments?: boolean }): ProjectBundle;
   };
   goals: { // alias: flowsk.objectives
     list(filter?: string): Goal[];
+    get(slugOrId: string, opts?: { project?: string }): Goal;
+    bundle(slugOrId: string, opts?: { project?: string; includeDone?: boolean; includeProjectDoc?: boolean; includeComments?: boolean }): GoalBundle;
+    getDoc(slugOrId: string, opts?: { project?: string; includeDone?: boolean; includeProjectDoc?: boolean; includeComments?: boolean }): GoalBundle;
     create(in: {
       title: string;
       project?: string;
@@ -313,7 +317,7 @@ const DefaultLanguageGuideMarkdown = "# Flowsk Cloudflare Code Mode — JavaScri
     deleteDoc(keyOrId: string): TaskDetail;
   };
 };
-// Task & TaskDetail expose lastSignalAt: string | null (RFC3339Nano UTC timestamp of latest agent/CLI/MCP signal up to in_review).` + "\n```\n\n---\n\n## 3. Multi-Step Atomic JavaScript Recipes & Examples\n\n### Decompose a Goal, Wire DAG Dependencies & Claim First Task\n```js\nconst goal = flowsk.goals.create({\n  title: \"Ship Storage & MCP v1\",\n  priority: \"urgent\",\n  targetDate: \"2026-12-31\"\n});\nconst epic = flowsk.tasks.create({\n  title: \"Dual SQLite & Postgres Persistence\",\n  kind: \"epic\",\n  objective: goal.key,\n  priority: \"urgent\",\n  tags: [\"db\", \"golang\"]\n});\nconst t1 = flowsk.tasks.create({\n  title: \"Implement SQLite WAL pool & Goose runner\",\n  parent: epic.key,\n  objective: goal.key,\n  priority: \"urgent\"\n});\nconst t2 = flowsk.tasks.create({\n  title: \"Add cross-tenant isolation integration tests\",\n  parent: epic.key,\n  objective: goal.key,\n  priority: \"high\",\n  dependsOn: [t1.key]\n});\nreturn flowsk.tasks.claim(t1.key, 1800);\n```\n\n### Complete Leased Work & Claim Next Unblocked Ready Task\n```js\nflowsk.tasks.comment(\"FLW-1\", \"Race-enabled test suite green\", \"progress\");\nflowsk.tasks.done(\"FLW-1\", \"Verified with task verify\");\nreturn flowsk.tasks.next({ claim: true, ttlSeconds: 1800 });\n```\n"
+// TaskDetail exposes inline markdown: string (populated automatically when hasMarkdownDoc is true) and lastSignalAt: string | null.` + "\n```\n\n---\n\n## 3. Multi-Step Atomic JavaScript Recipes & Examples\n\n### Plan a Goal with Self-Contained Task `.md` Specifications (`flowsk-plan`)\n```js\nconst goal = flowsk.goals.create({\n  title: \"Ship Storage & MCP v1\",\n  slug: \"storage-mcp-v1\",\n  priority: \"urgent\",\n  targetDate: \"2026-12-31\",\n  successCriteria: [\"Zero lock contention under -race\", \"Cross-tenant isolation verified\"]\n});\nconst t1 = flowsk.tasks.create({\n  title: \"Implement SQLite WAL pool & Goose runner\",\n  objective: goal.slug,\n  priority: \"urgent\",\n  tags: [\"db\", \"golang\"],\n  markdown: \"# SQLite WAL & Goose\\n\\n## Target Files & Symbols\\n- `internal/adapter/db/sqlite/adapter.go`\\n\\n## Verification\\n- `go test -race ./internal/adapter/db/sqlite/...`\"\n});\nconst t2 = flowsk.tasks.create({\n  title: \"Add cross-tenant isolation integration tests\",\n  objective: goal.slug,\n  priority: \"high\",\n  dependsOn: [t1.key],\n  markdown: \"# Cross-Tenant Isolation Tests\\n\\n## Target Files & Symbols\\n- `internal/adapter/db/sqlite/adapter_test.go`\\n\\n## Verification\\n- `go test -race ./internal/adapter/db/...`\"\n});\nreturn flowsk.goals.bundle(goal.slug).markdown;\n```\n\n### Validate Goal Blueprint, Claim Ready Task & Complete (`flowsk-dev`)\n```js\n// 1. Download composed Goal blueprint (charter + criteria + DAG + all task .md specs) before coding:\nconst blueprint = flowsk.goals.bundle(\"storage-mcp-v1\");\n// 2. Claim ready task (returns TaskDetail with inline `markdown`):\nconst active = flowsk.tasks.claim(\"FLW-1\", 1800);\nreturn { blueprintMarkdown: blueprint.markdown, taskSpec: active.markdown };\n```\n"
 
 var defaultExamples = []Example{
 	{

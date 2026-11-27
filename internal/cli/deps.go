@@ -1942,6 +1942,43 @@ type MarkdownDocView struct {
 	Action string `json:"action"`
 }
 
+// BundledTaskView pairs a full TaskView (including dependencies and comments)
+// with its optional extended Markdown specification body inside a composed blueprint.
+type BundledTaskView struct {
+	// Task holds full task metadata, acceptance criteria, dependencies, and comments.
+	Task TaskView `json:"task"`
+
+	// Markdown holds the contents of `<task_id>.md` when HasMarkdownDoc is true.
+	Markdown string `json:"markdown,omitempty"`
+}
+
+// BlueprintBundleView represents a self-contained composed Markdown blueprint for
+// a single strategic goal (`Kind == "goal"`) or an entire project (`Kind == "project"`),
+// aggregating project charter, goal success criteria, execution summary table,
+// dependency edges, comments, and every task's `.md` specification.
+type BlueprintBundleView struct {
+	// Kind identifies the bundle scope ("goal" or "project").
+	Kind string `json:"kind"`
+
+	// Project holds the owning project metadata.
+	Project ProjectView `json:"project"`
+
+	// ProjectMarkdown holds the project's `.md` charter when included and present.
+	ProjectMarkdown string `json:"project_markdown,omitempty"`
+
+	// Goal holds the target goal metadata when Kind == "goal".
+	Goal *ObjectiveView `json:"goal,omitempty"`
+
+	// Goals lists project goals when Kind == "project".
+	Goals []ObjectiveView `json:"goals,omitempty"`
+
+	// Tasks lists hydrated tasks and their inline `.md` specifications in execution order.
+	Tasks []BundledTaskView `json:"tasks"`
+
+	// Markdown contains the complete composed GitHub-Flavored Markdown blueprint document.
+	Markdown string `json:"markdown"`
+}
+
 // PurgeArchivedView summarizes permanent deletion of all archived tasks in a workspace.
 type PurgeArchivedView struct {
 	// WorkspaceID identifies the purged workspace.

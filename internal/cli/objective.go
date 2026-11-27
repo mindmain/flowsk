@@ -14,6 +14,8 @@ import (
 
 type objectiveCommandDeps interface {
 	ObjectiveDependency
+	ProjectDependency
+	TaskDependency
 	LocalPathDependency
 	FormatterDependency
 }
@@ -21,27 +23,35 @@ type objectiveCommandDeps interface {
 type objectiveHandler struct {
 	opts       *GlobalOptions
 	client     ObjectiveClient
+	projects   ProjectClient
+	tasks      TaskClient
 	localPaths LocalPathRegistry
 	formatter  OutputFormatter
 }
 
 // newObjectiveCommand constructs `flowsk objective` (aliases: `obj`, `goal`,
-// `goals`) and its `create`, `list`, `get`, `update`, and `close` subcommands
-// with immediate constructor dependency resolution.
+// `goals`) and its `create`, `list`, `get`, `bundle`, `update`, and `close`
+// subcommands with immediate constructor dependency resolution.
 func newObjectiveCommand(opts *GlobalOptions, deps objectiveCommandDeps) *cobra.Command {
 	var (
 		client     ObjectiveClient
+		projects   ProjectClient
+		tasks      TaskClient
 		localPaths LocalPathRegistry
 		formatter  OutputFormatter
 	)
 	if deps != nil {
 		client = deps.ObjectiveClient()
+		projects = deps.ProjectClient()
+		tasks = deps.TaskClient()
 		localPaths = deps.LocalPathRegistry()
 		formatter = deps.OutputFormatter()
 	}
 	h := &objectiveHandler{
 		opts:       opts,
 		client:     client,
+		projects:   projects,
+		tasks:      tasks,
 		localPaths: localPaths,
 		formatter:  formatter,
 	}
@@ -61,6 +71,7 @@ AI agents can align daily tasks with measurable project outcomes.`,
 		h.newCreateSubcommand(),
 		h.newListSubcommand(),
 		h.newGetSubcommand(),
+		h.newBundleSubcommand(),
 		h.newUpdateSubcommand(),
 		h.newCloseSubcommand(),
 	)
@@ -227,6 +238,55 @@ func (h *objectiveHandler) newGetSubcommand() *cobra.Command {
 			return renderPayload(cmd.OutOrStdout(), h.formatter, h.opts, obj)
 		},
 	}
+}
+
+func (h *objectiveHandler) newBundleSubcommand() *cobra.Command {
+	var (
+		excludeDone   bool
+		noProjectDoc  bool
+		noComments    bool
+	)
+
+	cmd := &cobra.Command{
+		Use:     "bundle <objective-id-or-key>",
+		Aliases: []string{"doc", "dossier"},
+		Short:   "Compose the complete Goal Markdown blueprint (project charter, criteria, DAG table, and all task .md specs)",
+		Example: `  flowsk goal bundle auth-v2
+  flowsk goal doc auth-v2 --exclude-done
+  flowsk goal bundle auth-v2 --format json`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("objective bundle context canceled: %w", err)
+			}
+			if h.client == nil {
+				return ErrNotImplemented
+			}
+			ref := strings.TrimSpace(args[0])
+			if ref == "" {
+				return errors.New("objective identifier must not be empty")
+			}
+			ws, proj, err := resolveActiveProject(ctx, h.opts, h.localPaths, "")
+			if err != nil {
+				return err
+			}
+			bundle, err := composeCLIGoalBundle(ctx, ws, proj, ref, cliBundleOptions{
+				IncludeDone:       !excludeDone,
+				IncludeProjectDoc: !noProjectDoc,
+				IncludeComments:   !noComments,
+			}, h.projects, h.client, h.tasks)
+			if err != nil {
+				return err
+			}
+			return renderPayload(cmd.OutOrStdout(), h.formatter, h.opts, bundle)
+		},
+	}
+
+	cmd.Flags().BoolVar(&excludeDone, "exclude-done", false, "Omit completed and canceled tasks from the composed blueprint")
+	cmd.Flags().BoolVar(&noProjectDoc, "no-project-doc", false, "Omit the project-level .md charter from the composed blueprint")
+	cmd.Flags().BoolVar(&noComments, "no-comments", false, "Omit task timeline comments from the composed blueprint")
+	return cmd
 }
 
 func (h *objectiveHandler) newUpdateSubcommand() *cobra.Command {
