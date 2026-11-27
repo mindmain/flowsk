@@ -20,6 +20,7 @@ import {
   TaskStatus,
 } from '../../core/models/flowsk.models';
 import { FlowskStore } from '../../core/store/flowsk.store';
+import { MarkdownViewerComponent } from '../markdown-viewer/markdown-viewer.component';
 
 /**
  * Discriminated modal dialog identifier displayed by DialogsComponent.
@@ -41,7 +42,7 @@ export type ActiveDialogType =
 @Component({
   selector: 'app-dialogs',
   standalone: true,
-  imports: [FormsModule],
+  imports: [FormsModule, MarkdownViewerComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     @if (dialog() !== null) {
@@ -51,7 +52,8 @@ export type ActiveDialogType =
       >
         <div
           (click)="$event.stopPropagation()"
-          class="w-full max-w-lg rounded-xl bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 shadow-2xl p-5 space-y-4"
+          class="w-full rounded-xl bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 shadow-2xl p-5 space-y-4"
+          [class]="dialog() === 'project-charter' ? 'max-w-2xl' : 'max-w-lg'"
         >
           <!-- 1. Create Task -->
           @if (dialog() === 'new-task') {
@@ -97,10 +99,10 @@ export type ActiveDialogType =
                   (ngModelChange)="taskPriority.set($event)"
                   class="px-2.5 py-1.5 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200"
                 >
-                  <option value="TASK_PRIORITY_URGENT">P0 · Urgent</option>
-                  <option value="TASK_PRIORITY_HIGH">P1 · High</option>
-                  <option value="TASK_PRIORITY_MEDIUM">P2 · Medium</option>
-                  <option value="TASK_PRIORITY_LOW">P3 · Low</option>
+                  <option value="TASK_PRIORITY_URGENT">P1 · Urgent</option>
+                  <option value="TASK_PRIORITY_HIGH">P2 · High</option>
+                  <option value="TASK_PRIORITY_MEDIUM">P3 · Medium</option>
+                  <option value="TASK_PRIORITY_LOW">P4 · Low</option>
                   <option value="TASK_PRIORITY_NONE">Unprioritized</option>
                 </select>
 
@@ -237,11 +239,39 @@ export type ActiveDialogType =
 
           <!-- 3. Project Charter (.md in ~/.flowsk/projects) -->
           @if (dialog() === 'project-charter' && store.activeProject(); as proj) {
-            <div class="flex items-center justify-between">
+            <div class="flex items-center justify-between gap-3">
               <h2 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
                 Project .md Document — {{ proj.keyPrefix }}
               </h2>
-              <button type="button" (click)="close.emit()" class="text-xs text-zinc-400">✕</button>
+              <div class="flex items-center gap-2">
+                <div class="inline-flex items-center p-0.5 rounded-md bg-zinc-200/70 dark:bg-zinc-800 border border-zinc-300/60 dark:border-zinc-700 text-xs">
+                  <button
+                    type="button"
+                    (click)="setCharterViewMode('preview')"
+                    class="px-2.5 py-1 rounded transition-colors"
+                    [class]="
+                      charterViewMode() === 'preview'
+                        ? 'bg-white dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 font-medium shadow-xs'
+                        : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
+                    "
+                  >
+                    Preview
+                  </button>
+                  <button
+                    type="button"
+                    (click)="setCharterViewMode('edit')"
+                    class="px-2.5 py-1 rounded transition-colors"
+                    [class]="
+                      charterViewMode() === 'edit'
+                        ? 'bg-white dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 font-medium shadow-xs'
+                        : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
+                    "
+                  >
+                    Edit Raw
+                  </button>
+                </div>
+                <button type="button" (click)="close.emit()" class="text-xs text-zinc-400">✕</button>
+              </div>
             </div>
             <p class="text-xs text-zinc-500 dark:text-zinc-400">
               Saved inside <code class="font-mono text-[11px]">~/.flowsk/projects/</code> alongside
@@ -251,6 +281,23 @@ export type ActiveDialogType =
               <div class="py-8 text-center text-xs text-zinc-400 font-mono">
                 Loading Project .md charter...
               </div>
+            } @else if (charterViewMode() === 'preview') {
+              @if (projectCharterMd().trim()) {
+                <div class="max-h-[60vh] overflow-y-auto p-4 rounded-lg bg-zinc-50/40 dark:bg-zinc-900/40 border border-zinc-200 dark:border-zinc-800">
+                  <app-markdown-viewer [markdown]="projectCharterMd()" />
+                </div>
+              } @else {
+                <div class="p-8 rounded-lg border border-dashed border-zinc-200 dark:border-zinc-800 text-center space-y-2">
+                  <div class="text-xs text-zinc-500 dark:text-zinc-400">No Project .md charter saved yet.</div>
+                  <button
+                    type="button"
+                    (click)="setCharterViewMode('edit')"
+                    class="px-3 py-1.5 rounded-md bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-950 text-xs font-medium"
+                  >
+                    Write Project .md Charter
+                  </button>
+                </div>
+              }
             } @else {
               <textarea
                 rows="12"
@@ -262,16 +309,18 @@ export type ActiveDialogType =
             }
             <div class="flex justify-end gap-2">
               <button type="button" (click)="close.emit()" class="px-3 py-1.5 rounded text-xs text-zinc-500">
-                Cancel
+                {{ charterViewMode() === 'preview' && !charterDirtyView() ? 'Close' : 'Cancel' }}
               </button>
-              <button
-                type="button"
-                (click)="submitProjectCharter(proj.id)"
-                [disabled]="store.saving() || store.activeProjectMarkdownLoading()"
-                class="px-4 py-1.5 rounded-md bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-950 text-xs font-medium disabled:opacity-50"
-              >
-                Save Project .md
-              </button>
+              @if (charterViewMode() === 'edit' || charterDirtyView()) {
+                <button
+                  type="button"
+                  (click)="submitProjectCharter(proj.id)"
+                  [disabled]="store.saving() || store.activeProjectMarkdownLoading()"
+                  class="px-4 py-1.5 rounded-md bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-950 text-xs font-medium disabled:opacity-50"
+                >
+                  Save Project .md
+                </button>
+              }
             </div>
           }
 
@@ -591,7 +640,10 @@ export class DialogsComponent {
   readonly projParentId = signal<string>('');
   readonly projScopeSubpath = signal<string>('');
   readonly projectCharterMd = signal<string>('');
+  readonly charterViewMode = signal<'preview' | 'edit'>('preview');
+  private charterModeChosen = false;
   private readonly charterDirty = signal<boolean>(false);
+  readonly charterDirtyView = this.charterDirty.asReadonly();
 
   readonly objProjectId = signal<string>('');
   readonly objKind = signal<ObjectiveKind>('goal');
@@ -683,6 +735,9 @@ export class DialogsComponent {
 
       if (current === 'project-charter' && this.lastDialog !== 'project-charter') {
         this.charterDirty.set(false);
+        this.charterModeChosen = false;
+        const hasDoc = Boolean(untracked(() => this.store.activeProject()?.hasMarkdownDoc));
+        this.charterViewMode.set(hasDoc ? 'preview' : 'edit');
       }
 
       this.lastDialog = current;
@@ -702,6 +757,9 @@ export class DialogsComponent {
       }
       if (!untracked(() => this.charterDirty())) {
         this.projectCharterMd.set(loadedMd);
+        if (!this.charterModeChosen) {
+          this.charterViewMode.set(loadedMd.trim().length > 0 ? 'preview' : 'edit');
+        }
       }
     });
   }
@@ -709,6 +767,11 @@ export class DialogsComponent {
   onCharterChange(value: string): void {
     this.charterDirty.set(true);
     this.projectCharterMd.set(value);
+  }
+
+  setCharterViewMode(mode: 'preview' | 'edit'): void {
+    this.charterModeChosen = true;
+    this.charterViewMode.set(mode);
   }
 
   onProjParentChange(parentId: string): void {

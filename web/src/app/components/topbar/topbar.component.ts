@@ -268,10 +268,10 @@ import { FlowskStore } from '../../core/store/flowsk.store';
             class="px-2.5 py-1.5 rounded-md text-xs bg-zinc-100/80 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300 focus:outline-none"
           >
             <option value="all">All Priorities</option>
-            <option value="TASK_PRIORITY_URGENT">P0 · Urgent</option>
-            <option value="TASK_PRIORITY_HIGH">P1 · High</option>
-            <option value="TASK_PRIORITY_MEDIUM">P2 · Medium</option>
-            <option value="TASK_PRIORITY_LOW">P3 · Low</option>
+            <option value="TASK_PRIORITY_URGENT">P1 · Urgent</option>
+            <option value="TASK_PRIORITY_HIGH">P2 · High</option>
+            <option value="TASK_PRIORITY_MEDIUM">P3 · Medium</option>
+            <option value="TASK_PRIORITY_LOW">P4 · Low</option>
             <option value="TASK_PRIORITY_NONE">Unprioritized</option>
           </select>
 

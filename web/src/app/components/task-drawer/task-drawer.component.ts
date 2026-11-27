@@ -19,6 +19,7 @@ import {
   formatStatusLabel,
 } from '../../core/models/flowsk.models';
 import { FlowskStore } from '../../core/store/flowsk.store';
+import { MarkdownViewerComponent } from '../markdown-viewer/markdown-viewer.component';
 
 interface ResolvedTaskRelationView {
   readonly id: string;
@@ -38,7 +39,7 @@ interface ResolvedTaskRelationView {
 @Component({
   selector: 'app-task-drawer',
   standalone: true,
-  imports: [FormsModule],
+  imports: [FormsModule, MarkdownViewerComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     @if (store.selectedTask(); as task) {
@@ -57,9 +58,14 @@ interface ResolvedTaskRelationView {
                 {{ task.identifier }}
               </span>
               @if (task.hasMarkdownDoc) {
-                <span class="text-[11px] font-mono px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-600 dark:text-sky-300 border border-sky-500/30">
+                <button
+                  type="button"
+                  (click)="openMarkdownPreview()"
+                  title="Open rendered Task .md document"
+                  class="text-[11px] font-mono px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-600 dark:text-sky-300 border border-sky-500/30 hover:bg-sky-500/20 transition-colors cursor-pointer"
+                >
                   ~/.flowsk/tasks .md
-                </span>
+                </button>
               }
               @if (store.isTaskGlowing(task)) {
                 <span
@@ -237,10 +243,10 @@ interface ResolvedTaskRelationView {
                     (ngModelChange)="onPriorityChange($event)"
                     class="w-full px-2.5 py-1.5 rounded-md text-xs bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100"
                   >
-                    <option value="TASK_PRIORITY_URGENT">P0 · Urgent</option>
-                    <option value="TASK_PRIORITY_HIGH">P1 · High</option>
-                    <option value="TASK_PRIORITY_MEDIUM">P2 · Medium</option>
-                    <option value="TASK_PRIORITY_LOW">P3 · Low</option>
+                    <option value="TASK_PRIORITY_URGENT">P1 · Urgent</option>
+                    <option value="TASK_PRIORITY_HIGH">P2 · High</option>
+                    <option value="TASK_PRIORITY_MEDIUM">P3 · Medium</option>
+                    <option value="TASK_PRIORITY_LOW">P4 · Low</option>
                     <option value="TASK_PRIORITY_NONE">Unprioritized</option>
                   </select>
                 </div>
@@ -376,16 +382,63 @@ interface ResolvedTaskRelationView {
 
             @if (activeTab() === 'markdown') {
               <div class="space-y-3">
-                <div class="p-3 rounded-lg bg-zinc-50 dark:bg-zinc-900/70 border border-zinc-200 dark:border-zinc-800 text-xs text-zinc-600 dark:text-zinc-400">
-                  Extended Markdown specification stored globally inside Flowsk's memory folder
-                  (<code class="font-mono text-[11px]">~/.flowsk/tasks/</code>). Deleting archived tasks or running
-                  <code class="font-mono text-[11px]">flowsk prune</code> keeps these resources synchronized with the DB.
+                <div class="p-3 rounded-lg bg-zinc-50 dark:bg-zinc-900/70 border border-zinc-200 dark:border-zinc-800 flex items-center justify-between gap-3 flex-wrap">
+                  <div class="text-xs text-zinc-600 dark:text-zinc-400 min-w-0 flex-1">
+                    Extended Markdown specification stored inside
+                    <code class="font-mono text-[11px]">~/.flowsk/tasks/</code>.
+                  </div>
+
+                  <div class="inline-flex items-center p-0.5 rounded-md bg-zinc-200/70 dark:bg-zinc-800 border border-zinc-300/60 dark:border-zinc-700 text-xs shrink-0">
+                    <button
+                      type="button"
+                      (click)="setMarkdownViewMode('preview')"
+                      class="px-2.5 py-1 rounded transition-colors"
+                      [class]="
+                        markdownViewMode() === 'preview'
+                          ? 'bg-white dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 font-medium shadow-xs'
+                          : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
+                      "
+                    >
+                      Preview
+                    </button>
+                    <button
+                      type="button"
+                      (click)="setMarkdownViewMode('edit')"
+                      class="px-2.5 py-1 rounded transition-colors"
+                      [class]="
+                        markdownViewMode() === 'edit'
+                          ? 'bg-white dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 font-medium shadow-xs'
+                          : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
+                      "
+                    >
+                      Edit Raw
+                    </button>
+                  </div>
                 </div>
 
                 @if (store.selectedTaskMarkdownLoading() && !markdownDirty()) {
                   <div class="py-10 text-center text-xs font-mono text-zinc-400">
                     Loading Task .md document...
                   </div>
+                } @else if (markdownViewMode() === 'preview') {
+                  @if (draftMarkdown().trim()) {
+                    <div class="p-4 rounded-lg bg-zinc-50/40 dark:bg-zinc-900/40 border border-zinc-200 dark:border-zinc-800">
+                      <app-markdown-viewer [markdown]="draftMarkdown()" />
+                    </div>
+                  } @else {
+                    <div class="p-8 rounded-lg border border-dashed border-zinc-200 dark:border-zinc-800 text-center space-y-2.5">
+                      <div class="text-xs text-zinc-500 dark:text-zinc-400">
+                        No Markdown specification is attached to this task yet.
+                      </div>
+                      <button
+                        type="button"
+                        (click)="setMarkdownViewMode('edit')"
+                        class="px-3 py-1.5 rounded-md bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-950 text-xs font-medium hover:bg-zinc-800 dark:hover:bg-zinc-200"
+                      >
+                        Write Task .md Document
+                      </button>
+                    </div>
+                  }
                 } @else {
                   <textarea
                     rows="16"
@@ -410,14 +463,16 @@ interface ResolvedTaskRelationView {
                     <span></span>
                   }
 
-                  <button
-                    type="button"
-                    (click)="saveMarkdown(task.id)"
-                    [disabled]="store.saving() || store.selectedTaskMarkdownLoading() || !draftMarkdown().trim()"
-                    class="px-4 py-1.5 rounded-md bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-950 text-xs font-medium hover:bg-zinc-800 dark:hover:bg-zinc-200 disabled:opacity-50"
-                  >
-                    Save Task .md
-                  </button>
+                  @if (markdownViewMode() === 'edit' || markdownDirty()) {
+                    <button
+                      type="button"
+                      (click)="saveMarkdown(task.id)"
+                      [disabled]="store.saving() || store.selectedTaskMarkdownLoading() || !draftMarkdown().trim()"
+                      class="px-4 py-1.5 rounded-md bg-zinc-900 dark:bg-zinc-100 text-zinc-50 dark:text-zinc-950 text-xs font-medium hover:bg-zinc-800 dark:hover:bg-zinc-200 disabled:opacity-50"
+                    >
+                      Save Task .md
+                    </button>
+                  }
                 </div>
               </div>
             }
@@ -494,6 +549,8 @@ export class TaskDrawerComponent {
   private readonly platformId = inject(PLATFORM_ID);
   readonly statusColumns = CANONICAL_STATUS_COLUMNS;
   readonly activeTab = signal<'details' | 'markdown' | 'comments'>('details');
+  readonly markdownViewMode = signal<'preview' | 'edit'>('preview');
+  private markdownModeChosen = false;
 
   readonly draftTitle = signal<string>('');
   readonly draftDescription = signal<string>('');
@@ -538,6 +595,7 @@ export class TaskDrawerComponent {
 
       if (!t) {
         this.hydratedTaskId = null;
+        this.markdownModeChosen = false;
         this.detailsDirty.set(false);
         this.markdownDirty.set(false);
         return;
@@ -545,7 +603,9 @@ export class TaskDrawerComponent {
 
       if (this.hydratedTaskId !== t.id) {
         this.hydratedTaskId = t.id;
+        this.markdownModeChosen = false;
         this.activeTab.set('details');
+        this.markdownViewMode.set(t.hasMarkdownDoc || md.trim().length > 0 ? 'preview' : 'edit');
         this.detailsDirty.set(false);
         this.markdownDirty.set(false);
         this.commentKind.set('TASK_COMMENT_KIND_COMMENT');
@@ -572,6 +632,9 @@ export class TaskDrawerComponent {
 
       if (!mdLoading && !untracked(() => this.markdownDirty())) {
         this.draftMarkdown.set(md);
+        if (!this.markdownModeChosen) {
+          this.markdownViewMode.set(md.trim().length > 0 ? 'preview' : 'edit');
+        }
       }
     });
   }
@@ -607,6 +670,16 @@ export class TaskDrawerComponent {
   onMarkdownChange(value: string): void {
     this.markdownDirty.set(true);
     this.draftMarkdown.set(value);
+  }
+
+  setMarkdownViewMode(mode: 'preview' | 'edit'): void {
+    this.markdownModeChosen = true;
+    this.markdownViewMode.set(mode);
+  }
+
+  openMarkdownPreview(): void {
+    this.activeTab.set('markdown');
+    this.setMarkdownViewMode('preview');
   }
 
   actorHandle(actorId: string): string {
@@ -694,6 +767,9 @@ export class TaskDrawerComponent {
       payload: { taskId, markdown: this.draftMarkdown() },
       onSuccess: () => {
         this.markdownDirty.set(false);
+        if (this.draftMarkdown().trim()) {
+          this.markdownViewMode.set('preview');
+        }
       },
     });
   }
@@ -704,6 +780,7 @@ export class TaskDrawerComponent {
       onSuccess: () => {
         this.markdownDirty.set(false);
         this.draftMarkdown.set('');
+        this.markdownViewMode.set('edit');
       },
     });
   }

@@ -247,34 +247,34 @@ export const CANONICAL_STATUS_COLUMNS: readonly StatusColumnSpec[] = [
 export function formatPriorityLabel(priority: TaskPriority): string {
   switch (priority) {
     case 'TASK_PRIORITY_URGENT':
-      return 'P0 · Urgent';
+      return 'P1 · Urgent';
     case 'TASK_PRIORITY_HIGH':
-      return 'P1 · High';
+      return 'P2 · High';
     case 'TASK_PRIORITY_MEDIUM':
-      return 'P2 · Medium';
+      return 'P3 · Medium';
     case 'TASK_PRIORITY_LOW':
-      return 'P3 · Low';
+      return 'P4 · Low';
     case 'TASK_PRIORITY_NONE':
       return 'Unprioritized';
     default:
-      return 'P2 · Normal';
+      return 'P3 · Normal';
   }
 }
 
 export function formatShortPriority(priority: TaskPriority): string {
   switch (priority) {
     case 'TASK_PRIORITY_URGENT':
-      return 'P0';
-    case 'TASK_PRIORITY_HIGH':
       return 'P1';
-    case 'TASK_PRIORITY_MEDIUM':
+    case 'TASK_PRIORITY_HIGH':
       return 'P2';
-    case 'TASK_PRIORITY_LOW':
+    case 'TASK_PRIORITY_MEDIUM':
       return 'P3';
+    case 'TASK_PRIORITY_LOW':
+      return 'P4';
     case 'TASK_PRIORITY_NONE':
       return '—';
     default:
-      return 'P2';
+      return 'P3';
   }
 }
 

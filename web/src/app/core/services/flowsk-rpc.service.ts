@@ -986,17 +986,17 @@ function collectPaginatedPages<TItem>(
 function priorityOrder(p: TaskPriority): number {
   switch (p) {
     case 'TASK_PRIORITY_URGENT':
-      return 0;
-    case 'TASK_PRIORITY_HIGH':
       return 1;
+    case 'TASK_PRIORITY_HIGH':
+      return 2;
     case 'TASK_PRIORITY_MEDIUM':
-      return 2;
-    case 'TASK_PRIORITY_LOW':
       return 3;
-    case 'TASK_PRIORITY_NONE':
+    case 'TASK_PRIORITY_LOW':
       return 4;
+    case 'TASK_PRIORITY_NONE':
+      return 5;
     default:
-      return 2;
+      return 3;
   }
 }
 
