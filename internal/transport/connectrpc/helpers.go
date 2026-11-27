@@ -265,17 +265,40 @@ var defaultWorkflowStateSpecs = []canonicalStateSpec{
 
 var (
 	customStateMu         sync.RWMutex
-	customStateCategories = make(map[uuid.UUID]flowsk_project_pb.WorkflowStateCategory)
+	customStatesByProject = make(map[uuid.UUID]map[uuid.UUID]flowsk_project_pb.WorkflowStateCategory)
 )
 
 // RegisterCustomWorkflowState records the category of a custom workflow state UUID
-// so task state transitions can resolve custom columns deterministically.
+// under the wildcard project bucket for backward-compatible callers.
 func RegisterCustomWorkflowState(stateID uuid.UUID, category flowsk_project_pb.WorkflowStateCategory) {
+	RegisterProjectWorkflowState(uuid.Nil, stateID, category)
+}
+
+// RegisterProjectWorkflowState records the category of a custom workflow state UUID
+// scoped to `projectID` so task state transitions resolve custom columns safely
+// without leaking state IDs across projects.
+func RegisterProjectWorkflowState(projectID, stateID uuid.UUID, category flowsk_project_pb.WorkflowStateCategory) {
 	if stateID == uuid.Nil {
 		return
 	}
 	customStateMu.Lock()
-	customStateCategories[stateID] = category
+	perProj := customStatesByProject[projectID]
+	if perProj == nil {
+		perProj = make(map[uuid.UUID]flowsk_project_pb.WorkflowStateCategory)
+		customStatesByProject[projectID] = perProj
+	}
+	perProj[stateID] = category
+	customStateMu.Unlock()
+}
+
+// UnregisterProjectWorkflowStates removes any cached custom workflow state mappings
+// belonging to `projectID` when a project is deleted.
+func UnregisterProjectWorkflowStates(projectID uuid.UUID) {
+	if projectID == uuid.Nil {
+		return
+	}
+	customStateMu.Lock()
+	delete(customStatesByProject, projectID)
 	customStateMu.Unlock()
 }
 
@@ -338,17 +361,30 @@ func WorkflowStateIDForStatus(projectID uuid.UUID, st task.Status) uuid.UUID {
 
 // ResolveWorkflowStateStatus resolves a workflow state UUID back into its canonical
 // domain task.Status for projectID (checking project-scoped defaults, global defaults,
-// and custom registered workflow states).
+// and project-scoped custom workflow states).
 func ResolveWorkflowStateStatus(projectID, stateID uuid.UUID) (task.Status, bool) {
 	for _, spec := range defaultWorkflowStateSpecs {
-		if CanonicalWorkflowStateID(projectID, spec.slug) == stateID ||
+		if (projectID != uuid.Nil && CanonicalWorkflowStateID(projectID, spec.slug) == stateID) ||
 			CanonicalWorkflowStateID(uuid.Nil, spec.slug) == stateID {
 			return spec.taskStatus, true
 		}
 	}
 
 	customStateMu.RLock()
-	cat, ok := customStateCategories[stateID]
+	var (
+		cat flowsk_project_pb.WorkflowStateCategory
+		ok  bool
+	)
+	if projectID != uuid.Nil {
+		if perProj := customStatesByProject[projectID]; perProj != nil {
+			cat, ok = perProj[stateID]
+		}
+	}
+	if !ok {
+		if global := customStatesByProject[uuid.Nil]; global != nil {
+			cat, ok = global[stateID]
+		}
+	}
 	customStateMu.RUnlock()
 	if !ok {
 		return "", false

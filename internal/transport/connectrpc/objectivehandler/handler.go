@@ -4,6 +4,7 @@ package objectivehandler
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -255,16 +256,37 @@ func (h *Handler) ListObjectives(
 		projectID = *projectIDPtr
 	}
 
-	items, err := h.svc.ListObjectives(ctx, objective.ListObjectivesFilter{
-		WorkspaceID: workspaceID,
-		ProjectID:   projectID,
-		Kind:        kindPtr,
-		Status:      statusPtr,
-		Limit:       limit,
-		Offset:      offset,
-	})
-	if err != nil {
-		return nil, connectrpc.MapDomainError(err)
+	var (
+		items         []objective.Objective
+		nextPageToken string
+	)
+	if limit > 0 {
+		items, err = h.svc.ListObjectives(ctx, objective.ListObjectivesFilter{
+			WorkspaceID: workspaceID,
+			ProjectID:   projectID,
+			Kind:        kindPtr,
+			Status:      statusPtr,
+			Limit:       limit + 1,
+			Offset:      offset,
+		})
+		if err != nil {
+			return nil, connectrpc.MapDomainError(err)
+		}
+		if len(items) > int(limit) {
+			items = items[:limit]
+			nextPageToken = strconv.Itoa(int(offset + limit))
+		}
+	} else {
+		allItems, listErr := h.svc.ListObjectives(ctx, objective.ListObjectivesFilter{
+			WorkspaceID: workspaceID,
+			ProjectID:   projectID,
+			Kind:        kindPtr,
+			Status:      statusPtr,
+		})
+		if listErr != nil {
+			return nil, connectrpc.MapDomainError(listErr)
+		}
+		items, nextPageToken = connectrpc.PaginateSlice(allItems, limit, offset)
 	}
 
 	out := make([]*flowsk_objective_pb.Objective, 0, len(items))
@@ -272,7 +294,8 @@ func (h *Handler) ListObjectives(
 		out = append(out, items[i].ToProto())
 	}
 	return connect.NewResponse(&flowsk_objective_pb.ListObjectivesResponse{
-		Objectives: out,
+		Objectives:    out,
+		NextPageToken: nextPageToken,
 	}), nil
 }
 
@@ -319,6 +342,12 @@ func (h *Handler) UpdateObjective(
 		}
 	}
 
+	targetDate := protoTimestampToTimePtr(req.Msg.GetTargetDate())
+	if req.Msg.GetClearTargetDate() {
+		zero := time.Time{}
+		targetDate = &zero
+	}
+
 	updated, err := h.svc.UpdateObjective(ctx, objective.UpdateObjectiveInput{
 		WorkspaceID:     workspaceID,
 		ObjectiveID:     objectiveID,
@@ -326,7 +355,7 @@ func (h *Handler) UpdateObjective(
 		Summary:         req.Msg.Description,
 		SuccessCriteria: criteria,
 		Status:          statusPtr,
-		TargetDate:      protoTimestampToTimePtr(req.Msg.GetTargetDate()),
+		TargetDate:      targetDate,
 	})
 	if err != nil {
 		return nil, connectrpc.MapDomainError(err)

@@ -24,9 +24,10 @@ import (
 )
 
 const (
-	maxTaskPageSize   int32 = 200
-	maxQueuePageSize  int32 = 100
-	maxLeaseTTLSecond int32 = 86400
+	maxTaskPageSize      int32 = 200
+	listTasksFetchWindow int32 = 1000
+	maxQueuePageSize     int32 = 100
+	maxLeaseTTLSecond    int32 = 86400
 )
 
 // DataDependencies defines the segregated persistence provider contracts consumed
@@ -202,7 +203,7 @@ func (h *Handler) CreateTask(
 		Status:             initialStatus,
 		Priority:           priority,
 		AssigneeActorID:    assigneeActorID,
-		Tags:               append([]string(nil), req.Msg.GetLabelIds()...),
+		Tags:               mergeTaskTags(req.Msg.GetTags(), req.Msg.GetLabelIds()),
 	})
 	if err != nil {
 		return nil, connectrpc.MapDomainError(err)
@@ -391,7 +392,8 @@ func (h *Handler) ListTasks(
 	if err != nil {
 		return nil, connectrpc.MapDomainError(err)
 	}
-	if _, err := connectrpc.ParseOptionalUUID(op, "workflow_state_id", req.Msg.WorkflowStateId); err != nil {
+	workflowStateFilter, err := connectrpc.ParseOptionalUUID(op, "workflow_state_id", req.Msg.WorkflowStateId)
+	if err != nil {
 		return nil, connectrpc.MapDomainError(err)
 	}
 	assigneeFilter, err := connectrpc.ParseOptionalUUID(op, "assignee_actor_id", req.Msg.AssigneeActorId)
@@ -431,6 +433,31 @@ func (h *Handler) ListTasks(
 	if projectIDPtr != nil {
 		projectID = *projectIDPtr
 	}
+
+	needPerTaskWorkflowCheck := false
+	if workflowStateFilter != nil {
+		if projectID != uuid.Nil {
+			wsStatus, ok := connectrpc.ResolveWorkflowStateStatus(projectID, *workflowStateFilter)
+			if !ok {
+				return nil, connectrpc.MapDomainError(errs.Validation(op, "unknown workflow_state_id", errs.FieldViolation{
+					Field:       "workflow_state_id",
+					Description: "workflow_state_id does not match any workflow state for this project",
+				}))
+			}
+			statuses = intersectStatuses(statuses, wsStatus)
+			if len(statuses) == 0 {
+				return connect.NewResponse(&flowsk_task_pb.ListTasksResponse{}), nil
+			}
+		} else if wsStatus, ok := connectrpc.ResolveWorkflowStateStatus(uuid.Nil, *workflowStateFilter); ok {
+			statuses = intersectStatuses(statuses, wsStatus)
+			if len(statuses) == 0 {
+				return connect.NewResponse(&flowsk_task_pb.ListTasksResponse{}), nil
+			}
+		} else {
+			needPerTaskWorkflowCheck = true
+		}
+	}
+
 	var requiredTags []string
 	if labelFilter != nil {
 		requiredTags = []string{labelFilter.String()}
@@ -447,12 +474,13 @@ func (h *Handler) ListTasks(
 		Statuses:      statuses,
 		RequiredTags:  requiredTags,
 		OnlyUnclaimed: req.Msg.GetUnclaimedOnly(),
-		Limit:         maxTaskPageSize,
+		Limit:         listTasksFetchWindow,
 	})
 	if err != nil {
 		return nil, connectrpc.MapDomainError(err)
 	}
 
+	hydrateCtx := authctx.WithSuppressTaskSignal(ctx)
 	searchQuery := strings.ToLower(strings.TrimSpace(req.Msg.GetSearchQuery()))
 	matched := make([]task.Task, 0, len(summaries))
 	for _, s := range summaries {
@@ -462,9 +490,15 @@ func (h *Handler) ListTasks(
 		if priorityFilter != nil && s.Priority != *priorityFilter {
 			continue
 		}
-		full, getErr := h.svc.GetTask(ctx, workspaceID, s.ID)
+		full, getErr := h.svc.GetTask(hydrateCtx, workspaceID, s.ID)
 		if getErr != nil {
 			continue
+		}
+		if needPerTaskWorkflowCheck && workflowStateFilter != nil {
+			wsStatus, ok := connectrpc.ResolveWorkflowStateStatus(full.ProjectID, *workflowStateFilter)
+			if !ok || full.Status != wsStatus {
+				continue
+			}
 		}
 		if extFilter != "" && full.ExternalID != extFilter {
 			continue
@@ -567,8 +601,11 @@ func (h *Handler) UpdateTask(
 		}
 	}
 	var tags []string
-	if req.Msg.GetReplaceLabels() {
-		tags = append([]string{}, req.Msg.GetLabelIds()...)
+	if req.Msg.GetReplaceTags() || req.Msg.GetReplaceLabels() || len(req.Msg.GetTags()) > 0 || len(req.Msg.GetLabelIds()) > 0 {
+		tags = mergeTaskTags(req.Msg.GetTags(), req.Msg.GetLabelIds())
+		if tags == nil {
+			tags = []string{}
+		}
 	}
 	var extIDPtr *string
 	if req.Msg.GetClearExternalId() {
@@ -635,7 +672,7 @@ func (h *Handler) TransitionTaskState(
 
 	targetStatus, ok := connectrpc.ResolveWorkflowStateStatus(uuid.Nil, workflowStateID)
 	if !ok {
-		existing, getErr := h.svc.GetTask(ctx, workspaceID, taskID)
+		existing, getErr := h.svc.GetTask(authctx.WithSuppressTaskSignal(ctx), workspaceID, taskID)
 		if getErr != nil {
 			return nil, connectrpc.MapDomainError(getErr)
 		}
@@ -723,7 +760,7 @@ func (h *Handler) ClaimTask(
 		return nil, connectrpc.MapDomainError(err)
 	}
 
-	claimedTask, err := h.svc.GetTask(ctx, workspaceID, taskID)
+	claimedTask, err := h.svc.GetTask(authctx.WithSuppressTaskSignal(ctx), workspaceID, taskID)
 	if err != nil {
 		return nil, connectrpc.MapDomainError(err)
 	}
@@ -765,7 +802,7 @@ func (h *Handler) ReleaseTaskClaim(
 	}
 
 	var leaseToken string
-	if current, getErr := h.svc.GetTask(ctx, workspaceID, taskID); getErr == nil && current.ActiveLease != nil {
+	if current, getErr := h.svc.GetTask(authctx.WithSuppressTaskSignal(ctx), workspaceID, taskID); getErr == nil && current.ActiveLease != nil {
 		leaseToken = current.ActiveLease.LeaseToken
 	}
 
@@ -773,12 +810,13 @@ func (h *Handler) ReleaseTaskClaim(
 		WorkspaceID:    workspaceID,
 		TaskID:         taskID,
 		LeaseToken:     leaseToken,
+		Force:          req.Msg.GetForce(),
 		HandoffComment: req.Msg.GetHandoffNote(),
 	}); err != nil {
 		return nil, connectrpc.MapDomainError(err)
 	}
 
-	releasedTask, err := h.svc.GetTask(ctx, workspaceID, taskID)
+	releasedTask, err := h.svc.GetTask(authctx.WithSuppressTaskSignal(ctx), workspaceID, taskID)
 	if err != nil {
 		return nil, connectrpc.MapDomainError(err)
 	}
@@ -1390,10 +1428,57 @@ func enrichTaskProto(t *task.Task) *flowsk_task_pb.Task {
 		return nil
 	}
 	pb := t.ToProto()
-	if pb != nil && pb.GetWorkflowStateId() == "" {
+	if pb == nil {
+		return nil
+	}
+	if pb.GetWorkflowStateId() == "" {
 		pb.WorkflowStateId = connectrpc.WorkflowStateIDForStatus(t.ProjectID, t.Status).String()
 	}
+	if len(t.Tags) > 0 {
+		pb.Tags = append([]string(nil), t.Tags...)
+		var labelUUIDs []string
+		for _, rawTag := range t.Tags {
+			if parsed, err := uuid.Parse(strings.TrimSpace(rawTag)); err == nil && parsed != uuid.Nil {
+				labelUUIDs = append(labelUUIDs, parsed.String())
+			}
+		}
+		pb.LabelIds = labelUUIDs
+	} else {
+		pb.Tags = nil
+		pb.LabelIds = nil
+	}
 	return pb
+}
+
+func mergeTaskTags(tags, labelIDs []string) []string {
+	if len(tags) == 0 && len(labelIDs) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(tags)+len(labelIDs))
+	out := make([]string, 0, len(tags)+len(labelIDs))
+	for _, group := range [][]string{tags, labelIDs} {
+		for _, raw := range group {
+			trimmed := strings.TrimSpace(raw)
+			if trimmed == "" {
+				continue
+			}
+			if _, exists := seen[trimmed]; exists {
+				continue
+			}
+			seen[trimmed] = struct{}{}
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func intersectStatuses(statuses []task.Status, target task.Status) []task.Status {
+	for _, st := range statuses {
+		if st == target {
+			return []task.Status{target}
+		}
+	}
+	return nil
 }
 
 func relationsToProto(rels []task.TaskRelation) []*flowsk_task_pb.TaskRelation {

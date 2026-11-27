@@ -29,7 +29,47 @@ const (
 
 	// HeaderActorHandle carries the human-readable actor handle (for example, `"mario"` or `"agent-01"`).
 	HeaderActorHandle = "X-Flowsk-Actor-Handle"
+
+	// HeaderClientSurface optionally identifies the calling client surface (for example, `"webui"`),
+	// allowing human Web UI interactions to suppress agent `last_signal_at` updates.
+	HeaderClientSurface = "X-Flowsk-Client"
+
+	// HeaderSuppressSignal explicitly suppresses `last_signal_at` updates on internal
+	// pre-mutation lookups over ConnectRPC when set to `"1"` or `"true"`.
+	HeaderSuppressSignal = "X-Flowsk-Suppress-Signal"
 )
+
+// ShouldSuppressSignalHeaders reports whether inbound HTTP headers originate from the
+// browser Web UI or carry an explicit internal signal-suppression flag.
+func ShouldSuppressSignalHeaders(headers http.Header) bool {
+	if headers == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(headers.Get(HeaderClientSurface)), "webui") {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(headers.Get(HeaderSuppressSignal))) {
+	case "1", "true", "yes":
+		return true
+	}
+	return strings.HasPrefix(strings.TrimSpace(headers.Get("X-Request-Id")), "ui-")
+}
+
+// ExtractBearerToken parses an HTTP `Authorization` header according to RFC 9110,
+// matching the `"Bearer"` scheme case-insensitively without mutating or stripping
+// `"bearer"` prefixes from the token credential itself. Scheme-less raw tokens and
+// empty credentials return `("", false)`.
+func ExtractBearerToken(authHeader string) (string, bool) {
+	scheme, rest, ok := strings.Cut(strings.TrimSpace(authHeader), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	token := strings.TrimSpace(rest)
+	if token == "" {
+		return "", false
+	}
+	return token, true
+}
 
 // IdentityResolver authenticates inbound ConnectRPC request metadata and resolves an
 // immutable `authctx.Identity` prior to invoking any bounded-context service handler.
@@ -124,6 +164,10 @@ func NewAuthContextInterceptor(resolver IdentityResolver) connect.UnaryIntercept
 		return connect.UnaryFunc(func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
 			if err := ctx.Err(); err != nil {
 				return nil, MapDomainError(err)
+			}
+
+			if ShouldSuppressSignalHeaders(req.Header()) {
+				ctx = authctx.WithSuppressTaskSignal(ctx)
 			}
 
 			if _, err := authctx.FromContext(ctx); err == nil {

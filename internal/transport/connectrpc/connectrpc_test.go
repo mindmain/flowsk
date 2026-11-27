@@ -243,3 +243,112 @@ func (c *inMemoryHTTPClient) Do(req *http.Request) (*http.Response, error) {
 	c.handler.ServeHTTP(rec, req)
 	return rec.Result(), nil
 }
+
+func TestExtractBearerToken(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		header string
+		want   string
+		ok     bool
+	}{
+		{header: "", want: "", ok: false},
+		{header: "   ", want: "", ok: false},
+		{header: "raw-schemeless-token", want: "", ok: false},
+		{header: "Basic dXNlcjpwYXNz", want: "", ok: false},
+		{header: "Bearer", want: "", ok: false},
+		{header: "Bearer    ", want: "", ok: false},
+		{header: "Bearer tok_123", want: "tok_123", ok: true},
+		{header: "  bEaReR   bearer-secret-xyz  ", want: "bearer-secret-xyz", ok: true},
+	}
+
+	for _, tc := range cases {
+		got, ok := connectrpc.ExtractBearerToken(tc.header)
+		if ok != tc.ok || got != tc.want {
+			t.Fatalf("ExtractBearerToken(%q) = (%q, %v), want (%q, %v)", tc.header, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestOriginAndHostGuardAndNewServer(t *testing.T) {
+	t.Parallel()
+
+	okHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	loopbackGuard := connectrpc.NewOriginAndHostGuard("127.0.0.1:1616", okHandler)
+
+	// 1. DNS rebinding host rejected on loopback bind.
+	reqRebind := httptest.NewRequest(http.MethodGet, "http://evil.rebind.com:1616/healthz", nil)
+	recRebind := httptest.NewRecorder()
+	loopbackGuard.ServeHTTP(recRebind, reqRebind)
+	if recRebind.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-loopback Host on loopback bind, got %d", recRebind.Code)
+	}
+
+	// 2. Valid loopback Hosts (127.0.0.1, localhost, [::1]) pass.
+	for _, target := range []string{
+		"http://127.0.0.1:1616/healthz",
+		"http://localhost:1616/healthz",
+		"http://[::1]:1616/healthz",
+	} {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		rec := httptest.NewRecorder()
+		loopbackGuard.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 for %s, got %d", target, rec.Code)
+		}
+	}
+
+	// 3. Cross-site POST or GET /api/events rejected with 403 Forbidden.
+	reqCrossPOST := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:1616/flowsk.task.v1.TaskService/CreateTask", strings.NewReader("{}"))
+	reqCrossPOST.Header.Set("Sec-Fetch-Site", "cross-site")
+	recCrossPOST := httptest.NewRecorder()
+	loopbackGuard.ServeHTTP(recCrossPOST, reqCrossPOST)
+	if recCrossPOST.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for cross-site POST, got %d", recCrossPOST.Code)
+	}
+
+	reqBadOriginPOST := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:1616/flowsk.task.v1.TaskService/CreateTask", strings.NewReader("{}"))
+	reqBadOriginPOST.Header.Set("Origin", "https://evil.example")
+	recBadOriginPOST := httptest.NewRecorder()
+	loopbackGuard.ServeHTTP(recBadOriginPOST, reqBadOriginPOST)
+	if recBadOriginPOST.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for cross-origin POST, got %d", recBadOriginPOST.Code)
+	}
+
+	reqCrossSSE := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:1616"+connectrpc.EventsPath, nil)
+	reqCrossSSE.Header.Set("Origin", "http://localhost:9999")
+	recCrossSSE := httptest.NewRecorder()
+	loopbackGuard.ServeHTTP(recCrossSSE, reqCrossSSE)
+	if recCrossSSE.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for cross-origin SSE, got %d", recCrossSSE.Code)
+	}
+
+	// 4. Same-origin browser POST and non-browser CLI POST pass cleanly.
+	reqSameOrigin := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:1616/flowsk.task.v1.TaskService/ListTasks", strings.NewReader("{}"))
+	reqSameOrigin.Header.Set("Origin", "http://127.0.0.1:1616")
+	reqSameOrigin.Header.Set("Sec-Fetch-Site", "same-origin")
+	recSameOrigin := httptest.NewRecorder()
+	loopbackGuard.ServeHTTP(recSameOrigin, reqSameOrigin)
+	if recSameOrigin.Code != http.StatusOK {
+		t.Fatalf("expected 200 for same-origin POST, got %d", recSameOrigin.Code)
+	}
+
+	reqCLI := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:1616/flowsk.task.v1.TaskService/ListTasks", strings.NewReader("{}"))
+	recCLI := httptest.NewRecorder()
+	loopbackGuard.ServeHTTP(recCLI, reqCLI)
+	if recCLI.Code != http.StatusOK {
+		t.Fatalf("expected 200 for non-browser CLI POST, got %d", recCLI.Code)
+	}
+
+	// 5. Wildcard bind (:8080 / 0.0.0.0:8080) permits non-loopback Host while still blocking cross-origin POST.
+	wildcardGuard := connectrpc.NewOriginAndHostGuard("0.0.0.0:8080", okHandler)
+	reqWild := httptest.NewRequest(http.MethodPost, "http://flowsk.internal:8080/rpc", strings.NewReader("{}"))
+	recWild := httptest.NewRecorder()
+	wildcardGuard.ServeHTTP(recWild, reqWild)
+	if recWild.Code != http.StatusOK {
+		t.Fatalf("expected 200 on wildcard bind for CLI request, got %d", recWild.Code)
+	}
+}

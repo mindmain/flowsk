@@ -8,6 +8,7 @@ package projecthandler
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strings"
 	"sync"
@@ -27,7 +28,10 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-const maxProjectPageSize int32 = 200
+const (
+	maxProjectPageSize     int32 = 200
+	listProjectsFetchLimit int32 = 1000
+)
 
 // DataDependencies defines the segregated persistence provider contracts consumed
 // by `New` to extract concrete project repository and transaction dependencies.
@@ -300,8 +304,7 @@ func (h *Handler) ListProjects(
 	items, err := h.svc.ListProjects(ctx, project.ListProjectsFilter{
 		WorkspaceID: workspaceID,
 		Status:      statusFilter,
-		Limit:       limit,
-		Offset:      offset,
+		Limit:       listProjectsFetchLimit,
 	})
 	if err != nil {
 		return nil, connectrpc.MapDomainError(err)
@@ -315,12 +318,14 @@ func (h *Handler) ListProjects(
 		filtered = append(filtered, item)
 	}
 
-	out := make([]*flowsk_project_pb.Project, 0, len(filtered))
-	for i := range filtered {
-		out = append(out, filtered[i].ToProto())
+	page, nextToken := connectrpc.PaginateSlice(filtered, limit, offset)
+	out := make([]*flowsk_project_pb.Project, 0, len(page))
+	for i := range page {
+		out = append(out, page[i].ToProto())
 	}
 	return connect.NewResponse(&flowsk_project_pb.ListProjectsResponse{
-		Projects: out,
+		Projects:      out,
+		NextPageToken: nextToken,
 	}), nil
 }
 
@@ -454,6 +459,7 @@ func (h *Handler) DeleteProject(
 	delete(h.states, projectID)
 	delete(h.labels, projectID)
 	h.mu.Unlock()
+	connectrpc.UnregisterProjectWorkflowStates(projectID)
 
 	return connect.NewResponse(&flowsk_project_pb.DeleteProjectResponse{
 		DeletedProjectId: projectID.String(),
@@ -516,6 +522,37 @@ func (h *Handler) CreateWorkflowState(
 		return nil, connectrpc.MapDomainError(err)
 	}
 
+	if isCanonicalDefaultStateName(name) {
+		return nil, connectrpc.MapDomainError(errs.New(errs.ErrConflict, op, "workflow state name already exists in project"))
+	}
+
+	if boardSvc, ok := h.svc.(project.BoardMetadataService); ok {
+		saved, persistErr := boardSvc.CreateWorkflowState(ctx, project.CreateWorkflowStateInput{
+			WorkspaceID: workspaceID,
+			ProjectID:   projectID,
+			Name:        name,
+			Description: req.Msg.GetDescription(),
+			Category:    protoWorkflowCategoryToDomain(req.Msg.GetCategory()),
+			ColorHex:    req.Msg.GetColorHex(),
+			Position:    req.Msg.GetPosition(),
+			IsDefault:   req.Msg.GetIsDefault(),
+		})
+		if persistErr == nil {
+			created := saved.ToProto()
+			// Preserve caller description when SQL workflow_states stores name/category/color/position.
+			if created.GetDescription() == "" && req.Msg.GetDescription() != "" {
+				created.Description = req.Msg.GetDescription()
+			}
+			connectrpc.RegisterProjectWorkflowState(projectID, saved.ID, created.GetCategory())
+			return connect.NewResponse(&flowsk_project_pb.CreateWorkflowStateResponse{
+				WorkflowState: created,
+			}), nil
+		}
+		if !isBoardMetadataUnsupported(persistErr) {
+			return nil, connectrpc.MapDomainError(persistErr)
+		}
+	}
+
 	stateID := uuid.New()
 	now := timestamppb.New(time.Now().UTC())
 	created := &flowsk_project_pb.WorkflowState{
@@ -553,7 +590,7 @@ func (h *Handler) CreateWorkflowState(
 	h.states[projectID] = existing
 	h.mu.Unlock()
 
-	connectrpc.RegisterCustomWorkflowState(stateID, created.GetCategory())
+	connectrpc.RegisterProjectWorkflowState(projectID, stateID, created.GetCategory())
 
 	return connect.NewResponse(&flowsk_project_pb.CreateWorkflowStateResponse{
 		WorkflowState: created,
@@ -602,7 +639,10 @@ func (h *Handler) ListWorkflowStates(
 		return nil, connectrpc.MapDomainError(err)
 	}
 
-	allStates := h.ensureProjectStates(workspaceID, projectID, proj.CreatedAt)
+	allStates, err := h.loadMergedWorkflowStates(ctx, workspaceID, projectID, proj.CreatedAt)
+	if err != nil {
+		return nil, connectrpc.MapDomainError(err)
+	}
 	out := make([]*flowsk_project_pb.WorkflowState, 0, len(allStates))
 	for _, st := range allStates {
 		if catFilter != flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_UNSPECIFIED && st.GetCategory() != catFilter {
@@ -665,6 +705,40 @@ func (h *Handler) UpdateWorkflowState(
 		return nil, connectrpc.MapDomainError(err)
 	}
 
+	if boardSvc, ok := h.svc.(project.BoardMetadataService); ok {
+		var catPtr *string
+		if req.Msg.GetCategory() != flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_UNSPECIFIED {
+			c := protoWorkflowCategoryToDomain(req.Msg.GetCategory())
+			catPtr = &c
+		}
+		saved, updErr := boardSvc.UpdateWorkflowState(ctx, project.UpdateWorkflowStateInput{
+			WorkspaceID: workspaceID,
+			ProjectID:   projectID,
+			StateID:     stateID,
+			Name:        req.Msg.Name,
+			Description: req.Msg.Description,
+			Category:    catPtr,
+			ColorHex:    req.Msg.ColorHex,
+			Position:    req.Msg.Position,
+			IsDefault:   req.Msg.IsDefault,
+		})
+		if updErr == nil {
+			updated := saved.ToProto()
+			if req.Msg.Description != nil && updated.GetDescription() == "" {
+				updated.Description = *req.Msg.Description
+			}
+			connectrpc.RegisterProjectWorkflowState(projectID, saved.ID, updated.GetCategory())
+			return connect.NewResponse(&flowsk_project_pb.UpdateWorkflowStateResponse{
+				WorkflowState: updated,
+			}), nil
+		}
+		// Allow canonical UUIDv5 state updates to fall through to canonical state map;
+		// propagate real validation/conflict/tenant errors immediately.
+		if !isBoardMetadataUnsupported(updErr) && !errors.Is(updErr, errs.ErrNotFound) {
+			return nil, connectrpc.MapDomainError(updErr)
+		}
+	}
+
 	h.mu.Lock()
 	existing := h.states[projectID]
 	if len(existing) == 0 {
@@ -710,7 +784,7 @@ func (h *Handler) UpdateWorkflowState(
 	if updated == nil {
 		return nil, connectrpc.MapDomainError(errs.New(errs.ErrNotFound, op, "workflow state not found"))
 	}
-	connectrpc.RegisterCustomWorkflowState(stateID, updated.GetCategory())
+	connectrpc.RegisterProjectWorkflowState(projectID, stateID, updated.GetCategory())
 	return connect.NewResponse(&flowsk_project_pb.UpdateWorkflowStateResponse{
 		WorkflowState: updated,
 	}), nil
@@ -755,6 +829,24 @@ func (h *Handler) CreateLabel(
 	}
 	if _, err := h.svc.GetProject(ctx, workspaceID, projectID); err != nil {
 		return nil, connectrpc.MapDomainError(err)
+	}
+
+	if boardSvc, ok := h.svc.(project.BoardMetadataService); ok {
+		saved, persistErr := boardSvc.CreateLabel(ctx, project.CreateProjectLabelInput{
+			WorkspaceID: workspaceID,
+			ProjectID:   projectID,
+			Name:        name,
+			ColorHex:    req.Msg.GetColorHex(),
+			Description: req.Msg.GetDescription(),
+		})
+		if persistErr == nil {
+			return connect.NewResponse(&flowsk_project_pb.CreateLabelResponse{
+				Label: saved.ToProto(),
+			}), nil
+		}
+		if !isBoardMetadataUnsupported(persistErr) {
+			return nil, connectrpc.MapDomainError(persistErr)
+		}
 	}
 
 	now := timestamppb.New(time.Now().UTC())
@@ -820,6 +912,25 @@ func (h *Handler) ListLabels(
 		return nil, connectrpc.MapDomainError(err)
 	}
 
+	if boardSvc, ok := h.svc.(project.BoardMetadataService); ok {
+		persisted, listErr := boardSvc.ListLabels(ctx, workspaceID, projectID)
+		if listErr == nil {
+			out := make([]*flowsk_project_pb.Label, 0, len(persisted))
+			for i := range persisted {
+				out = append(out, persisted[i].ToProto())
+			}
+			sort.Slice(out, func(i, j int) bool {
+				return strings.ToLower(out[i].GetName()) < strings.ToLower(out[j].GetName())
+			})
+			return connect.NewResponse(&flowsk_project_pb.ListLabelsResponse{
+				Labels: out,
+			}), nil
+		}
+		if !isBoardMetadataUnsupported(listErr) {
+			return nil, connectrpc.MapDomainError(listErr)
+		}
+	}
+
 	h.mu.RLock()
 	src := h.labels[projectID]
 	out := make([]*flowsk_project_pb.Label, 0, len(src))
@@ -866,6 +977,18 @@ func (h *Handler) DeleteLabel(
 	}
 	if _, err := h.svc.GetProject(ctx, workspaceID, projectID); err != nil {
 		return nil, connectrpc.MapDomainError(err)
+	}
+
+	if boardSvc, ok := h.svc.(project.BoardMetadataService); ok {
+		delErr := boardSvc.DeleteLabel(ctx, workspaceID, projectID, labelID)
+		if delErr == nil {
+			return connect.NewResponse(&flowsk_project_pb.DeleteLabelResponse{
+				DeletedLabelId: labelID.String(),
+			}), nil
+		}
+		if !isBoardMetadataUnsupported(delErr) {
+			return nil, connectrpc.MapDomainError(delErr)
+		}
 	}
 
 	h.mu.Lock()
@@ -917,6 +1040,9 @@ func (h *Handler) BindSubproject(
 	if err != nil {
 		return nil, connectrpc.MapDomainError(err)
 	}
+	if _, err := authctx.RequireWorkspaceOwnership(ctx, wsID); err != nil {
+		return nil, connectrpc.MapDomainError(err)
+	}
 	binding, err := h.svc.BindSubproject(ctx, project.BindSubprojectInput{
 		WorkspaceID:     wsID,
 		ParentProjectID: parentID,
@@ -958,6 +1084,9 @@ func (h *Handler) UnbindSubproject(
 	if err != nil {
 		return nil, connectrpc.MapDomainError(err)
 	}
+	if _, err := authctx.RequireWorkspaceOwnership(ctx, wsID); err != nil {
+		return nil, connectrpc.MapDomainError(err)
+	}
 	unbound, err := h.svc.UnbindSubproject(ctx, project.UnbindSubprojectInput{
 		WorkspaceID:     wsID,
 		ParentProjectID: parentID,
@@ -996,6 +1125,9 @@ func (h *Handler) ListProjectBindings(
 	}
 	childID, err := connectrpc.ParseOptionalUUID(op, "child_project_id", req.Msg.ChildProjectId)
 	if err != nil {
+		return nil, connectrpc.MapDomainError(err)
+	}
+	if _, err := authctx.RequireWorkspaceOwnership(ctx, wsID); err != nil {
 		return nil, connectrpc.MapDomainError(err)
 	}
 	items, err := h.svc.ListBindings(ctx, project.ListBindingsFilter{
@@ -1134,6 +1266,92 @@ func (h *Handler) ensureProjectStates(workspaceID, projectID uuid.UUID, createdA
 		out = append(out, cloneWorkflowState(st))
 	}
 	return out
+}
+
+func (h *Handler) loadMergedWorkflowStates(ctx context.Context, workspaceID, projectID uuid.UUID, createdAt time.Time) ([]*flowsk_project_pb.WorkflowState, error) {
+	base := h.ensureProjectStates(workspaceID, projectID, createdAt)
+	boardSvc, ok := h.svc.(project.BoardMetadataService)
+	if !ok {
+		return base, nil
+	}
+	persisted, err := boardSvc.ListWorkflowStates(ctx, workspaceID, projectID)
+	if err != nil {
+		if isBoardMetadataUnsupported(err) {
+			return base, nil
+		}
+		return nil, err
+	}
+	if len(persisted) == 0 {
+		return base, nil
+	}
+
+	seenID := make(map[string]struct{}, len(base)+len(persisted))
+	seenCanonical := make(map[string]struct{}, len(base))
+	for _, st := range base {
+		seenID[st.GetId()] = struct{}{}
+		seenCanonical[strings.ToLower(strings.TrimSpace(st.GetName()))] = struct{}{}
+	}
+
+	customDefault := false
+	extras := make([]*flowsk_project_pb.WorkflowState, 0, len(persisted))
+	for i := range persisted {
+		stProto := persisted[i].ToProto()
+		connectrpc.RegisterProjectWorkflowState(projectID, persisted[i].ID, stProto.GetCategory())
+		lowerName := strings.ToLower(strings.TrimSpace(stProto.GetName()))
+		if _, isCanonical := seenCanonical[lowerName]; isCanonical {
+			continue
+		}
+		if _, exists := seenID[stProto.GetId()]; exists {
+			continue
+		}
+		if stProto.GetIsDefault() {
+			customDefault = true
+		}
+		seenID[stProto.GetId()] = struct{}{}
+		extras = append(extras, stProto)
+	}
+	if customDefault {
+		for _, st := range base {
+			st.IsDefault = false
+		}
+	}
+	merged := append(base, extras...)
+	sortWorkflowStates(merged)
+	return merged, nil
+}
+
+func isCanonicalDefaultStateName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "triage", "backlog", "todo", "in progress", "in review", "blocked", "done", "canceled", "cancelled", "archived":
+		return true
+	default:
+		return false
+	}
+}
+
+func protoWorkflowCategoryToDomain(cat flowsk_project_pb.WorkflowStateCategory) string {
+	switch cat {
+	case flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_TRIAGE:
+		return "triage"
+	case flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_BACKLOG:
+		return "backlog"
+	case flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_UNSTARTED:
+		return "unstarted"
+	case flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_STARTED:
+		return "started"
+	case flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_COMPLETED:
+		return "completed"
+	case flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_CANCELED:
+		return "canceled"
+	case flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_ARCHIVED:
+		return "archived"
+	default:
+		return "unstarted"
+	}
+}
+
+func isBoardMetadataUnsupported(err error) bool {
+	return errors.Is(err, errs.ErrPreconditionFailed) && strings.Contains(err.Error(), "does not support")
 }
 
 func cloneWorkflowState(st *flowsk_project_pb.WorkflowState) *flowsk_project_pb.WorkflowState {

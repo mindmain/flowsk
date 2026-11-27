@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -260,7 +262,7 @@ func NewServer(cfg Config, handlers HandlerSet, opts ...connect.HandlerOption) (
 
 	srv := &http.Server{
 		Addr:              resolvedCfg.ListenAddr,
-		Handler:           mux,
+		Handler:           NewOriginAndHostGuard(resolvedCfg.ListenAddr, mux),
 		ReadHeaderTimeout: resolvedCfg.ReadHeaderTimeout,
 		ReadTimeout:       resolvedCfg.ReadTimeout,
 		WriteTimeout:      resolvedCfg.WriteTimeout,
@@ -340,4 +342,94 @@ func (s *HTTPServer) Shutdown(ctx context.Context) error {
 		return fmt.Errorf("connectrpc.HTTPServer.Shutdown: %w", err)
 	}
 	return nil
+}
+
+// NewOriginAndHostGuard constructs an HTTP middleware protecting loopback listeners
+// against browser DNS-rebinding attacks (`Host` header validation) and rejecting
+// cross-site / cross-origin browser requests on mutating HTTP methods (`POST`, `PUT`,
+// `DELETE`, `PATCH`) and the real-time SSE stream (`GET /api/events`).
+//
+// Non-browser CLI, MCP, and Go ConnectRPC clients omit `Origin` and `Sec-Fetch-Site`
+// headers and remain completely unaffected when using valid `Host` headers.
+func NewOriginAndHostGuard(listenAddr string, next http.Handler) http.Handler {
+	if next == nil {
+		next = http.NotFoundHandler()
+	}
+	enforceLoopbackHost := isLoopbackBindAddr(listenAddr)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if enforceLoopbackHost && !isLoopbackHostHeader(r.Host) {
+			http.Error(w, "forbidden host header", http.StatusForbidden)
+			return
+		}
+
+		if isMutatingHTTPMethod(r.Method) || (r.URL != nil && r.URL.Path == EventsPath) {
+			if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+				http.Error(w, "cross-site request forbidden", http.StatusForbidden)
+				return
+			}
+			if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+				parsedOrigin, err := url.Parse(origin)
+				if err != nil || parsedOrigin.Scheme == "" || parsedOrigin.Host == "" || !strings.EqualFold(parsedOrigin.Host, strings.TrimSpace(r.Host)) {
+					http.Error(w, "cross-origin request forbidden", http.StatusForbidden)
+					return
+				}
+			}
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isLoopbackBindAddr(listenAddr string) bool {
+	trimmed := strings.TrimSpace(listenAddr)
+	if trimmed == "" {
+		return false
+	}
+	var host string
+	if h, _, err := net.SplitHostPort(trimmed); err == nil {
+		host = h
+	} else {
+		host = strings.Trim(trimmed, "[]")
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+func isLoopbackHostHeader(hostHeader string) bool {
+	raw := strings.TrimSpace(hostHeader)
+	if raw == "" {
+		return false
+	}
+	host := raw
+	if h, _, err := net.SplitHostPort(raw); err == nil {
+		host = h
+	} else if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		host = raw[1 : len(raw)-1]
+	} else if strings.Count(raw, ":") == 1 {
+		return false
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	return host == "127.0.0.1" || host == "::1" || strings.EqualFold(host, "localhost")
+}
+
+func isMutatingHTTPMethod(method string) bool {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch:
+		return true
+	default:
+		return false
+	}
 }

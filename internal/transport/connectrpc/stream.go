@@ -17,6 +17,8 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/google/uuid"
+	flowsk_task_pb "github.com/mindmain/flowsk/gen/go/flowsk/task/v1"
+	flowsk_workspace_pb "github.com/mindmain/flowsk/gen/go/flowsk/workspace/v1"
 	"github.com/mindmain/flowsk/internal/domain/audit"
 	"github.com/mindmain/flowsk/internal/domain/authctx"
 	"github.com/mindmain/flowsk/internal/domain/errs"
@@ -39,6 +41,7 @@ const (
 	// standalone local CLI or `stdio` MCP agent processes sharing `~/.flowsk/flowsk.db`.
 	DefaultAuditPollInterval = 750 * time.Millisecond
 
+	auditRelayBatchLimit        = 200
 	maxSeenAuditIDsPerWorkspace = 512
 	streamWriteFrameTimeout     = 30 * time.Second
 )
@@ -113,12 +116,13 @@ type EventBroker struct {
 	bufSize int
 	wakeCh  chan uuid.UUID
 
-	mu          sync.RWMutex
-	subs        map[uuid.UUID]map[chan StreamEvent]struct{}
-	initialized map[uuid.UUID]bool
-	lastSince   map[uuid.UUID]time.Time
-	seenSet     map[uuid.UUID]map[uuid.UUID]struct{}
-	seenRing    map[uuid.UUID][]uuid.UUID
+	mu           sync.RWMutex
+	subs         map[uuid.UUID]map[chan StreamEvent]struct{}
+	initialized  map[uuid.UUID]bool
+	subscribedAt map[uuid.UUID]time.Time
+	lastSince    map[uuid.UUID]time.Time
+	seenSet      map[uuid.UUID]map[uuid.UUID]struct{}
+	seenRing     map[uuid.UUID][]uuid.UUID
 }
 
 // NewEventBroker constructs a tenant-isolated Go channel `EventBroker`.
@@ -127,13 +131,14 @@ func NewEventBroker(subscriberBuffer int) *EventBroker {
 		subscriberBuffer = DefaultSubscriberBuffer
 	}
 	return &EventBroker{
-		bufSize:     subscriberBuffer,
-		wakeCh:      make(chan uuid.UUID, 64),
-		subs:        make(map[uuid.UUID]map[chan StreamEvent]struct{}),
-		initialized: make(map[uuid.UUID]bool),
-		lastSince:   make(map[uuid.UUID]time.Time),
-		seenSet:     make(map[uuid.UUID]map[uuid.UUID]struct{}),
-		seenRing:    make(map[uuid.UUID][]uuid.UUID),
+		bufSize:      subscriberBuffer,
+		wakeCh:       make(chan uuid.UUID, 64),
+		subs:         make(map[uuid.UUID]map[chan StreamEvent]struct{}),
+		initialized:  make(map[uuid.UUID]bool),
+		subscribedAt: make(map[uuid.UUID]time.Time),
+		lastSince:    make(map[uuid.UUID]time.Time),
+		seenSet:      make(map[uuid.UUID]map[uuid.UUID]struct{}),
+		seenRing:     make(map[uuid.UUID][]uuid.UUID),
 	}
 }
 
@@ -156,6 +161,11 @@ func (b *EventBroker) Subscribe(workspaceID uuid.UUID) (<-chan StreamEvent, func
 	}
 	wsSubs[ch] = struct{}{}
 	needInit := !b.initialized[workspaceID]
+	if needInit && b.subscribedAt[workspaceID].IsZero() {
+		now := nextWallClockTickUTC()
+		b.subscribedAt[workspaceID] = now
+		b.lastSince[workspaceID] = now.Add(-200 * time.Millisecond)
+	}
 	b.mu.Unlock()
 
 	if needInit {
@@ -170,6 +180,11 @@ func (b *EventBroker) Subscribe(workspaceID uuid.UUID) (<-chan StreamEvent, func
 				delete(set, ch)
 				if len(set) == 0 {
 					delete(b.subs, workspaceID)
+					delete(b.initialized, workspaceID)
+					delete(b.subscribedAt, workspaceID)
+					delete(b.lastSince, workspaceID)
+					delete(b.seenSet, workspaceID)
+					delete(b.seenRing, workspaceID)
 				}
 			}
 			b.mu.Unlock()
@@ -305,6 +320,7 @@ func (b *EventBroker) syncWorkspaceAudit(
 	b.mu.RLock()
 	hasSubs := len(b.subs[workspaceID]) > 0
 	isInit := b.initialized[workspaceID]
+	subAt := b.subscribedAt[workspaceID]
 	since := b.lastSince[workspaceID]
 	b.mu.RUnlock()
 
@@ -319,28 +335,52 @@ func (b *EventBroker) syncWorkspaceAudit(
 	queryCtx := authctx.WithIdentity(ctx, ident)
 
 	if !isInit {
-		// Baseline seed: mark recent existing audit records as seen so newly opened
-		// browser tabs stream only fresh mutations committed from connection time onward.
+		// Baseline seed: mark pre-existing audit records (committed at or before
+		// Subscribe's synchronous baseline timestamp) as seen while immediately
+		// relaying any mutations committed after Subscribe() returned.
 		records, err := auditSvc.QueryRecords(queryCtx, audit.QueryFilter{
 			WorkspaceID: workspaceID,
-			Limit:       50,
+			Limit:       auditRelayBatchLimit,
 		})
 		if err != nil {
 			return
 		}
-		now := time.Now().UTC()
+		var fresh []audit.Record
 		b.mu.Lock()
+		if len(b.subs[workspaceID]) == 0 {
+			b.mu.Unlock()
+			return
+		}
 		if !b.initialized[workspaceID] {
-			for _, r := range records {
+			baseline := b.subscribedAt[workspaceID]
+			if baseline.IsZero() {
+				baseline = subAt
+			}
+			if baseline.IsZero() {
+				baseline = time.Now().UTC()
+			}
+			latest := baseline
+			for i := len(records) - 1; i >= 0; i-- {
+				r := records[i]
+				if r.WorkspaceID != workspaceID {
+					continue
+				}
 				b.markSeenLocked(workspaceID, r.ID)
-				if r.OccurredAt.After(now) {
-					now = r.OccurredAt.UTC()
+				if r.OccurredAt.After(latest) {
+					latest = r.OccurredAt.UTC()
+				}
+				if !r.OccurredAt.Before(baseline) {
+					fresh = append(fresh, r)
 				}
 			}
-			b.lastSince[workspaceID] = now.Add(-2 * time.Second)
+			b.lastSince[workspaceID] = latest
 			b.initialized[workspaceID] = true
 		}
 		b.mu.Unlock()
+
+		for _, rec := range fresh {
+			b.Publish(workspaceID, StreamEventFromAuditRecord(rec))
+		}
 		return
 	}
 
@@ -348,7 +388,7 @@ func (b *EventBroker) syncWorkspaceAudit(
 	records, err := auditSvc.QueryRecords(queryCtx, audit.QueryFilter{
 		WorkspaceID: workspaceID,
 		Since:       &windowSince,
-		Limit:       50,
+		Limit:       auditRelayBatchLimit,
 	})
 	if err != nil || len(records) == 0 {
 		return
@@ -356,6 +396,10 @@ func (b *EventBroker) syncWorkspaceAudit(
 
 	var fresh []audit.Record
 	b.mu.Lock()
+	if len(b.subs[workspaceID]) == 0 {
+		b.mu.Unlock()
+		return
+	}
 	latest := b.lastSince[workspaceID]
 	// Iterate oldest-to-newest (QueryRecords returns newest-first).
 	for i := len(records) - 1; i >= 0; i-- {
@@ -423,15 +467,55 @@ func NewEventBroadcastInterceptor(broker *EventBroker) connect.UnaryInterceptorF
 			if err != nil || broker == nil {
 				return resp, err
 			}
-			if isReadOnlyProcedure(req.Spec().Procedure) {
+			isSignalRead := isTaskSignalReadProcedure(req.Spec().Procedure) && authctx.ShouldEmitTaskSignal(ctx)
+			if isReadOnlyProcedure(req.Spec().Procedure) && !isSignalRead {
 				return resp, nil
 			}
 			if ident, idErr := authctx.FromContext(ctx); idErr == nil && ident.WorkspaceID != uuid.Nil {
+				if isSignalRead && resp != nil {
+					if resID, ok := extractSignaledTaskIDFromResponse(req.Any(), resp.Any()); ok {
+						broker.Publish(ident.WorkspaceID, StreamEvent{
+							ID:           uuid.NewString(),
+							WorkspaceID:  ident.WorkspaceID.String(),
+							ActorID:      ident.ActorID.String(),
+							ActorHandle:  ident.Handle,
+							ActorKind:    string(ident.Kind),
+							Action:       "Signal",
+							ResourceType: "task",
+							ResourceID:   resID,
+							OccurredAt:   time.Now().UTC().Format(time.RFC3339Nano),
+						})
+					}
+				}
 				broker.NotifyWorkspace(ident.WorkspaceID)
+				return resp, nil
+			}
+			if resp != nil {
+				if wsID := extractWorkspaceIDFromResponse(resp.Any()); wsID != uuid.Nil {
+					broker.NotifyWorkspace(wsID)
+				}
 			}
 			return resp, nil
 		})
 	})
+}
+
+func extractWorkspaceIDFromResponse(raw any) uuid.UUID {
+	switch msg := raw.(type) {
+	case *flowsk_workspace_pb.CreateWorkspaceResponse:
+		if ws := msg.GetWorkspace(); ws != nil {
+			if id, err := uuid.Parse(strings.TrimSpace(ws.GetId())); err == nil {
+				return id
+			}
+		}
+	case *flowsk_workspace_pb.RegisterActorResponse:
+		if actor := msg.GetActor(); actor != nil {
+			if id, err := uuid.Parse(strings.TrimSpace(actor.GetWorkspaceId())); err == nil {
+				return id
+			}
+		}
+	}
+	return uuid.Nil
 }
 
 func isReadOnlyProcedure(proc string) bool {
@@ -442,7 +526,56 @@ func isReadOnlyProcedure(proc string) bool {
 	}
 	return strings.HasPrefix(method, "Get") ||
 		strings.HasPrefix(method, "List") ||
-		strings.HasPrefix(method, "Inspect")
+		strings.HasPrefix(method, "Inspect") ||
+		strings.HasPrefix(method, "Validate")
+}
+
+func isTaskSignalReadProcedure(proc string) bool {
+	switch proc {
+	case "/flowsk.task.v1.TaskService/GetTask",
+		"/flowsk.task.v1.TaskService/GetTaskByIdentifier",
+		"/flowsk.task.v1.TaskService/GetTaskByExternalId",
+		"/flowsk.task.v1.TaskService/GetTaskMarkdown":
+		return true
+	default:
+		return false
+	}
+}
+
+func nextWallClockTickUTC() time.Time {
+	t0 := time.Now().UTC()
+	deadline := time.Now().Add(50 * time.Microsecond)
+	for time.Now().Before(deadline) {
+		now := time.Now().UTC()
+		if now.After(t0) {
+			return now
+		}
+	}
+	return time.Now().UTC()
+}
+
+func extractSignaledTaskIDFromResponse(rawReq, rawResp any) (string, bool) {
+	switch msg := rawResp.(type) {
+	case *flowsk_task_pb.GetTaskResponse:
+		if t := msg.GetTask(); t != nil && t.GetLastSignalAt() != nil && t.GetId() != "" {
+			return t.GetId(), true
+		}
+	case *flowsk_task_pb.GetTaskByIdentifierResponse:
+		if t := msg.GetTask(); t != nil && t.GetLastSignalAt() != nil && t.GetId() != "" {
+			return t.GetId(), true
+		}
+	case *flowsk_task_pb.GetTaskByExternalIdResponse:
+		if t := msg.GetTask(); t != nil && t.GetLastSignalAt() != nil && t.GetId() != "" {
+			return t.GetId(), true
+		}
+	case *flowsk_task_pb.GetTaskMarkdownResponse:
+		if mdReq, ok := rawReq.(*flowsk_task_pb.GetTaskMarkdownRequest); ok {
+			if id := strings.TrimSpace(mdReq.GetTaskId()); id != "" {
+				return id, true
+			}
+		}
+	}
+	return "", false
 }
 
 // NewSSEHandler serves `GET /api/events` over HTTP/1.1 and HTTP/2 using Go's

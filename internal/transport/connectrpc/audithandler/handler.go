@@ -4,6 +4,7 @@ package audithandler
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,7 +21,10 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-const maxAuditPageSize int32 = 200
+const (
+	maxAuditPageSize     int32 = 200
+	defaultAuditPageSize int32 = 50
+)
 
 // DataDependencies defines the segregated persistence provider contracts consumed
 // by `New` to extract concrete audit repository and transaction dependencies.
@@ -158,6 +162,11 @@ func (h *Handler) ListAuditEvents(
 		resourceID = entityIDPtr.String()
 	}
 
+	effectiveLimit := limit
+	if effectiveLimit <= 0 {
+		effectiveLimit = defaultAuditPageSize
+	}
+
 	records, err := h.svc.QueryRecords(ctx, audit.QueryFilter{
 		WorkspaceID:  workspaceID,
 		ActorID:      targetActorID,
@@ -166,11 +175,17 @@ func (h *Handler) ListAuditEvents(
 		ResourceID:   resourceID,
 		Since:        since,
 		Until:        until,
-		Limit:        limit,
+		Limit:        effectiveLimit + 1,
 		Offset:       offset,
 	})
 	if err != nil {
 		return nil, connectrpc.MapDomainError(err)
+	}
+
+	var nextPageToken string
+	if len(records) > int(effectiveLimit) {
+		records = records[:effectiveLimit]
+		nextPageToken = strconv.Itoa(int(offset + effectiveLimit))
 	}
 
 	out := make([]*flowsk_audit_pb.AuditEvent, 0, len(records))
@@ -178,7 +193,8 @@ func (h *Handler) ListAuditEvents(
 		out = append(out, records[i].ToProto())
 	}
 	return connect.NewResponse(&flowsk_audit_pb.ListAuditEventsResponse{
-		Events: out,
+		Events:        out,
+		NextPageToken: nextPageToken,
 	}), nil
 }
 

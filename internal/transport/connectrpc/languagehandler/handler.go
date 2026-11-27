@@ -218,7 +218,7 @@ func (h *Handler) ExecuteScript(
 	return connect.NewResponse(&flowsk_language_pb.ExecuteScriptResponse{
 		Committed:          jsOut.Committed,
 		EffectiveMode:      effMode,
-		StatementsExecuted: int32(max(1, jsOut.Mutations)),
+		StatementsExecuted: int32(jsOut.Mutations),
 		CompactOutput:      jsOut.Summary,
 		ExecutedAt:         timestamppb.New(time.Now().UTC()),
 	}), nil

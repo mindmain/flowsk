@@ -314,7 +314,7 @@ func TestStreamableHTTPJSONRPCAndErrorHandling(t *testing.T) {
 	// Wait briefly for listener bind via HTTPHandler and live socket check.
 	postRPC := func(handler http.Handler, body string) (*http.Response, jsonRPCResponseEnvelope) {
 		t.Helper()
-		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8081/mcp", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
@@ -385,5 +385,160 @@ func TestStreamableHTTPJSONRPCAndErrorHandling(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for HTTP MCP server graceful shutdown")
+	}
+}
+
+func TestStreamableHTTPSecurityGuardsAndJSONRPCNotifications(t *testing.T) {
+	t.Parallel()
+
+	deps := &fakeMCPDeps{}
+	const token = "bearer-prefixed-secret-token"
+
+	srv := mcp.NewServer(mcp.Config{
+		Transport:          mcp.TransportHTTP,
+		HTTPAddr:           "127.0.0.1:8081",
+		DefaultWorkspaceID: uuid.NewString(),
+		DefaultActorID:     uuid.NewString(),
+		AuthToken:          token,
+		AllowedOrigins:     []string{"https://studio.example.com"},
+	}, deps)
+	h := srv.HTTPHandler()
+
+	sendReq := func(target string, headers map[string]string, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, target, strings.NewReader(body))
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	pingReq := `{"jsonrpc":"2.0","id":1,"method":"ping"}`
+
+	// 1. DNS rebinding protection on loopback listener rejects non-loopback Host.
+	recRebind := sendReq("http://evil.rebind.example:8081/mcp", map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+	}, pingReq)
+	if recRebind.Code != http.StatusForbidden {
+		t.Fatalf("DNS rebinding Host status = %d, want 403", recRebind.Code)
+	}
+
+	// 2. Missing/wrong/scheme-less Authorization -> 401 Unauthorized.
+	for _, badAuth := range []string{"", token, "Basic dXNlcjpwYXNz", "Bearer wrong-token", "Bearer "} {
+		hdrs := map[string]string{"Content-Type": "application/json"}
+		if badAuth != "" {
+			hdrs["Authorization"] = badAuth
+		}
+		rec := sendReq("http://127.0.0.1:8081/mcp", hdrs, pingReq)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("bad Authorization %q status = %d, want 401", badAuth, rec.Code)
+		}
+	}
+
+	// 3. Case-insensitive "bearer" scheme + token starting with "bearer" succeeds, and Content-Type charset allowed.
+	recOK := sendReq("http://localhost:8081/mcp", map[string]string{
+		"Authorization": "bEaReR " + token,
+		"Content-Type":  "Application/JSON; charset=utf-8",
+	}, pingReq)
+	if recOK.Code != http.StatusOK {
+		t.Fatalf("valid bearer + charset JSON status = %d, want 200 (body=%q)", recOK.Code, recOK.Body.String())
+	}
+
+	// 4. Non-JSON Content-Type (browser simple-request CSRF vectors) -> 415 Unsupported Media Type.
+	for _, badCT := range []string{"", "text/plain", "text/plain; charset=utf-8", "application/x-www-form-urlencoded"} {
+		hdrs := map[string]string{"Authorization": "Bearer " + token}
+		if badCT != "" {
+			hdrs["Content-Type"] = badCT
+		}
+		rec := sendReq("http://127.0.0.1:8081/mcp", hdrs, pingReq)
+		if rec.Code != http.StatusUnsupportedMediaType {
+			t.Fatalf("Content-Type %q status = %d, want 415", badCT, rec.Code)
+		}
+	}
+
+	// 5. Cross-site / cross-origin browser requests rejected (403) unless in AllowedOrigins or same-host.
+	recCrossSite := sendReq("http://127.0.0.1:8081/mcp", map[string]string{
+		"Authorization":  "Bearer " + token,
+		"Content-Type":   "application/json",
+		"Sec-Fetch-Site": "cross-site",
+	}, pingReq)
+	if recCrossSite.Code != http.StatusForbidden {
+		t.Fatalf("Sec-Fetch-Site: cross-site status = %d, want 403", recCrossSite.Code)
+	}
+
+	recBadOrigin := sendReq("http://127.0.0.1:8081/mcp", map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+		"Origin":        "https://evil.attacker.com",
+	}, pingReq)
+	if recBadOrigin.Code != http.StatusForbidden {
+		t.Fatalf("untrusted Origin status = %d, want 403", recBadOrigin.Code)
+	}
+
+	recNullOrigin := sendReq("http://127.0.0.1:8081/mcp", map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+		"Origin":        "null",
+	}, pingReq)
+	if recNullOrigin.Code != http.StatusForbidden {
+		t.Fatalf("null Origin status = %d, want 403", recNullOrigin.Code)
+	}
+
+	recSameOrigin := sendReq("http://[::1]:8081/mcp", map[string]string{
+		"Authorization":  "Bearer " + token,
+		"Content-Type":   "application/json",
+		"Origin":         "http://[::1]:8081",
+		"Sec-Fetch-Site": "same-origin",
+	}, pingReq)
+	if recSameOrigin.Code != http.StatusOK {
+		t.Fatalf("same-origin IPv6 loopback status = %d, want 200", recSameOrigin.Code)
+	}
+
+	recAllowedOrigin := sendReq("http://127.0.0.1:8081/mcp", map[string]string{
+		"Authorization":  "Bearer " + token,
+		"Content-Type":   "application/json",
+		"Origin":         "https://studio.example.com",
+		"Sec-Fetch-Site": "cross-site",
+	}, pingReq)
+	if recAllowedOrigin.Code != http.StatusOK {
+		t.Fatalf("explicitly allowed Origin status = %d, want 200", recAllowedOrigin.Code)
+	}
+
+	// 6. JSON-RPC 2.0 Notification compliance: requests without "id" NEVER emit a JSON-RPC body, regardless of method.
+	for _, notif := range []string{
+		`{"jsonrpc":"2.0","method":"ping"}`,
+		`{"jsonrpc":"2.0","method":"tools/list"}`,
+		`{"jsonrpc":"2.0","method":"initialize"}`,
+		`{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":50}}`,
+	} {
+		rec := sendReq("http://127.0.0.1:8081/mcp", map[string]string{
+			"Authorization": "Bearer " + token,
+			"Content-Type":  "application/json",
+		}, notif)
+		if rec.Code != http.StatusAccepted || rec.Body.Len() != 0 {
+			t.Fatalf("notification %s -> status=%d body=%q, want 202 with empty body", notif, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Verify stdio also emits zero frames for notifications of any method name.
+	var stdout bytes.Buffer
+	stdioSrv := mcp.NewServer(mcp.Config{
+		Transport: mcp.TransportStdio,
+		Stdin: strings.NewReader(strings.Join([]string{
+			`{"jsonrpc":"2.0","method":"ping"}`,
+			`{"jsonrpc":"2.0","method":"tools/list"}`,
+			`{"jsonrpc":"2.0","id":99,"method":"ping"}`,
+		}, "\n") + "\n"),
+		Stdout: &stdout,
+	}, deps)
+	if err := stdioSrv.Serve(context.Background()); err != nil {
+		t.Fatalf("stdio notification test Serve: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 1 || !strings.Contains(lines[0], `"id":99`) {
+		t.Fatalf("expected exactly 1 response frame (for id=99), got %d: %q", len(lines), stdout.String())
 	}
 }

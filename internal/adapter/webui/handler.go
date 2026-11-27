@@ -38,33 +38,44 @@ type RuntimeBootstrap struct {
 
 	// ActorHandle is the default operator handle for interactive UI actions.
 	ActorHandle string `json:"actorHandle,omitempty"`
+
+	// AuthRequired reports whether the server requires caller authentication for RPC and SSE endpoints.
+	AuthRequired bool `json:"authRequired,omitempty"`
+
+	// Authenticated reports whether the current HTTP request presented valid credentials.
+	Authenticated bool `json:"authenticated,omitempty"`
 }
+
+const defaultContentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'"
 
 // DistFS returns the sub-filesystem rooted at `dist/` inside the embedded bundle.
 func DistFS() (fs.FS, error) {
 	return fs.Sub(embeddedDist, "dist")
 }
 
-// NewBootstrapHandler serves `GET /api/ui-config` with strictly logical startup metadata.
+// NewBootstrapHandler serves `GET /api/ui-config` with static logical startup metadata.
 func NewBootstrapHandler(cfg RuntimeBootstrap) http.Handler {
-	ws := strings.TrimSpace(cfg.WorkspaceSlug)
-	if ws == "" {
-		ws = "default"
-	}
-	payload := RuntimeBootstrap{
-		WorkspaceID:   strings.TrimSpace(cfg.WorkspaceID),
-		WorkspaceSlug: ws,
-		ProjectSlug:   strings.TrimSpace(cfg.ProjectSlug),
-		ActorID:       strings.TrimSpace(cfg.ActorID),
-		ActorHandle:   strings.TrimSpace(cfg.ActorHandle),
-	}
+	normalized := normalizeBootstrap(cfg)
+	return NewDynamicBootstrapHandler(func(*http.Request) RuntimeBootstrap {
+		return normalized
+	})
+}
 
+// NewDynamicBootstrapHandler serves `GET /api/ui-config` by evaluating `fn(r)` on
+// each request so networked servers can inspect request headers/cookies and report
+// `AuthRequired`/`Authenticated` without leaking `WorkspaceID` or `ActorID` to
+// unauthenticated callers.
+func NewDynamicBootstrapHandler(fn func(r *http.Request) RuntimeBootstrap) http.Handler {
+	if fn == nil {
+		fn = func(*http.Request) RuntimeBootstrap { return RuntimeBootstrap{} }
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
 			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 			return
 		}
+		payload := normalizeBootstrap(fn(r))
 		applySecurityHeaders(w)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
@@ -73,6 +84,27 @@ func NewBootstrapHandler(cfg RuntimeBootstrap) http.Handler {
 			_ = json.NewEncoder(w).Encode(payload)
 		}
 	})
+}
+
+func normalizeBootstrap(cfg RuntimeBootstrap) RuntimeBootstrap {
+	ws := strings.TrimSpace(cfg.WorkspaceSlug)
+	if ws == "" {
+		ws = "default"
+	}
+	out := RuntimeBootstrap{
+		WorkspaceID:   strings.TrimSpace(cfg.WorkspaceID),
+		WorkspaceSlug: ws,
+		ProjectSlug:   strings.TrimSpace(cfg.ProjectSlug),
+		ActorID:       strings.TrimSpace(cfg.ActorID),
+		ActorHandle:   strings.TrimSpace(cfg.ActorHandle),
+		AuthRequired:  cfg.AuthRequired,
+		Authenticated: cfg.Authenticated,
+	}
+	if out.AuthRequired && !out.Authenticated {
+		out.WorkspaceID = ""
+		out.ActorID = ""
+	}
+	return out
 }
 
 // NewSPAHandler constructs an `http.Handler` serving the embedded Angular SPA
@@ -144,6 +176,7 @@ func applySecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "same-origin")
+	w.Header().Set("Content-Security-Policy", defaultContentSecurityPolicy)
 }
 
 func isFingerprintedAsset(cleanPath string) bool {

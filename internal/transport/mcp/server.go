@@ -28,16 +28,22 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/mindmain/flowsk/internal/version"
 )
 
 // ErrNotImplemented is returned when an MCP server or handler is invoked without
@@ -152,6 +158,16 @@ type Config struct {
 	// MaxTokensDefault caps serialized tool output budgets when a tool call omits
 	// an explicit max_tokens override (0 delegates to domain defaults).
 	MaxTokensDefault int
+
+	// AuthToken optionally requires `Authorization: Bearer <token>` on every
+	// Streamable HTTP MCP request when non-empty.
+	AuthToken string
+
+	// AllowedOrigins optionally lists additional browser `Origin` values (e.g.
+	// "https://studio.example.com") permitted to call the Streamable HTTP MCP
+	// endpoint across origins. Same-host requests and non-browser clients (no
+	// `Origin` header) are permitted unless `Sec-Fetch-Site: cross-site` is sent.
+	AllowedOrigins []string
 }
 
 // ExecuteScriptInput represents a tenant-scoped request to execute an atomic
@@ -380,7 +396,7 @@ func NewServer(cfg Config, deps Dependencies) *ServerSkeleton {
 	}
 
 	s := &ServerSkeleton{
-		cfg:            cfg,
+		cfg:             cloneConfig(cfg),
 		executor:       executor,
 		guideProvider:  guideProvider,
 		digestProvider: digestProvider,
@@ -394,7 +410,21 @@ func NewServer(cfg Config, deps Dependencies) *ServerSkeleton {
 
 // Config returns the normalized transport configuration bound to the server.
 func (s *ServerSkeleton) Config() Config {
-	return s.cfg
+	return cloneConfig(s.cfg)
+}
+
+func cloneConfig(cfg Config) Config {
+	if len(cfg.AllowedOrigins) > 0 {
+		cfg.AllowedOrigins = append([]string(nil), cfg.AllowedOrigins...)
+	}
+	return cfg
+}
+
+func serverVersion() string {
+	if v := strings.TrimSpace(version.Version); v != "" {
+		return v
+	}
+	return mcpServerVersion
 }
 
 // Addr returns the active TCP listener address when running TransportHTTP.
@@ -439,6 +469,8 @@ func (s *ServerSkeleton) HTTPHandler() http.Handler {
 			http.Error(w, err.Error(), http.StatusRequestTimeout)
 			return
 		}
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+
 		if !s.hasCapabilities() {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(http.StatusNotImplemented)
@@ -448,9 +480,33 @@ func (s *ServerSkeleton) HTTPHandler() http.Handler {
 			return
 		}
 
+		if isLoopbackBindAddr(s.cfg.HTTPAddr) && !isLoopbackHostHeader(r.Host) {
+			http.Error(w, "forbidden host header", http.StatusForbidden)
+			return
+		}
+
+		if !isBrowserOriginAllowed(r, s.cfg.AllowedOrigins) {
+			http.Error(w, "cross-site request forbidden", http.StatusForbidden)
+			return
+		}
+
+		if expectedToken := strings.TrimSpace(s.cfg.AuthToken); expectedToken != "" {
+			providedToken, ok := extractBearerToken(r.Header.Get("Authorization"))
+			if !ok || !constantTimeTokenMatch(providedToken, expectedToken) {
+				w.Header().Set("WWW-Authenticate", `Bearer realm="flowsk-mcp"`)
+				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+				return
+			}
+		}
+
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
 			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+			return
+		}
+
+		if !isJSONMediaType(r.Header.Get("Content-Type")) {
+			http.Error(w, http.StatusText(http.StatusUnsupportedMediaType), http.StatusUnsupportedMediaType)
 			return
 		}
 
@@ -464,11 +520,11 @@ func (s *ServerSkeleton) HTTPHandler() http.Handler {
 		}
 
 		resp, isNotification := s.dispatchFrame(r.Context(), rawBody)
-		if isNotification {
+		if isNotification || resp == nil {
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
-		writeJSONRPCResponse(w, http.StatusOK, resp)
+		writeJSONRPCResponse(w, http.StatusOK, *resp)
 	})
 }
 
@@ -562,7 +618,7 @@ func (s *ServerSkeleton) serveStdio(ctx context.Context) error {
 			}
 
 			resp, isNotification := s.dispatchFrame(ctx, trimmed)
-			if isNotification {
+			if isNotification || resp == nil {
 				continue
 			}
 			encoded, err := json.Marshal(resp)
@@ -675,8 +731,12 @@ func newJSONRPCError(id json.RawMessage, code int, msg string) jsonRPCResponse {
 	}
 }
 
+func hasJSONRPCID(id json.RawMessage) bool {
+	return len(bytes.TrimSpace(id)) > 0
+}
+
 func normalizeID(id json.RawMessage) json.RawMessage {
-	if len(bytes.TrimSpace(id)) == 0 {
+	if !hasJSONRPCID(id) {
 		return json.RawMessage("null")
 	}
 	return id
@@ -688,31 +748,166 @@ func writeJSONRPCResponse(w http.ResponseWriter, statusCode int, resp jsonRPCRes
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func (s *ServerSkeleton) dispatchFrame(ctx context.Context, raw []byte) (resp jsonRPCResponse, isNotification bool) {
+func extractBearerToken(authHeader string) (string, bool) {
+	scheme, rest, ok := strings.Cut(strings.TrimSpace(authHeader), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	token := strings.TrimSpace(rest)
+	if token == "" {
+		return "", false
+	}
+	return token, true
+}
+
+func constantTimeTokenMatch(provided, expected string) bool {
+	gotHash := sha256.Sum256([]byte(provided))
+	wantHash := sha256.Sum256([]byte(expected))
+	return subtle.ConstantTimeCompare(gotHash[:], wantHash[:]) == 1 &&
+		subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+}
+
+func isJSONMediaType(contentType string) bool {
+	raw := strings.TrimSpace(contentType)
+	if raw == "" {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(raw)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(mediaType, "application/json")
+}
+
+func isLoopbackBindAddr(addr string) bool {
+	trimmed := strings.TrimSpace(addr)
+	if trimmed == "" {
+		return false
+	}
+	var host string
+	if h, _, err := net.SplitHostPort(trimmed); err == nil {
+		host = h
+	} else {
+		host = strings.Trim(trimmed, "[]")
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+func isLoopbackHostHeader(hostHeader string) bool {
+	raw := strings.TrimSpace(hostHeader)
+	if raw == "" {
+		return false
+	}
+	host := raw
+	if h, _, err := net.SplitHostPort(raw); err == nil {
+		host = h
+	} else if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		host = raw[1 : len(raw)-1]
+	} else if strings.Count(raw, ":") == 1 {
+		return false
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	return host == "127.0.0.1" || host == "::1" || strings.EqualFold(host, "localhost")
+}
+
+func isBrowserOriginAllowed(r *http.Request, allowedOrigins []string) bool {
+	secFetchSite := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+
+	if origin != "" {
+		parsed, err := url.Parse(origin)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			return false
+		}
+		if matchesAllowedOrigin(parsed, allowedOrigins) {
+			return true
+		}
+		if strings.EqualFold(secFetchSite, "cross-site") {
+			return false
+		}
+		return strings.EqualFold(parsed.Host, strings.TrimSpace(r.Host))
+	}
+
+	if strings.EqualFold(secFetchSite, "cross-site") {
+		return false
+	}
+	return true
+}
+
+func matchesAllowedOrigin(parsedOrigin *url.URL, allowedOrigins []string) bool {
+	for _, rawAllowed := range allowedOrigins {
+		allowed := strings.TrimSpace(rawAllowed)
+		if allowed == "" {
+			continue
+		}
+		if allowed == "*" {
+			return true
+		}
+		if strings.Contains(allowed, "://") {
+			if au, err := url.Parse(allowed); err == nil && au.Scheme != "" && au.Host != "" {
+				if strings.EqualFold(au.Scheme, parsedOrigin.Scheme) && strings.EqualFold(au.Host, parsedOrigin.Host) {
+					return true
+				}
+			}
+			continue
+		}
+		if strings.EqualFold(allowed, parsedOrigin.Host) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *ServerSkeleton) dispatchFrame(ctx context.Context, raw []byte) (resp *jsonRPCResponse, isNotification bool) {
 	var req jsonRPCRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
-		return newJSONRPCError(nil, jsonRPCCodeParseError, "Parse error: malformed JSON-RPC payload"), false
+		errResp := newJSONRPCError(nil, jsonRPCCodeParseError, "Parse error: malformed JSON-RPC payload")
+		return &errResp, false
 	}
 	if req.JSONRPC != "2.0" || strings.TrimSpace(req.Method) == "" {
-		return newJSONRPCError(req.ID, jsonRPCCodeInvalidRequest, "Invalid Request: jsonrpc must be '2.0' and method must be non-empty"), false
+		errResp := newJSONRPCError(req.ID, jsonRPCCodeInvalidRequest, "Invalid Request: jsonrpc must be '2.0' and method must be non-empty")
+		return &errResp, false
 	}
 
-	hasID := len(bytes.TrimSpace(req.ID)) > 0
+	hasID := hasJSONRPCID(req.ID)
+	out := s.dispatchValidRequest(ctx, req, hasID)
+	if !hasID {
+		return nil, true
+	}
+	return &out, false
+}
 
+func (s *ServerSkeleton) dispatchValidRequest(ctx context.Context, req jsonRPCRequest, hasID bool) jsonRPCResponse {
 	switch req.Method {
 	case "notifications/initialized", "notifications/cancelled":
 		if !hasID {
-			return jsonRPCResponse{}, true
+			return jsonRPCResponse{}
 		}
-		return newJSONRPCResult(req.ID, map[string]any{}), false
+		return newJSONRPCResult(req.ID, map[string]any{})
 
 	case "initialize":
+		if !hasID {
+			return jsonRPCResponse{}
+		}
 		var initParams struct {
 			ProtocolVersion string `json:"protocolVersion"`
 		}
 		if len(req.Params) > 0 {
 			if err := json.Unmarshal(req.Params, &initParams); err != nil {
-				return newJSONRPCError(req.ID, jsonRPCCodeInvalidParams, "Invalid params: malformed initialize parameters"), false
+				return newJSONRPCError(req.ID, jsonRPCCodeInvalidParams, "Invalid params: malformed initialize parameters")
 			}
 		}
 		negotiated := defaultMCPProtocolVersion
@@ -727,18 +922,21 @@ func (s *ServerSkeleton) dispatchFrame(ctx context.Context, raw []byte) (resp js
 			},
 			"serverInfo": map[string]string{
 				"name":    mcpServerName,
-				"version": mcpServerVersion,
+				"version": serverVersion(),
 			},
 			"instructions": "Cloudflare Code Mode MCP: use flowsk_search (GitHub-style filters like 'state:done #tag sqlite', 'state:in_progress', or scope='sdk' to inspect SDK methods) and flowsk_execute to run standard ES6 JavaScript against the sandboxed `flowsk` SDK inside a single ACID transaction.",
-		}), false
+		})
 
 	case "ping":
-		return newJSONRPCResult(req.ID, map[string]any{}), false
+		return newJSONRPCResult(req.ID, map[string]any{})
 
 	case "tools/list":
+		if !hasID {
+			return jsonRPCResponse{}
+		}
 		return newJSONRPCResult(req.ID, map[string]any{
 			"tools": s.RegisterTools(),
-		}), false
+		})
 
 	case "tools/call":
 		var callParams struct {
@@ -746,10 +944,10 @@ func (s *ServerSkeleton) dispatchFrame(ctx context.Context, raw []byte) (resp js
 			Arguments json.RawMessage `json:"arguments"`
 		}
 		if len(req.Params) == 0 {
-			return newJSONRPCError(req.ID, jsonRPCCodeInvalidParams, "Invalid params: tools/call requires name"), false
+			return newJSONRPCError(req.ID, jsonRPCCodeInvalidParams, "Invalid params: tools/call requires name")
 		}
 		if err := json.Unmarshal(req.Params, &callParams); err != nil || strings.TrimSpace(callParams.Name) == "" {
-			return newJSONRPCError(req.ID, jsonRPCCodeInvalidParams, "Invalid params: malformed tools/call payload"), false
+			return newJSONRPCError(req.ID, jsonRPCCodeInvalidParams, "Invalid params: malformed tools/call payload")
 		}
 
 		var (
@@ -766,57 +964,63 @@ func (s *ServerSkeleton) dispatchFrame(ctx context.Context, raw []byte) (resp js
 		case ToolNameDigest:
 			toolRes, callErr = s.HandleDigest(ctx, callParams.Arguments)
 		default:
-			return newJSONRPCError(req.ID, jsonRPCCodeInvalidParams, fmt.Sprintf("Invalid params: unknown tool %q", callParams.Name)), false
+			return newJSONRPCError(req.ID, jsonRPCCodeInvalidParams, fmt.Sprintf("Invalid params: unknown tool %q", callParams.Name))
 		}
 
 		if callErr != nil {
 			switch {
 			case errors.Is(callErr, ErrInvalidArguments):
-				return newJSONRPCError(req.ID, jsonRPCCodeInvalidParams, callErr.Error()), false
+				return newJSONRPCError(req.ID, jsonRPCCodeInvalidParams, callErr.Error())
 			case errors.Is(callErr, ErrNotImplemented):
-				return newJSONRPCError(req.ID, jsonRPCCodeMethodNotFound, callErr.Error()), false
+				return newJSONRPCError(req.ID, jsonRPCCodeMethodNotFound, callErr.Error())
 			default:
-				return newJSONRPCError(req.ID, jsonRPCCodeInternalError, "internal MCP tool execution error"), false
+				return newJSONRPCError(req.ID, jsonRPCCodeInternalError, "internal MCP tool execution error")
 			}
 		}
-		return newJSONRPCResult(req.ID, toolRes), false
+		return newJSONRPCResult(req.ID, toolRes)
 
 	case "resources/list":
+		if !hasID {
+			return jsonRPCResponse{}
+		}
 		return newJSONRPCResult(req.ID, map[string]any{
 			"resources": s.RegisterResources(),
-		}), false
+		})
 
 	case "resources/read":
+		if !hasID {
+			return jsonRPCResponse{}
+		}
 		var readParams struct {
 			URI string `json:"uri"`
 		}
 		if len(req.Params) == 0 {
-			return newJSONRPCError(req.ID, jsonRPCCodeInvalidParams, "Invalid params: resources/read requires uri"), false
+			return newJSONRPCError(req.ID, jsonRPCCodeInvalidParams, "Invalid params: resources/read requires uri")
 		}
 		if err := json.Unmarshal(req.Params, &readParams); err != nil || strings.TrimSpace(readParams.URI) == "" {
-			return newJSONRPCError(req.ID, jsonRPCCodeInvalidParams, "Invalid params: malformed resources/read payload"), false
+			return newJSONRPCError(req.ID, jsonRPCCodeInvalidParams, "Invalid params: malformed resources/read payload")
 		}
 
 		contents, readErr := s.ReadResource(ctx, readParams.URI)
 		if readErr != nil {
 			switch {
 			case errors.Is(readErr, ErrInvalidArguments):
-				return newJSONRPCError(req.ID, jsonRPCCodeInvalidParams, readErr.Error()), false
+				return newJSONRPCError(req.ID, jsonRPCCodeInvalidParams, readErr.Error())
 			case errors.Is(readErr, ErrNotImplemented):
-				return newJSONRPCError(req.ID, jsonRPCCodeMethodNotFound, readErr.Error()), false
+				return newJSONRPCError(req.ID, jsonRPCCodeMethodNotFound, readErr.Error())
 			default:
-				return newJSONRPCError(req.ID, jsonRPCCodeInternalError, "internal MCP resource read error"), false
+				return newJSONRPCError(req.ID, jsonRPCCodeInternalError, "internal MCP resource read error")
 			}
 		}
 		return newJSONRPCResult(req.ID, map[string]any{
 			"contents": []ResourceContents{contents},
-		}), false
+		})
 
 	default:
 		if !hasID {
 			s.logDiagnosticf("ignoring unknown MCP notification %q", req.Method)
-			return jsonRPCResponse{}, true
+			return jsonRPCResponse{}
 		}
-		return newJSONRPCError(req.ID, jsonRPCCodeMethodNotFound, fmt.Sprintf("Method not found: %q", req.Method)), false
+		return newJSONRPCError(req.ID, jsonRPCCodeMethodNotFound, fmt.Sprintf("Method not found: %q", req.Method))
 	}
 }

@@ -33,6 +33,10 @@ func TestSPAHandler_RoutesAndSecurityHeaders(t *testing.T) {
 	if got := recRoot.Header().Get("X-Content-Type-Options"); got != "nosniff" {
 		t.Fatalf("expected X-Content-Type-Options=nosniff, got %q", got)
 	}
+	const wantCSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'"
+	if got := recRoot.Header().Get("Content-Security-Policy"); got != wantCSP {
+		t.Fatalf("unexpected Content-Security-Policy:\ngot:  %q\nwant: %q", got, wantCSP)
+	}
 
 	// 2. Fingerprinted JS bundle gets immutable Cache-Control.
 	reqJS := httptest.NewRequest(http.MethodGet, "/main-ABCDEF12.js", nil)
@@ -88,5 +92,54 @@ func TestBootstrapHandler(t *testing.T) {
 		got.ActorID != "22222222-2222-4222-8222-222222222222" ||
 		got.ActorHandle != "mind" {
 		t.Fatalf("unexpected bootstrap payload: %+v", got)
+	}
+}
+
+func TestDynamicBootstrapHandler_AuthStateAndZeroLeakage(t *testing.T) {
+	t.Parallel()
+
+	h := webui.NewDynamicBootstrapHandler(func(r *http.Request) webui.RuntimeBootstrap {
+		authed := r.Header.Get("Authorization") == "Bearer secret"
+		return webui.RuntimeBootstrap{
+			WorkspaceID:   "11111111-1111-4111-8111-111111111111",
+			WorkspaceSlug: "prod",
+			ActorID:       "22222222-2222-4222-8222-222222222222",
+			ActorHandle:   "operator",
+			AuthRequired:  true,
+			Authenticated: authed,
+		}
+	})
+
+	// 1. Unauthenticated caller sees authRequired=true, authenticated=false, and NEVER receives WorkspaceID or ActorID.
+	reqUnauth := httptest.NewRequest(http.MethodGet, "/api/ui-config", nil)
+	recUnauth := httptest.NewRecorder()
+	h.ServeHTTP(recUnauth, reqUnauth)
+	if recUnauth.Code != http.StatusOK {
+		t.Fatalf("unauth status = %d, want 200", recUnauth.Code)
+	}
+	var unauthPayload webui.RuntimeBootstrap
+	if err := json.Unmarshal(recUnauth.Body.Bytes(), &unauthPayload); err != nil {
+		t.Fatalf("unmarshal unauth payload: %v", err)
+	}
+	if !unauthPayload.AuthRequired || unauthPayload.Authenticated {
+		t.Fatalf("unexpected auth flags on unauth request: %+v", unauthPayload)
+	}
+	if unauthPayload.WorkspaceID != "" || unauthPayload.ActorID != "" {
+		t.Fatalf("leaked WorkspaceID/ActorID to unauthenticated caller: %+v", unauthPayload)
+	}
+
+	// 2. Authenticated caller receives full logical bootstrap metadata.
+	reqAuth := httptest.NewRequest(http.MethodGet, "/api/ui-config", nil)
+	reqAuth.Header.Set("Authorization", "Bearer secret")
+	recAuth := httptest.NewRecorder()
+	h.ServeHTTP(recAuth, reqAuth)
+	var authPayload webui.RuntimeBootstrap
+	if err := json.Unmarshal(recAuth.Body.Bytes(), &authPayload); err != nil {
+		t.Fatalf("unmarshal auth payload: %v", err)
+	}
+	if !authPayload.AuthRequired || !authPayload.Authenticated ||
+		authPayload.WorkspaceID != "11111111-1111-4111-8111-111111111111" ||
+		authPayload.ActorID != "22222222-2222-4222-8222-222222222222" {
+		t.Fatalf("unexpected auth bootstrap payload: %+v", authPayload)
 	}
 }

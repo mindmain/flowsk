@@ -4,7 +4,9 @@ package connectrpc_test
 
 import (
 	"context"
+	"fmt"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -289,6 +291,14 @@ func (s *fakeProjectService) ListProjects(ctx context.Context, filter project.Li
 		}
 		out = append(out, p.Clone())
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Slug < out[j].Slug })
+	if int(filter.Offset) >= len(out) {
+		return nil, nil
+	}
+	out = out[filter.Offset:]
+	if filter.Limit > 0 && len(out) > int(filter.Limit) {
+		out = out[:filter.Limit]
+	}
 	return out, nil
 }
 
@@ -497,6 +507,14 @@ func (s *fakeObjectiveService) ListObjectives(ctx context.Context, filter object
 		}
 		out = append(out, o.Clone())
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Slug < out[j].Slug })
+	if int(filter.Offset) >= len(out) {
+		return nil, nil
+	}
+	out = out[filter.Offset:]
+	if filter.Limit > 0 && len(out) > int(filter.Limit) {
+		out = out[:filter.Limit]
+	}
 	return out, nil
 }
 
@@ -523,7 +541,12 @@ func (s *fakeObjectiveService) UpdateObjective(ctx context.Context, in objective
 		o.Status = *in.Status
 	}
 	if in.TargetDate != nil {
-		o.TargetDate = in.TargetDate
+		if in.TargetDate.IsZero() {
+			o.TargetDate = nil
+		} else {
+			cp := *in.TargetDate
+			o.TargetDate = &cp
+		}
 	}
 	o.UpdatedAt = time.Now().UTC()
 	s.objectives[o.ID] = o
@@ -546,12 +569,13 @@ func (s *fakeObjectiveService) DeleteObjective(ctx context.Context, workspaceID,
 
 // fakeTaskService is a thread-safe in-memory double of task.Service.
 type fakeTaskService struct {
-	mu        sync.RWMutex
-	seq       int64
-	tasks     map[uuid.UUID]task.Task
-	relations map[uuid.UUID]task.TaskRelation
-	comments  map[uuid.UUID][]task.TaskComment
-	docs      map[uuid.UUID]string
+	mu              sync.RWMutex
+	seq             int64
+	tasks           map[uuid.UUID]task.Task
+	relations       map[uuid.UUID]task.TaskRelation
+	comments        map[uuid.UUID][]task.TaskComment
+	docs            map[uuid.UUID]string
+	lastReleaseTask task.ReleaseTaskInput
 }
 
 func newFakeTaskService() *fakeTaskService {
@@ -589,7 +613,7 @@ func (s *fakeTaskService) CreateTask(ctx context.Context, in task.CreateTaskInpu
 		ProjectID:          in.ProjectID,
 		ObjectiveID:        in.ObjectiveID,
 		ParentTaskID:       in.ParentTaskID,
-		Key:                "FLW-1",
+		Key:                fmt.Sprintf("FLW-%d", s.seq),
 		ExternalID:         in.ExternalID,
 		Kind:               in.Kind,
 		Title:              in.Title,
@@ -598,13 +622,11 @@ func (s *fakeTaskService) CreateTask(ctx context.Context, in task.CreateTaskInpu
 		Status:             st,
 		Priority:           in.Priority,
 		AssigneeActorID:    in.AssigneeActorID,
+		Tags:               append([]string(nil), in.Tags...),
 		Version:            1,
 		CreatedBy:          id.ActorID,
 		CreatedAt:          now,
 		UpdatedAt:          now,
-	}
-	if s.seq > 1 {
-		t.Key = "FLW-2"
 	}
 	s.tasks[t.ID] = t
 	return t.Clone(), nil
@@ -682,6 +704,9 @@ func (s *fakeTaskService) UpdateTask(ctx context.Context, in task.UpdateTaskInpu
 	}
 	if in.Kind != nil {
 		t.Kind = *in.Kind
+	}
+	if in.Tags != nil {
+		t.Tags = append([]string(nil), in.Tags...)
 	}
 	t.UpdatedAt = time.Now().UTC()
 	s.tasks[t.ID] = t
@@ -765,6 +790,7 @@ func (s *fakeTaskService) ReleaseTask(ctx context.Context, in task.ReleaseTaskIn
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.lastReleaseTask = in
 	t, ok := s.tasks[in.TaskID]
 	if !ok || t.WorkspaceID != in.WorkspaceID {
 		return errs.New(errs.ErrNotFound, "fakeTaskService.ReleaseTask", "task not found")
@@ -826,6 +852,10 @@ func (s *fakeTaskService) PollWorkQueue(ctx context.Context, filter task.AgentWo
 			HasMarkdownDoc: t.HasMarkdownDoc,
 			UpdatedAt:      t.UpdatedAt,
 		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	if filter.Limit > 0 && len(out) > int(filter.Limit) {
+		out = out[:filter.Limit]
 	}
 	return out, nil
 }
@@ -1034,6 +1064,14 @@ func (e *fakeCodeExecutor) Execute(ctx context.Context, in codemode.ExecuteInput
 	if _, err := authctx.RequireWorkspaceOwnership(ctx, in.WorkspaceID); err != nil {
 		return codemode.ExecuteOutput{}, err
 	}
+	if strings.Contains(in.Script, "flowsk.board()") {
+		return codemode.ExecuteOutput{
+			Committed: false,
+			DryRun:    in.DryRun,
+			Mutations: 0,
+			Summary:   `{"ready":0}`,
+		}, nil
+	}
 	return codemode.ExecuteOutput{
 		Committed: !in.DryRun,
 		DryRun:    in.DryRun,
@@ -1044,27 +1082,51 @@ func (e *fakeCodeExecutor) Execute(ctx context.Context, in codemode.ExecuteInput
 
 // fakeAuditService is a deterministic double of audit.Service.
 type fakeAuditService struct {
-	record audit.Record
+	record  audit.Record
+	records []audit.Record
+}
+
+func (s *fakeAuditService) allRecords() []audit.Record {
+	if len(s.records) > 0 {
+		return s.records
+	}
+	if s.record.ID != uuid.Nil {
+		return []audit.Record{s.record}
+	}
+	return nil
 }
 
 func (s *fakeAuditService) GetRecord(ctx context.Context, workspaceID, auditID uuid.UUID) (audit.Record, error) {
 	if _, err := authctx.RequireWorkspaceOwnership(ctx, workspaceID); err != nil {
 		return audit.Record{}, err
 	}
-	if s.record.ID != auditID || s.record.WorkspaceID != workspaceID {
-		return audit.Record{}, errs.New(errs.ErrNotFound, "fakeAuditService.GetRecord", "audit record not found")
+	for _, rec := range s.allRecords() {
+		if rec.ID == auditID && rec.WorkspaceID == workspaceID {
+			return rec.Clone(), nil
+		}
 	}
-	return s.record.Clone(), nil
+	return audit.Record{}, errs.New(errs.ErrNotFound, "fakeAuditService.GetRecord", "audit record not found")
 }
 
 func (s *fakeAuditService) QueryRecords(ctx context.Context, filter audit.QueryFilter) ([]audit.Record, error) {
 	if _, err := authctx.RequireWorkspaceOwnership(ctx, filter.WorkspaceID); err != nil {
 		return nil, err
 	}
-	if s.record.WorkspaceID != filter.WorkspaceID {
+	var matched []audit.Record
+	for _, rec := range s.allRecords() {
+		if rec.WorkspaceID != filter.WorkspaceID {
+			continue
+		}
+		matched = append(matched, rec.Clone())
+	}
+	if int(filter.Offset) >= len(matched) {
 		return nil, nil
 	}
-	return []audit.Record{s.record.Clone()}, nil
+	matched = matched[filter.Offset:]
+	if filter.Limit > 0 && len(matched) > int(filter.Limit) {
+		matched = matched[:filter.Limit]
+	}
+	return matched, nil
 }
 
 func attachAuth[T any](req *connect.Request[T], wsID, actorID uuid.UUID, handle string) *connect.Request[T] {
@@ -1677,5 +1739,285 @@ func TestAllConnectRPCHandlersEndToEnd(t *testing.T) {
 		ActorId:     actorID.String(),
 	}), wsID, actorID, "agent-alpha")); err != nil {
 		t.Fatalf("DeleteWorkspace: %v", err)
+	}
+}
+
+func TestHandlersHardening_TagsPaginationFiltersAndBindingsOwnership(t *testing.T) {
+	t.Parallel()
+
+	wsID := uuid.New()
+	foreignWSID := uuid.New()
+	actorID := uuid.New()
+
+	fakeTasks := newFakeTaskService()
+	fakeAudit := &fakeAuditService{
+		records: []audit.Record{
+			{ID: uuid.New(), WorkspaceID: wsID, ActorID: actorID, ActorKind: authctx.ActorKindAgent, ActorHandle: "a1", Action: tx.AuditActionCreate, ResourceType: "task", ResourceID: "1", OccurredAt: time.Now().UTC()},
+			{ID: uuid.New(), WorkspaceID: wsID, ActorID: actorID, ActorKind: authctx.ActorKindAgent, ActorHandle: "a1", Action: tx.AuditActionUpdate, ResourceType: "task", ResourceID: "2", OccurredAt: time.Now().UTC()},
+			{ID: uuid.New(), WorkspaceID: wsID, ActorID: actorID, ActorKind: authctx.ActorKindAgent, ActorHandle: "a1", Action: tx.AuditActionTransition, ResourceType: "task", ResourceID: "3", OccurredAt: time.Now().UTC()},
+		},
+	}
+
+	svcs := &fakeServiceContainer{
+		wsSvc:   newFakeWorkspaceService(),
+		projSvc: newFakeProjectService(),
+		objSvc:  newFakeObjectiveService(),
+		taskSvc: fakeTasks,
+		exec:    &fakeCodeExecutor{},
+		guide:   language.NewGuideProvider(),
+		audSvc:  fakeAudit,
+	}
+
+	mux := connectrpc.NewMux(
+		connectrpc.HandlerSet{
+			Workspace: workspacehandler.New(nil, svcs),
+			Project:   projecthandler.New(nil, svcs),
+			Objective: objectivehandler.New(nil, svcs),
+			Task:      taskhandler.New(nil, svcs),
+			Language:  languagehandler.New(nil, svcs),
+			Audit:     audithandler.New(nil, svcs),
+		},
+		connect.WithInterceptors(connectrpc.NewAuthContextInterceptor(nil)),
+	)
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	projClient := flowsk_project_pbconnect.NewProjectServiceClient(srv.Client(), srv.URL)
+	objClient := flowsk_objective_pbconnect.NewObjectiveServiceClient(srv.Client(), srv.URL)
+	taskClient := flowsk_task_pbconnect.NewTaskServiceClient(srv.Client(), srv.URL)
+	langClient := flowsk_language_pbconnect.NewLanguageServiceClient(srv.Client(), srv.URL)
+	audClient := flowsk_audit_pbconnect.NewAuditServiceClient(srv.Client(), srv.URL)
+
+	ctx := context.Background()
+
+	// 1. Project bindings require workspace ownership and ListProjects filters archived BEFORE pagination.
+	_, err := projClient.BindSubproject(ctx, attachAuth(connect.NewRequest(&flowsk_project_pb.BindSubprojectRequest{
+		WorkspaceId:     foreignWSID.String(),
+		ActorId:         actorID.String(),
+		ParentProjectId: uuid.NewString(),
+		ChildProjectId:  uuid.NewString(),
+	}), wsID, actorID, "agent"))
+	if connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("foreign BindSubproject code = %v, want PermissionDenied", connect.CodeOf(err))
+	}
+	_, err = projClient.UnbindSubproject(ctx, attachAuth(connect.NewRequest(&flowsk_project_pb.UnbindSubprojectRequest{
+		WorkspaceId:     foreignWSID.String(),
+		ActorId:         actorID.String(),
+		ParentProjectId: uuid.NewString(),
+		ChildProjectId:  uuid.NewString(),
+	}), wsID, actorID, "agent"))
+	if connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("foreign UnbindSubproject code = %v, want PermissionDenied", connect.CodeOf(err))
+	}
+	_, err = projClient.ListProjectBindings(ctx, attachAuth(connect.NewRequest(&flowsk_project_pb.ListProjectBindingsRequest{
+		WorkspaceId: foreignWSID.String(),
+		ActorId:     actorID.String(),
+	}), wsID, actorID, "agent"))
+	if connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("foreign ListProjectBindings code = %v, want PermissionDenied", connect.CodeOf(err))
+	}
+
+	// Create 2 archived projects sorting lexicographically first ("a-arch-1", "a-arch-2") + 3 active projects.
+	for i, spec := range []struct {
+		slug     string
+		archived bool
+	}{
+		{"a-arch-1", true},
+		{"a-arch-2", true},
+		{"b-active-1", false},
+		{"b-active-2", false},
+		{"b-active-3", false},
+	} {
+		st := flowsk_project_pb.ProjectStatus_PROJECT_STATUS_ACTIVE
+		if spec.archived {
+			st = flowsk_project_pb.ProjectStatus_PROJECT_STATUS_ARCHIVED
+		}
+		if _, err := projClient.CreateProject(ctx, attachAuth(connect.NewRequest(&flowsk_project_pb.CreateProjectRequest{
+			WorkspaceId: wsID.String(),
+			ActorId:     actorID.String(),
+			KeyPrefix:   fmt.Sprintf("P%d", i),
+			Slug:        spec.slug,
+			Name:        spec.slug,
+			Status:      st,
+		}), wsID, actorID, "agent")); err != nil {
+			t.Fatalf("CreateProject %s: %v", spec.slug, err)
+		}
+	}
+
+	projPage1, err := projClient.ListProjects(ctx, attachAuth(connect.NewRequest(&flowsk_project_pb.ListProjectsRequest{
+		WorkspaceId:     wsID.String(),
+		ActorId:         actorID.String(),
+		IncludeArchived: false,
+		PageSize:        2,
+	}), wsID, actorID, "agent"))
+	if err != nil {
+		t.Fatalf("ListProjects page 1: %v", err)
+	}
+	if len(projPage1.Msg.GetProjects()) != 2 || projPage1.Msg.GetNextPageToken() != "2" {
+		t.Fatalf("ListProjects page 1 got %d items token=%q, want 2 items token=2", len(projPage1.Msg.GetProjects()), projPage1.Msg.GetNextPageToken())
+	}
+	projPage2, err := projClient.ListProjects(ctx, attachAuth(connect.NewRequest(&flowsk_project_pb.ListProjectsRequest{
+		WorkspaceId:     wsID.String(),
+		ActorId:         actorID.String(),
+		IncludeArchived: false,
+		PageSize:        2,
+		PageToken:       projPage1.Msg.GetNextPageToken(),
+	}), wsID, actorID, "agent"))
+	if err != nil || len(projPage2.Msg.GetProjects()) != 1 || projPage2.Msg.GetNextPageToken() != "" {
+		t.Fatalf("ListProjects page 2: err=%v count=%d token=%q", err, len(projPage2.Msg.GetProjects()), projPage2.Msg.GetNextPageToken())
+	}
+
+	mainProjectID := uuid.MustParse(projPage1.Msg.GetProjects()[0].GetId())
+
+	// 2. Objectives: ClearTargetDate & ListObjectives NextPageToken.
+	due := timestamppb.New(time.Now().UTC().Add(48 * time.Hour))
+	var firstObjID string
+	for i := 0; i < 3; i++ {
+		resp, err := objClient.CreateObjective(ctx, attachAuth(connect.NewRequest(&flowsk_objective_pb.CreateObjectiveRequest{
+			WorkspaceId: wsID.String(),
+			ActorId:     actorID.String(),
+			ProjectId:   mainProjectID.String(),
+			Kind:        flowsk_objective_pb.ObjectiveKind_OBJECTIVE_KIND_GOAL,
+			Title:       fmt.Sprintf("Goal %d", i),
+			TargetDate:  due,
+		}), wsID, actorID, "agent"))
+		if err != nil {
+			t.Fatalf("CreateObjective %d: %v", i, err)
+		}
+		if i == 0 {
+			firstObjID = resp.Msg.GetObjective().GetId()
+		}
+	}
+
+	updObjResp, err := objClient.UpdateObjective(ctx, attachAuth(connect.NewRequest(&flowsk_objective_pb.UpdateObjectiveRequest{
+		WorkspaceId:     wsID.String(),
+		ActorId:         actorID.String(),
+		ObjectiveId:     firstObjID,
+		ClearTargetDate: true,
+	}), wsID, actorID, "agent"))
+	if err != nil || updObjResp.Msg.GetObjective().GetTargetDate() != nil {
+		t.Fatalf("ClearTargetDate failed: err=%v targetDate=%v", err, updObjResp.Msg.GetObjective().GetTargetDate())
+	}
+
+	objPage1, err := objClient.ListObjectives(ctx, attachAuth(connect.NewRequest(&flowsk_objective_pb.ListObjectivesRequest{
+		WorkspaceId: wsID.String(),
+		ActorId:     actorID.String(),
+		PageSize:    2,
+	}), wsID, actorID, "agent"))
+	if err != nil || len(objPage1.Msg.GetObjectives()) != 2 || objPage1.Msg.GetNextPageToken() != "2" {
+		t.Fatalf("ListObjectives page 1: err=%v count=%d token=%q", err, len(objPage1.Msg.GetObjectives()), objPage1.Msg.GetNextPageToken())
+	}
+
+	// 3. Tasks: Tags + LabelIds separation, workflow_state_id filter, >200 pagination, ReleaseTaskClaim Force.
+	labelUUID := uuid.NewString()
+	doneStateID := connectrpc.WorkflowStateIDForStatus(mainProjectID, task.StatusDone).String()
+	todoStateID := connectrpc.WorkflowStateIDForStatus(mainProjectID, task.StatusReady).String()
+
+	createdTaskResp, err := taskClient.CreateTask(ctx, attachAuth(connect.NewRequest(&flowsk_task_pb.CreateTaskRequest{
+		WorkspaceId:     wsID.String(),
+		ActorId:         actorID.String(),
+		ProjectId:       mainProjectID.String(),
+		Title:           "Tagged task",
+		WorkflowStateId: &doneStateID,
+		Tags:            []string{"security", "backend"},
+		LabelIds:        []string{labelUUID},
+	}), wsID, actorID, "agent"))
+	if err != nil {
+		t.Fatalf("CreateTask with tags: %v", err)
+	}
+	gotTask := createdTaskResp.Msg.GetTask()
+	if len(gotTask.GetTags()) != 3 || len(gotTask.GetLabelIds()) != 1 || gotTask.GetLabelIds()[0] != labelUUID {
+		t.Fatalf("unexpected tags/label_ids split: tags=%v label_ids=%v", gotTask.GetTags(), gotTask.GetLabelIds())
+	}
+
+	updTaskResp, err := taskClient.UpdateTask(ctx, attachAuth(connect.NewRequest(&flowsk_task_pb.UpdateTaskRequest{
+		WorkspaceId: wsID.String(),
+		ActorId:     actorID.String(),
+		TaskId:      gotTask.GetId(),
+		Tags:        []string{"hardened"},
+		ReplaceTags: true,
+	}), wsID, actorID, "agent"))
+	if err != nil || len(updTaskResp.Msg.GetTask().GetTags()) != 1 || len(updTaskResp.Msg.GetTask().GetLabelIds()) != 0 {
+		t.Fatalf("UpdateTask ReplaceTags: err=%v task=%+v", err, updTaskResp.Msg.GetTask())
+	}
+
+	// Create 205 additional Todo tasks so total tasks > 200.
+	for i := 0; i < 205; i++ {
+		if _, err := taskClient.CreateTask(ctx, attachAuth(connect.NewRequest(&flowsk_task_pb.CreateTaskRequest{
+			WorkspaceId:     wsID.String(),
+			ActorId:         actorID.String(),
+			ProjectId:       mainProjectID.String(),
+			Title:           fmt.Sprintf("Todo %03d", i),
+			WorkflowStateId: &todoStateID,
+		}), wsID, actorID, "agent")); err != nil {
+			t.Fatalf("CreateTask bulk %d: %v", i, err)
+		}
+	}
+
+	projIDStr := mainProjectID.String()
+	doneTasksResp, err := taskClient.ListTasks(ctx, attachAuth(connect.NewRequest(&flowsk_task_pb.ListTasksRequest{
+		WorkspaceId:     wsID.String(),
+		ActorId:         actorID.String(),
+		ProjectId:       &projIDStr,
+		WorkflowStateId: &doneStateID,
+	}), wsID, actorID, "agent"))
+	if err != nil || len(doneTasksResp.Msg.GetTasks()) != 1 || doneTasksResp.Msg.GetTasks()[0].GetId() != gotTask.GetId() {
+		t.Fatalf("ListTasks by workflow_state_id(done): err=%v count=%d", err, len(doneTasksResp.Msg.GetTasks()))
+	}
+
+	pageBeyond200, err := taskClient.ListTasks(ctx, attachAuth(connect.NewRequest(&flowsk_task_pb.ListTasksRequest{
+		WorkspaceId: wsID.String(),
+		ActorId:     actorID.String(),
+		ProjectId:   &projIDStr,
+		PageSize:    200,
+		PageToken:   "200",
+	}), wsID, actorID, "agent"))
+	if err != nil || len(pageBeyond200.Msg.GetTasks()) != 6 {
+		t.Fatalf("ListTasks page beyond 200: err=%v count=%d, want 6", err, len(pageBeyond200.Msg.GetTasks()))
+	}
+
+	if _, err := taskClient.ReleaseTaskClaim(ctx, attachAuth(connect.NewRequest(&flowsk_task_pb.ReleaseTaskClaimRequest{
+		WorkspaceId: wsID.String(),
+		ActorId:     actorID.String(),
+		TaskId:      gotTask.GetId(),
+		Force:       true,
+	}), wsID, actorID, "agent")); err != nil {
+		t.Fatalf("ReleaseTaskClaim(Force=true): %v", err)
+	}
+	fakeTasks.mu.RLock()
+	gotForce := fakeTasks.lastReleaseTask.Force
+	fakeTasks.mu.RUnlock()
+	if !gotForce {
+		t.Fatal("expected ReleaseTaskClaim Force=true to propagate to ReleaseTaskInput.Force")
+	}
+
+	// 4. LanguageService: 0-mutation script reports StatementsExecuted == 0.
+	readOnlyExec, err := langClient.ExecuteScript(ctx, attachAuth(connect.NewRequest(&flowsk_language_pb.ExecuteScriptRequest{
+		WorkspaceId: wsID.String(),
+		ActorId:     actorID.String(),
+		Script:      "return flowsk.board();",
+	}), wsID, actorID, "agent"))
+	if err != nil || readOnlyExec.Msg.GetStatementsExecuted() != 0 {
+		t.Fatalf("expected StatementsExecuted=0 for read-only script, got err=%v count=%d", err, readOnlyExec.Msg.GetStatementsExecuted())
+	}
+
+	// 5. AuditService: ListAuditEvents populates NextPageToken.
+	audPage1, err := audClient.ListAuditEvents(ctx, attachAuth(connect.NewRequest(&flowsk_audit_pb.ListAuditEventsRequest{
+		WorkspaceId: wsID.String(),
+		ActorId:     actorID.String(),
+		PageSize:    2,
+	}), wsID, actorID, "agent"))
+	if err != nil || len(audPage1.Msg.GetEvents()) != 2 || audPage1.Msg.GetNextPageToken() != "2" {
+		t.Fatalf("ListAuditEvents page 1: err=%v count=%d token=%q", err, len(audPage1.Msg.GetEvents()), audPage1.Msg.GetNextPageToken())
+	}
+	audPage2, err := audClient.ListAuditEvents(ctx, attachAuth(connect.NewRequest(&flowsk_audit_pb.ListAuditEventsRequest{
+		WorkspaceId: wsID.String(),
+		ActorId:     actorID.String(),
+		PageSize:    2,
+		PageToken:   audPage1.Msg.GetNextPageToken(),
+	}), wsID, actorID, "agent"))
+	if err != nil || len(audPage2.Msg.GetEvents()) != 1 || audPage2.Msg.GetNextPageToken() != "" {
+		t.Fatalf("ListAuditEvents page 2: err=%v count=%d token=%q", err, len(audPage2.Msg.GetEvents()), audPage2.Msg.GetNextPageToken())
 	}
 }
