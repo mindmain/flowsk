@@ -29,10 +29,11 @@ func formatWorktreeCommitShort(wt WorktreeCommitView) string {
 }
 
 func truncateText(s string, maxLen int) string {
-	if maxLen <= 4 || len(s) <= maxLen {
+	runes := []rune(s)
+	if maxLen <= 4 || len(runes) <= maxLen {
 		return s
 	}
-	return s[:maxLen-3] + "..."
+	return string(runes[:maxLen-3]) + "..."
 }
 
 func flattenProjectSummaries(roots []ProjectStatusSummaryView) []ProjectStatusSummaryView {
@@ -61,7 +62,7 @@ func renderHumanWorkspaceOverview(w io.Writer, v WorkspaceOverviewView) error {
 	_, _ = fmt.Fprintf(w, "Totals: %d tasks | Backlog: %d | Planned: %d | Progress: %d | Review: %d | Blocked: %d | Done: %d | Canceled: %d%s\n",
 		c.Total, c.Backlog, c.Planned, c.InProgress, c.InReview, c.Blocked, c.Done, c.Canceled, archSuffix)
 	if v.OrphanIssuesCount > 0 {
-		_, _ = fmt.Fprintf(w, "\033[33m⚠ Warning: %d orphan or missing Markdown resource(s) detected in ~/.flowsk — run 'flowsk prune' to clean up.\033[0m\n", v.OrphanIssuesCount)
+		_, _ = fmt.Fprintln(w, tuiWarnStyle.Render(fmt.Sprintf("⚠ Warning: %d orphan or missing Markdown resource(s) detected in ~/.flowsk — run 'flowsk prune' to clean up.", v.OrphanIssuesCount)))
 	}
 
 	if len(v.Projects) == 0 {

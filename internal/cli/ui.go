@@ -16,6 +16,10 @@ import (
 	"github.com/spf13/viper"
 )
 
+// DefaultUIListenAddr is the default loopback TCP address (`127.0.0.1:1616`)
+// bound by `flowsk ui` / `flowsk web` when `--listen` is not overridden.
+const DefaultUIListenAddr = "127.0.0.1:1616"
+
 type uiCommandDeps interface {
 	ServerDependency
 	LocalPathDependency
@@ -71,7 +75,7 @@ Capabilities:
   - One-click Archive Purge (permanent DB + .md deletion) and Orphan Resource Prune.
   - Automatically focuses the project bound to your current directory (if any) via
     ~/.flowsk/local_paths.json without exposing host paths to the server.`,
-		Example: `  # Launch the Flowsk Web UI on http://127.0.0.1:8080 and open the browser
+		Example: `  # Launch the Flowsk Web UI on http://127.0.0.1:1616 and open the browser
   flowsk ui
 
   # Alias 'flowsk web' on a custom port without opening a browser tab
@@ -140,7 +144,7 @@ Capabilities:
 	}
 
 	flags := cmd.Flags()
-	flags.StringVar(&listenAddr, "listen", "127.0.0.1:8080", "TCP address for the Flowsk Web UI & ConnectRPC server")
+	flags.StringVar(&listenAddr, "listen", DefaultUIListenAddr, "TCP address for the Flowsk Web UI & ConnectRPC server")
 	flags.StringVar(&dbDriver, "db-driver", "sqlite", "Persistence engine: sqlite|postgres")
 	flags.StringVar(&dbDSN, "db-dsn", defaultDSN, "SQLite file path or PostgreSQL connection URI")
 	flags.StringVar(&volumeDir, "volume-dir", defaultVol, "Shared volume directory for advisory locks and snapshots")

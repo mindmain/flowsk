@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"reflect"
 	"strings"
 
 	"github.com/mindmain/flowsk/internal/transport/mcp"
@@ -94,7 +96,7 @@ func (h *mcpHandler) newServeSubcommand(v *viper.Viper) *cobra.Command {
 			if resolvedAddr == "" {
 				resolvedAddr = httpAddr
 			}
-			srv := h.runner.NewMCPServer(mcp.Config{
+			mcpCfg := mcp.Config{
 				Transport:          kind,
 				HTTPAddr:           resolvedAddr,
 				Stdin:              cmd.InOrStdin(),
@@ -104,7 +106,9 @@ func (h *mcpHandler) newServeSubcommand(v *viper.Viper) *cobra.Command {
 				DefaultProjectID:   strings.TrimSpace(h.opts.Project),
 				DefaultActorID:     strings.TrimSpace(h.opts.Actor),
 				MaxTokensDefault:   h.opts.MaxTokens,
-			})
+			}
+			setMCPConfigAuthToken(&mcpCfg, firstNonEmptyCLI(h.opts.AuthToken, os.Getenv("FLOWSK_AUTH_TOKEN")))
+			srv := h.runner.NewMCPServer(mcpCfg)
 			err := srv.Serve(cmd.Context())
 			if errors.Is(err, mcp.ErrNotImplemented) {
 				return ErrNotImplemented
@@ -203,6 +207,20 @@ func (h *mcpHandler) newGuideSubcommand() *cobra.Command {
 	return cmd
 }
 
+func setMCPConfigAuthToken(cfg *mcp.Config, token string) {
+	if cfg == nil {
+		return
+	}
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return
+	}
+	rv := reflect.ValueOf(cfg).Elem()
+	if f := rv.FieldByName("AuthToken"); f.IsValid() && f.CanSet() && f.Kind() == reflect.String {
+		f.SetString(trimmed)
+	}
+}
+
 func buildMCPClientSnippets(workspace string) []MCPClientSnippetView {
 	promptHint := "Poll project state with flowsk_digest, filter tasks/goals or discover SDK methods with flowsk_search, and execute multi-step ES6 JavaScript against flowsk.* atomically via flowsk_execute."
 	jsonBlock := func(actor string) string {
@@ -231,7 +249,7 @@ func buildMCPClientSnippets(workspace string) []MCPClientSnippetView {
 		},
 		{
 			Client:         "antigravity",
-			ConfigPathHint: "Antigravity MCP Servers settings",
+			ConfigPathHint: "~/.gemini/config/mcp_config.json",
 			ConfigSnippet:  jsonBlock("antigravity-agent"),
 			SystemPrompt:   promptHint,
 		},

@@ -46,6 +46,11 @@ func newUpdateCommand(opts *GlobalOptions, deps FormatterDependency) *cobra.Comm
 		Long: `Queries GitHub Releases (and Tags fallback) for 'mindmain/flowsk' to check
 whether a newer version of Flowsk has been published compared to the running binary.
 
+Upgrade options when a newer release is available:
+  - Download a prebuilt release binary from GitHub Releases
+  - Run 'go install github.com/mindmain/flowsk/cmd/flowsk@<tag>'
+  - Run 'task install' from an updated local source checkout
+
 If the repository is not yet public or has no published releases yet, 'flowsk update'
 reports 'unpublished' cleanly with exit code 0.`,
 		Example: `  flowsk update
@@ -235,8 +240,14 @@ func renderHumanUpdateCheck(w io.Writer, v UpdateCheckView) error {
 			fmt.Fprintf(&b, "  Release:  %s\n", tuiMutedStyle.Render(v.ReleaseURL))
 		}
 		if v.UpgradeCommand != "" {
-			fmt.Fprintf(&b, "\n  Upgrade command:\n    %s\n  Then refresh AI skills:\n    %s",
+			releaseHint := fmt.Sprintf("https://github.com/%s/releases/latest", v.Repo)
+			if v.ReleaseURL != "" {
+				releaseHint = v.ReleaseURL
+			}
+			fmt.Fprintf(&b, "\n  Upgrade options:\n    %s\n    %s (from source checkout)\n    Download binary: %s\n  Then refresh AI skills:\n    %s",
 				tuiInfoStyle.Render(v.UpgradeCommand),
+				tuiInfoStyle.Render("task install"),
+				tuiMutedStyle.Render(releaseHint),
 				tuiInfoStyle.Render("flowsk install --yes"),
 			)
 		}

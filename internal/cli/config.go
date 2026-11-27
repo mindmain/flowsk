@@ -12,7 +12,7 @@ import (
 )
 
 // newConfigCommand constructs `flowsk config` (`init`, `show`, `paths`) for
-// managing strictly user-level client configuration under ~/.config/flowsk/.
+// managing strictly user-level client configuration under ~/.flowsk/.
 func newConfigCommand(v *viper.Viper, opts *GlobalOptions, deps FormatterDependency) *cobra.Command {
 	var formatter OutputFormatter
 	if deps != nil {
@@ -81,12 +81,12 @@ max-tokens: 0
 			})
 		},
 	}
-	initCmd.Flags().BoolVar(&force, "force", false, "Overwrite existing ~/.config/flowsk/config.yaml if present")
+	initCmd.Flags().BoolVar(&force, "force", false, "Overwrite existing ~/.flowsk/config.yaml if present")
 
 	var redact bool
 	showCmd := &cobra.Command{
 		Use:   "show",
-		Short: "Display effective merged configuration (flags + FLOWSK_* env + ~/.config/flowsk/config.yaml)",
+		Short: "Display effective merged configuration (flags + FLOWSK_* env + ~/.flowsk/config.yaml)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := cmd.Context().Err(); err != nil {

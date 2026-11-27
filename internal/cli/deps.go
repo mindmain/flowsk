@@ -13,7 +13,7 @@
 //  3. Strict Client-Only Local Path Isolation: Only client-side CLI commands
 //     (specifically project link, project unlink, project where, and implicit
 //     working-directory project resolution) interact with LocalPathRegistry
-//     (~/.config/flowsk/local_paths.json). Flowsk NEVER writes metadata files
+//     (~/.flowsk/local_paths.json). Flowsk NEVER writes metadata files
 //     inside a user's Git repository and NEVER transmits host filesystem paths
 //     to any server.
 package cli
@@ -65,7 +65,7 @@ type ServeConfig struct {
 }
 
 // LocalProjectBinding represents a strictly client-local mapping stored in
-// ~/.config/flowsk/local_paths.json associating a host directory on one
+// ~/.flowsk/local_paths.json associating a host directory on one
 // developer's workstation (e.g., Mario's ~/Desktop/app vs Paolo's
 // ~/Downloads/app) with a remote logical (WorkspaceID, ProjectID) pair.
 type LocalProjectBinding struct {
@@ -625,6 +625,9 @@ type CreateTaskInput struct {
 	// Title is the concise imperative task title.
 	Title string `json:"title"`
 
+	// Kind optionally classifies the task ("epic", "feature", "bug", "chore", "research").
+	Kind string `json:"kind,omitempty"`
+
 	// ExternalID optionally attaches a project-scoped external tracker ID (e.g., "CU-869abc").
 	ExternalID string `json:"external_id,omitempty"`
 
@@ -1102,6 +1105,9 @@ type TaskSummaryView struct {
 	// HasMarkdownDoc reports whether an extended Markdown document exists for this task.
 	HasMarkdownDoc bool `json:"has_markdown_doc,omitempty"`
 
+	// LastSignalAt is the optional UTC timestamp of the most recent agent/CLI/MCP signal.
+	LastSignalAt *time.Time `json:"last_signal_at,omitempty"`
+
 	// UpdatedAt is the UTC timestamp of the last modification.
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -1180,6 +1186,9 @@ type TaskView struct {
 
 	// HasMarkdownDoc reports whether an extended Markdown document exists for this task.
 	HasMarkdownDoc bool `json:"has_markdown_doc,omitempty"`
+
+	// LastSignalAt is the optional UTC timestamp of the most recent agent/CLI/MCP signal.
+	LastSignalAt *time.Time `json:"last_signal_at,omitempty"`
 
 	// CreatedAt is the UTC creation timestamp.
 	CreatedAt time.Time `json:"created_at"`
@@ -1609,16 +1618,16 @@ type DBPingView struct {
 
 // ConfigPathsView displays resolved user-scoped Flowsk client file locations.
 type ConfigPathsView struct {
-	// ConfigDir is the user-level configuration directory (~/.config/flowsk).
+	// ConfigDir is the user-level configuration directory (~/.flowsk).
 	ConfigDir string `json:"config_dir"`
 
-	// ConfigFile is the resolved YAML configuration path (~/.config/flowsk/config.yaml).
+	// ConfigFile is the resolved YAML configuration path (~/.flowsk/config.yaml).
 	ConfigFile string `json:"config_file"`
 
-	// LocalPathsFile is the client-only folder binding registry (~/.config/flowsk/local_paths.json).
+	// LocalPathsFile is the client-only folder binding registry (~/.flowsk/local_paths.json).
 	LocalPathsFile string `json:"local_paths_file"`
 
-	// LocalDBFile is the local embedded SQLite WAL database path (~/.local/share/flowsk/flowsk.db).
+	// LocalDBFile is the local embedded SQLite WAL database path (~/.flowsk/flowsk.db).
 	LocalDBFile string `json:"local_db_file"`
 }
 
@@ -2278,7 +2287,7 @@ type ProjectClient interface {
 }
 
 // LocalPathRegistry manages the client-only local path store at
-// ~/.config/flowsk/local_paths.json. Implementations must NEVER touch files
+// ~/.flowsk/local_paths.json. Implementations must NEVER touch files
 // inside target Git repositories and must NEVER send LocalDir values to any
 // remote Flowsk server.
 type LocalPathRegistry interface {

@@ -65,13 +65,13 @@ const (
 )
 
 // GlobalOptions holds root persistent CLI options bound to Viper (FLOWSK_*
-// environment variables + ~/.config/flowsk/config.yaml + explicit flags).
+// environment variables + ~/.flowsk/config.yaml + explicit flags).
 //
 // Dual-Mode Topology (Local-First Embedded + Optional Network Server):
 //   - Local Embedded Mode (Default when ServerURL is empty): Commands persist
 //     and read workspaces, projects, goals/objectives, tasks, and audit logs
 //     directly in the local SQLite WAL file (DBPath, defaulting to
-//     ~/.local/share/flowsk/flowsk.db) with zero background daemon required.
+//     ~/.flowsk/flowsk.db) with zero background daemon required.
 //   - Remote Network Mode (When --server-url or FLOWSK_SERVER_URL is set):
 //     Commands connect over HTTP/1.1 or HTTP/2 Buf Connect (`ConnectRPC`) to a
 //     shared `flowsk serve` instance so multiple developer machines, CI runners,
@@ -81,13 +81,13 @@ const (
 // Flowsk NEVER searches, reads, or writes configuration files inside the user's
 // working directory or target Git repository. Unless --config (or FLOWSK_CONFIG)
 // explicitly points elsewhere, configuration is loaded strictly from the
-// user-scoped ~/.config/flowsk/config.yaml file.
+// user-scoped ~/.flowsk/config.yaml file.
 type GlobalOptions struct {
-	// ConfigFile overrides the default ~/.config/flowsk/config.yaml path.
+	// ConfigFile overrides the default ~/.flowsk/config.yaml path.
 	ConfigFile string
 
 	// DBPath is the local SQLite database file path used in Local Embedded Mode
-	// when ServerURL is empty (FLOWSK_DB_PATH, default ~/.local/share/flowsk/flowsk.db).
+	// when ServerURL is empty (FLOWSK_DB_PATH, default ~/.flowsk/flowsk.db).
 	DBPath string
 
 	// ServerURL is the optional base HTTP/ConnectRPC URL of a remote or shared
@@ -105,7 +105,7 @@ type GlobalOptions struct {
 
 	// Project identifies the active logical project UUID or key (FLOWSK_PROJECT).
 	// When omitted on the client, CLI commands may consult the strictly local
-	// ~/.config/flowsk/local_paths.json registry for the current working folder,
+	// ~/.flowsk/local_paths.json registry for the current working folder,
 	// transmitting ONLY the resolved Project ID/Key when talking to a server.
 	Project string
 
@@ -202,19 +202,19 @@ func NewViper() *viper.Viper {
 
 // BindGlobalFlags attaches persistent global flags to rootCmd and binds each
 // flag to the provided Viper instance. Single-letter persistent shorthands that
-// would collide with subcommand flags (such as -f on `lang exec`) are
+// would collide with subcommand flags (such as -f on `code`) are
 // intentionally avoided.
 func BindGlobalFlags(rootCmd *cobra.Command, v *viper.Viper, opts *GlobalOptions) error {
 	pflags := rootCmd.PersistentFlags()
 
 	defaultDB, _ := DefaultLocalDBFile()
 
-	pflags.StringVar(&opts.ConfigFile, "config", "", "Path to client config file (default ~/.config/flowsk/config.yaml; never reads target repo)")
+	pflags.StringVar(&opts.ConfigFile, "config", "", "Path to client config file (default ~/.flowsk/config.yaml; never reads target repo)")
 	pflags.String("db-path", defaultDB, "Local SQLite database path used when --server-url is empty (env FLOWSK_DB_PATH)")
 	pflags.String("server-url", "", "Optional remote Flowsk ConnectRPC server URL; empty uses local SQLite directly (env FLOWSK_SERVER_URL)")
 	pflags.String("auth-token", "", "Optional bearer token for remote ConnectRPC servers (env FLOWSK_AUTH_TOKEN)")
 	pflags.String("workspace", "default", "Tenant workspace UUID or slug (env FLOWSK_WORKSPACE)")
-	pflags.String("project", "", "Logical project UUID or key; falls back to local ~/.config/flowsk/local_paths.json cwd binding (env FLOWSK_PROJECT)")
+	pflags.String("project", "", "Logical project UUID or key; falls back to local ~/.flowsk/local_paths.json cwd binding (env FLOWSK_PROJECT)")
 	pflags.String("actor", "", "Human or AI agent actor handle recorded on claims and audit logs (env FLOWSK_ACTOR)")
 	pflags.String("format", string(FormatAuto), "Output format: auto|human|compact|tsv|jsonl|json|md (auto = human on TTY, compact for agents; env FLOWSK_FORMAT)")
 	pflags.Int("max-tokens", 0, "Optional maximum token budget for rendered output (0 = unlimited; env FLOWSK_MAX_TOKENS)")
@@ -245,7 +245,7 @@ func BindGlobalFlags(rootCmd *cobra.Command, v *viper.Viper, opts *GlobalOptions
 }
 
 // LoadGlobalOptions loads user-level YAML configuration (strictly from
-// --config / FLOWSK_CONFIG or ~/.config/flowsk/config.yaml, never from the
+// --config / FLOWSK_CONFIG or ~/.flowsk/config.yaml, never from the
 // target Git repository), merges FLOWSK_* environment variables and CLI flags,
 // and validates effective option invariants.
 func LoadGlobalOptions(v *viper.Viper, opts *GlobalOptions) error {

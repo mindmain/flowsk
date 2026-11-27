@@ -53,7 +53,7 @@ func newTaskCommand(opts *GlobalOptions, deps taskCommandDeps) *cobra.Command {
 
 Tip for AI Agents:
   - Poll work in minimal tokens with 'flowsk task next' or 'flowsk task digest'.
-  - When creating or updating 3+ tasks/dependencies at once, prefer 'flowsk lang exec'
+  - When creating or updating 3+ tasks/dependencies at once, prefer 'flowsk code'
     to execute the entire batch atomically in a single round-trip.`,
 	}
 
@@ -81,6 +81,7 @@ Tip for AI Agents:
 
 func (h *taskHandler) newCreateSubcommand() *cobra.Command {
 	var (
+		kind        string
 		description string
 		externalID  string
 		objective   string
@@ -125,6 +126,7 @@ func (h *taskHandler) newCreateSubcommand() *cobra.Command {
 				Workspace:   ws,
 				Project:     proj,
 				Title:       title,
+				Kind:        strings.ToLower(strings.TrimSpace(kind)),
 				ExternalID:  strings.TrimSpace(externalID),
 				Description: strings.TrimSpace(description),
 				Objective:   strings.TrimSpace(objective),
@@ -146,6 +148,7 @@ func (h *taskHandler) newCreateSubcommand() *cobra.Command {
 	}
 
 	flags := cmd.Flags()
+	flags.StringVar(&kind, "kind", "", "Optional task classification: epic|feature|bug|chore|research")
 	flags.StringVar(&description, "description", "", "Concise technical task specification")
 	flags.StringVar(&externalID, "external-id", "", "Optional project-unique external tracker ID (e.g. ClickUp, Linear, Jira, GitHub)")
 	flags.StringVar(&objective, "objective", "", "Parent objective UUID or key")

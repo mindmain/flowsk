@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"text/tabwriter"
+	"unicode/utf8"
 )
 
 // ResolveOutputFormat resolves FormatAuto into FormatHuman for interactive TTYs
@@ -103,7 +104,7 @@ func enforceTokenBudget(text string, maxTokens int, format OutputFormat) string 
 			break
 		}
 		if len(kept) == 0 && need > maxBytes && maxBytes > 16 {
-			kept = append(kept, line[:maxBytes-3]+"...")
+			kept = append(kept, truncateUTF8RunesByBytes(line, maxBytes-3)+"...")
 			break
 		}
 		kept = append(kept, line)
@@ -114,6 +115,24 @@ func enforceTokenBudget(text string, maxTokens int, format OutputFormat) string 
 		kept = append(kept, fmt.Sprintf("... (+%d more lines omitted; --max-tokens=%d)", omitted, maxTokens))
 	}
 	return strings.Join(kept, "\n") + "\n"
+}
+
+func truncateUTF8RunesByBytes(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	var b strings.Builder
+	for _, r := range s {
+		rLen := utf8.RuneLen(r)
+		if rLen < 0 || b.Len()+rLen > maxBytes {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 func renderJSON(w io.Writer, payload any) error {
@@ -1012,7 +1031,7 @@ func renderHumanBoard(w io.Writer, v BoardView) error {
 		_, _ = fmt.Fprintf(w, "Tasks: %d | Active Leases: %d | Blocked: %d\n", v.TotalTasks, v.ActiveClaims, v.BlockedCount)
 	}
 	if v.OrphanIssuesCount > 0 {
-		_, _ = fmt.Fprintf(w, "\033[33m⚠ Warning: %d orphan or missing Markdown resource(s) detected in ~/.flowsk — run 'flowsk prune' to clean up.\033[0m\n", v.OrphanIssuesCount)
+		_, _ = fmt.Fprintln(w, tuiWarnStyle.Render(fmt.Sprintf("⚠ Warning: %d orphan or missing Markdown resource(s) detected in ~/.flowsk — run 'flowsk prune' to clean up.", v.OrphanIssuesCount)))
 	}
 
 	if len(v.Worktrees) > 0 {
@@ -1186,8 +1205,8 @@ func renderHumanAdminAndSystem(w io.Writer, payload any) error {
 			_, err := fmt.Fprintln(w, "No orphan .md files or broken database references found.")
 			return err
 		}
-		_, _ = fmt.Fprintf(w, "\033[33mDetected %d resource issue(s) (orphan task .md=%d, missing task .md=%d, orphan project .md=%d, missing project .md=%d):\033[0m\n",
-			v.TotalIssues, v.OrphanTaskFilesCount, v.MissingTaskFilesCount, v.OrphanProjectFilesCount, v.MissingProjectFilesCount)
+		_, _ = fmt.Fprintln(w, tuiWarnStyle.Render(fmt.Sprintf("Detected %d resource issue(s) (orphan task .md=%d, missing task .md=%d, orphan project .md=%d, missing project .md=%d):",
+			v.TotalIssues, v.OrphanTaskFilesCount, v.MissingTaskFilesCount, v.OrphanProjectFilesCount, v.MissingProjectFilesCount)))
 		for _, line := range v.IssueSummaries {
 			_, _ = fmt.Fprintf(w, "  - %s\n", line)
 		}

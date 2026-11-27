@@ -331,6 +331,42 @@ func openAdminAdapter(driver, dsn string) (db.DatabaseAdapter, error) {
 	}
 }
 
+type upToMigrationRunner interface {
+	UpTo(ctx context.Context, version int64) (int64, error)
+}
+
+func migrateAdapterUpTo(ctx context.Context, runner any, targetVersion int64) (int64, error) {
+	if upTo, ok := runner.(upToMigrationRunner); ok {
+		return upTo.UpTo(ctx, targetVersion)
+	}
+	mr, ok := runner.(db.MigrationRunner)
+	if !ok {
+		return 0, errs.Validation("app.MigrateUp", "migration runner unavailable")
+	}
+	statuses, err := mr.Status(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if len(statuses) > 0 && targetVersion < statuses[0].Version {
+		return 0, errs.Validation("app.MigrateUp", fmt.Sprintf("target migration version %d precedes earliest migration %d", targetVersion, statuses[0].Version))
+	}
+	ver, err := mr.Up(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for ver > targetVersion {
+		nextVer, downErr := mr.Down(ctx)
+		if downErr != nil {
+			return ver, downErr
+		}
+		if nextVer == ver {
+			break
+		}
+		ver = nextVer
+	}
+	return ver, nil
+}
+
 func (dbAdminBridge) MigrateUp(ctx context.Context, in cli.MigrateUpInput) (cli.MigrationResult, error) {
 	adapter, err := openAdminAdapter(in.Driver, in.DSN)
 	if err != nil {
@@ -340,7 +376,12 @@ func (dbAdminBridge) MigrateUp(ctx context.Context, in cli.MigrateUpInput) (cli.
 
 	before, _ := adapter.Migrations().Status(ctx)
 	appliedBefore := countApplied(before)
-	ver, err := adapter.Migrations().Up(ctx)
+	var ver int64
+	if in.TargetVersion > 0 {
+		ver, err = migrateAdapterUpTo(ctx, adapter.Migrations(), in.TargetVersion)
+	} else {
+		ver, err = adapter.Migrations().Up(ctx)
+	}
 	if err != nil {
 		return cli.MigrationResult{}, err
 	}

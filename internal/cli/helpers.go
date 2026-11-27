@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -44,7 +45,7 @@ func normalizeLocalDir(rawDir string) (string, error) {
 
 // resolveActiveProject resolves the effective (workspace, project) identifiers
 // from an explicit positional argument, --project / FLOWSK_PROJECT, or the
-// client-only ~/.config/flowsk/local_paths.json binding for the current working
+// client-only ~/.flowsk/local_paths.json binding for the current working
 // directory. Host filesystem paths are never returned to callers.
 func resolveActiveProject(ctx context.Context, opts *GlobalOptions, localPaths LocalPathRegistry, explicitProject string) (string, string, error) {
 	ws := defaultWorkspace(opts.Workspace)
@@ -213,6 +214,12 @@ func persistWorkspaceInConfig(opts *GlobalOptions, workspaceSlug string) (string
 	if srv := strings.TrimSpace(cfgViper.GetString("server-url")); srv != "" {
 		_, _ = fmt.Fprintf(&b, "server-url: %q\n", srv)
 	}
+	if authTok := strings.TrimSpace(cfgViper.GetString("auth-token")); authTok != "" {
+		_, _ = fmt.Fprintf(&b, "auth-token: %q\n", authTok)
+	}
+	if proj := strings.TrimSpace(cfgViper.GetString("project")); proj != "" {
+		_, _ = fmt.Fprintf(&b, "project: %q\n", proj)
+	}
 	if actor := strings.TrimSpace(cfgViper.GetString("actor")); actor != "" {
 		_, _ = fmt.Fprintf(&b, "actor: %q\n", actor)
 	}
@@ -223,10 +230,76 @@ func persistWorkspaceInConfig(opts *GlobalOptions, workspaceSlug string) (string
 		_, _ = fmt.Fprintf(&b, "max-tokens: %d\n", mt)
 	}
 
+	handled := map[string]bool{
+		"workspace":  true,
+		"db-path":    true,
+		"server-url": true,
+		"auth-token": true,
+		"project":    true,
+		"actor":      true,
+		"format":     true,
+		"max-tokens": true,
+	}
+	allSettings := cfgViper.AllSettings()
+	extraKeys := make([]string, 0, len(allSettings))
+	for k := range allSettings {
+		if !handled[strings.ToLower(k)] {
+			extraKeys = append(extraKeys, k)
+		}
+	}
+	slices.Sort(extraKeys)
+	for _, k := range extraKeys {
+		writeYAMLKeyValue(&b, k, allSettings[k], 0)
+	}
+
 	if err := writeSecureFile(cfgFile, []byte(b.String())); err != nil {
 		return "", err
 	}
 	return cfgFile, nil
+}
+
+func writeYAMLKeyValue(b *strings.Builder, key string, val any, indent int) {
+	pad := strings.Repeat("  ", indent)
+	switch v := val.(type) {
+	case nil:
+		return
+	case string:
+		_, _ = fmt.Fprintf(b, "%s%s: %q\n", pad, key, v)
+	case bool:
+		_, _ = fmt.Fprintf(b, "%s%s: %t\n", pad, key, v)
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		_, _ = fmt.Fprintf(b, "%s%s: %v\n", pad, key, v)
+	case []any:
+		if len(v) == 0 {
+			_, _ = fmt.Fprintf(b, "%s%s: []\n", pad, key)
+			return
+		}
+		_, _ = fmt.Fprintf(b, "%s%s:\n", pad, key)
+		for _, elem := range v {
+			switch ev := elem.(type) {
+			case string:
+				_, _ = fmt.Fprintf(b, "%s  - %q\n", pad, ev)
+			default:
+				_, _ = fmt.Fprintf(b, "%s  - %v\n", pad, ev)
+			}
+		}
+	case map[string]any:
+		if len(v) == 0 {
+			_, _ = fmt.Fprintf(b, "%s%s: {}\n", pad, key)
+			return
+		}
+		_, _ = fmt.Fprintf(b, "%s%s:\n", pad, key)
+		subKeys := make([]string, 0, len(v))
+		for sk := range v {
+			subKeys = append(subKeys, sk)
+		}
+		slices.Sort(subKeys)
+		for _, sk := range subKeys {
+			writeYAMLKeyValue(b, sk, v[sk], indent+1)
+		}
+	default:
+		_, _ = fmt.Fprintf(b, "%s%s: %q\n", pad, key, fmt.Sprint(v))
+	}
 }
 
 func readExclusiveTextInput(stdin io.Reader, inlineText, filePath string, fromStdin bool, kindLabel string) (string, error) {

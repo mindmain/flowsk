@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -76,8 +77,19 @@ func (h *dbHandler) resolveDriverAndDSN() (string, string, error) {
 		return "", "", err
 	}
 	dsn := strings.TrimSpace(h.v.GetString("db-dsn"))
-	if !h.dbCmd.PersistentFlags().Changed("db-dsn") && driver == "sqlite" && strings.TrimSpace(h.opts.DBPath) != "" {
-		dsn = strings.TrimSpace(h.opts.DBPath)
+	if !h.dbCmd.PersistentFlags().Changed("db-dsn") && strings.TrimSpace(os.Getenv("FLOWSK_DB_DSN")) == "" && !h.v.InConfig("db-dsn") && !h.v.InConfig("db_dsn") {
+		switch driver {
+		case "postgres":
+			if pgDSN := strings.TrimSpace(os.Getenv("FLOWSK_POSTGRES_DSN")); pgDSN != "" {
+				dsn = pgDSN
+			}
+		case "sqlite":
+			if sqlitePath := strings.TrimSpace(os.Getenv("FLOWSK_SQLITE_PATH")); sqlitePath != "" {
+				dsn = sqlitePath
+			} else if strings.TrimSpace(h.opts.DBPath) != "" {
+				dsn = strings.TrimSpace(h.opts.DBPath)
+			}
+		}
 	}
 	if dsn == "" {
 		return "", "", errors.New("--db-dsn must not be empty")

@@ -286,3 +286,57 @@ func TestSecretHygiene_RedactsDSNAndAuthToken(t *testing.T) {
 		t.Fatalf("expected ClientConfig String() to redact AuthToken, got %q", fmt.Sprint(cli))
 	}
 }
+
+// TestLoadServerConfig_ServeEnvAliases verifies that canonical `flowsk serve`
+// environment aliases (`LISTEN`, `HTTP_ADDR`, `DB_DRIVER`, `DB_DSN`, and `FLOWSK_HOME`)
+// resolve consistently with `serve.go`.
+func TestLoadServerConfig_ServeEnvAliases(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("FLOWSK_HOME", tmpHome)
+
+	loader := config.NewLoader()
+
+	// 1. Canonical LISTEN + DB_DSN for SQLite.
+	t.Setenv("TESTALIAS_LISTEN", ":19090")
+	t.Setenv("TESTALIAS_HTTP_ADDR", ":19999")
+	t.Setenv("TESTALIAS_DB_DRIVER", "sqlite")
+	t.Setenv("TESTALIAS_DB_DSN", "/data/flowsk/custom.db")
+	t.Setenv("TESTALIAS_SQLITE_PATH", "/data/flowsk/legacy.db")
+
+	sqliteCfg, err := loader.LoadServerConfig(context.Background(), config.LoadOptions{
+		EnvPrefix: "TESTALIAS",
+	})
+	if err != nil {
+		t.Fatalf("LoadServerConfig SQLite aliases failed: %v", err)
+	}
+	if sqliteCfg.HTTP.ListenAddr != ":19090" {
+		t.Fatalf("expected LISTEN alias :19090 to win over HTTP_ADDR, got %q", sqliteCfg.HTTP.ListenAddr)
+	}
+	if sqliteCfg.Database.Dialect != db.DialectSQLite {
+		t.Fatalf("expected dialect sqlite, got %q", sqliteCfg.Database.Dialect)
+	}
+	if sqliteCfg.Database.SQLite.FilePath != "/data/flowsk/custom.db" {
+		t.Fatalf("expected DB_DSN /data/flowsk/custom.db, got %q", sqliteCfg.Database.SQLite.FilePath)
+	}
+
+	// 2. Fallback HTTP_ADDR + DB_DRIVER=postgres + DB_DSN.
+	t.Setenv("TESTALIASPG_HTTP_ADDR", "0.0.0.0:18088")
+	t.Setenv("TESTALIASPG_DB_DRIVER", "postgres")
+	t.Setenv("TESTALIASPG_DB_DSN", "postgres://flowsk:secret@pg.local:5432/flowsk?sslmode=disable")
+
+	pgCfg, err := loader.LoadServerConfig(context.Background(), config.LoadOptions{
+		EnvPrefix: "TESTALIASPG",
+	})
+	if err != nil {
+		t.Fatalf("LoadServerConfig Postgres aliases failed: %v", err)
+	}
+	if pgCfg.HTTP.ListenAddr != "0.0.0.0:18088" {
+		t.Fatalf("expected HTTP_ADDR fallback 0.0.0.0:18088, got %q", pgCfg.HTTP.ListenAddr)
+	}
+	if pgCfg.Database.Dialect != db.DialectPostgres {
+		t.Fatalf("expected dialect postgres from DB_DRIVER, got %q", pgCfg.Database.Dialect)
+	}
+	if pgCfg.Database.Postgres.DSN != "postgres://flowsk:secret@pg.local:5432/flowsk?sslmode=disable" {
+		t.Fatalf("expected Postgres DSN from DB_DSN, got %q", pgCfg.Database.Postgres.DSN)
+	}
+}

@@ -5,6 +5,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -64,12 +65,28 @@ Zero Host Path Exposure:
 				return err
 			}
 			listenAddr := strings.TrimSpace(h.v.GetString("listen"))
+			if !cmd.Flags().Changed("listen") && strings.TrimSpace(os.Getenv("FLOWSK_LISTEN")) == "" && !h.v.InConfig("listen") {
+				if httpAddr := strings.TrimSpace(os.Getenv("FLOWSK_HTTP_ADDR")); httpAddr != "" {
+					listenAddr = httpAddr
+				}
+			}
 			if listenAddr == "" {
 				return errors.New("--listen must not be empty")
 			}
 			dsn := strings.TrimSpace(h.v.GetString("db-dsn"))
-			if !cmd.Flags().Changed("db-dsn") && driver == "sqlite" && strings.TrimSpace(h.opts.DBPath) != "" && h.v.GetString("db_dsn") == "" {
-				dsn = strings.TrimSpace(h.opts.DBPath)
+			if !cmd.Flags().Changed("db-dsn") && strings.TrimSpace(os.Getenv("FLOWSK_DB_DSN")) == "" && !h.v.InConfig("db-dsn") && !h.v.InConfig("db_dsn") {
+				switch driver {
+				case "postgres":
+					if pgDSN := strings.TrimSpace(os.Getenv("FLOWSK_POSTGRES_DSN")); pgDSN != "" {
+						dsn = pgDSN
+					}
+				case "sqlite":
+					if sqlitePath := strings.TrimSpace(os.Getenv("FLOWSK_SQLITE_PATH")); sqlitePath != "" {
+						dsn = sqlitePath
+					} else if strings.TrimSpace(h.opts.DBPath) != "" {
+						dsn = strings.TrimSpace(h.opts.DBPath)
+					}
+				}
 			}
 			if dsn == "" {
 				return errors.New("--db-dsn must not be empty")

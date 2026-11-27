@@ -7,6 +7,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,6 +23,8 @@ import (
 	"github.com/mindmain/flowsk/internal/cli"
 	"github.com/mindmain/flowsk/internal/domain/authctx"
 	"github.com/mindmain/flowsk/internal/domain/errs"
+	"github.com/mindmain/flowsk/internal/domain/task"
+	"github.com/mindmain/flowsk/internal/domain/tx"
 	"github.com/mindmain/flowsk/internal/language"
 	"github.com/mindmain/flowsk/internal/transport/connectrpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -117,6 +120,36 @@ func (c *dualModeClient) openRemoteSession(ctx context.Context, opts cli.GlobalO
 	}, nil
 }
 
+func (s *remoteSession) resolveOrRegisterRemoteActor(actorRef string) (string, error) {
+	trimmed := strings.TrimSpace(actorRef)
+	if trimmed == "" {
+		return "", nil
+	}
+	if _, err := uuid.Parse(trimmed); err == nil {
+		return trimmed, nil
+	}
+	handle := sanitizeActorHandle(trimmed)
+	pbKind := flowsk_workspace_pb.ActorKind_ACTOR_KIND_HUMAN
+	if classifyActorKind("", handle) == authctx.ActorKindAgent {
+		pbKind = flowsk_workspace_pb.ActorKind_ACTOR_KIND_AGENT
+	}
+	actorStr := s.actorID.String()
+	resp, err := s.prov.WorkspaceClient().RegisterActor(s.ctx, connect.NewRequest(&flowsk_workspace_pb.RegisterActorRequest{
+		WorkspaceId: s.workspaceID.String(),
+		ActorId:     &actorStr,
+		Kind:        pbKind,
+		Handle:      handle,
+		DisplayName: handle,
+	}))
+	if err != nil {
+		return "", err
+	}
+	if resp.Msg.GetActor() != nil && strings.TrimSpace(resp.Msg.GetActor().GetId()) != "" {
+		return resp.Msg.GetActor().GetId(), nil
+	}
+	return deterministicUUID("actor", s.workspaceID.String(), handle).String(), nil
+}
+
 func (s *remoteSession) resolveRemoteProject(projectRef string) (*flowsk_project_pb.Project, error) {
 	ref := strings.TrimSpace(projectRef)
 	if ref == "" {
@@ -156,37 +189,57 @@ func (s *remoteSession) resolveRemoteProject(projectRef string) (*flowsk_project
 	return nil, errs.New(errs.ErrNotFound, "app.resolveRemoteProject", fmt.Sprintf("remote project %q not found", ref))
 }
 
+func newRemoteTaskRequest[T any](msg *T, suppressSignal bool) *connect.Request[T] {
+	req := connect.NewRequest(msg)
+	if suppressSignal {
+		req.Header().Set(connectrpc.HeaderSuppressSignal, "1")
+	}
+	return req
+}
+
 func (s *remoteSession) resolveRemoteTask(taskRef string) (*flowsk_task_pb.Task, []*flowsk_task_pb.TaskRelation, error) {
-	return s.resolveRemoteTaskInProject("", taskRef)
+	return s.resolveRemoteTaskWithOpts("", taskRef, false)
+}
+
+func (s *remoteSession) resolveRemoteTaskQuiet(taskRef string) (*flowsk_task_pb.Task, []*flowsk_task_pb.TaskRelation, error) {
+	return s.resolveRemoteTaskWithOpts("", taskRef, true)
 }
 
 func (s *remoteSession) resolveRemoteTaskInProject(projectRef, taskRef string) (*flowsk_task_pb.Task, []*flowsk_task_pb.TaskRelation, error) {
+	return s.resolveRemoteTaskWithOpts(projectRef, taskRef, false)
+}
+
+func (s *remoteSession) resolveRemoteTaskInProjectQuiet(projectRef, taskRef string) (*flowsk_task_pb.Task, []*flowsk_task_pb.TaskRelation, error) {
+	return s.resolveRemoteTaskWithOpts(projectRef, taskRef, true)
+}
+
+func (s *remoteSession) resolveRemoteTaskWithOpts(projectRef, taskRef string, suppressSignal bool) (*flowsk_task_pb.Task, []*flowsk_task_pb.TaskRelation, error) {
 	ref := strings.TrimSpace(taskRef)
 	if _, err := uuid.Parse(ref); err == nil {
-		resp, gErr := s.prov.TaskClient().GetTask(s.ctx, connect.NewRequest(&flowsk_task_pb.GetTaskRequest{
+		resp, gErr := s.prov.TaskClient().GetTask(s.ctx, newRemoteTaskRequest(&flowsk_task_pb.GetTaskRequest{
 			WorkspaceId: s.workspaceID.String(),
 			ActorId:     s.actorID.String(),
 			TaskId:      ref,
-		}))
+		}, suppressSignal))
 		if gErr != nil {
 			return nil, nil, gErr
 		}
 		return resp.Msg.GetTask(), resp.Msg.GetRelations(), nil
 	}
-	if resp, err := s.prov.TaskClient().GetTaskByIdentifier(s.ctx, connect.NewRequest(&flowsk_task_pb.GetTaskByIdentifierRequest{
+	if resp, err := s.prov.TaskClient().GetTaskByIdentifier(s.ctx, newRemoteTaskRequest(&flowsk_task_pb.GetTaskByIdentifierRequest{
 		WorkspaceId: s.workspaceID.String(),
 		ActorId:     s.actorID.String(),
 		Identifier:  strings.ToUpper(ref),
-	})); err == nil {
+	}, suppressSignal)); err == nil {
 		return resp.Msg.GetTask(), resp.Msg.GetRelations(), nil
 	} else if strings.TrimSpace(projectRef) != "" {
 		if p, pErr := s.resolveRemoteProject(projectRef); pErr == nil {
-			if extResp, extErr := s.prov.TaskClient().GetTaskByExternalId(s.ctx, connect.NewRequest(&flowsk_task_pb.GetTaskByExternalIdRequest{
+			if extResp, extErr := s.prov.TaskClient().GetTaskByExternalId(s.ctx, newRemoteTaskRequest(&flowsk_task_pb.GetTaskByExternalIdRequest{
 				WorkspaceId: s.workspaceID.String(),
 				ActorId:     s.actorID.String(),
 				ProjectId:   p.GetId(),
 				ExternalId:  ref,
-			})); extErr == nil {
+			}, suppressSignal)); extErr == nil {
 				return extResp.Msg.GetTask(), extResp.Msg.GetRelations(), nil
 			}
 		}
@@ -699,19 +752,30 @@ func (c *dualModeClient) remoteListObjectives(ctx context.Context, opts cli.Glob
 		pid := p.GetId()
 		projIDPtr = &pid
 	}
+	kindFilter := strings.ToLower(strings.TrimSpace(in.Kind))
+	statusFilter := strings.ToLower(strings.TrimSpace(in.Status))
 	resp, err := sess.prov.ObjectiveClient().ListObjectives(sess.ctx, connect.NewRequest(&flowsk_objective_pb.ListObjectivesRequest{
-		WorkspaceId: sess.workspaceID.String(),
-		ActorId:     sess.actorID.String(),
-		ProjectId:   projIDPtr,
-		PageSize:    int32(min(max(1, in.Limit), 200)),
-		PageToken:   in.Cursor,
+		WorkspaceId:  sess.workspaceID.String(),
+		ActorId:      sess.actorID.String(),
+		ProjectId:    projIDPtr,
+		KindFilter:   mapCLIObjectiveKindToProto(kindFilter),
+		StatusFilter: mapCLIObjectiveStatusToProto(statusFilter),
+		PageSize:     int32(min(max(1, in.Limit), 200)),
+		PageToken:    in.Cursor,
 	}))
 	if err != nil {
 		return cli.ObjectiveListResult{}, err
 	}
 	var out []cli.ObjectiveView
 	for _, o := range resp.Msg.GetObjectives() {
-		out = append(out, protoObjectiveToCLI(o))
+		ov := protoObjectiveToCLI(o)
+		if kindFilter != "" && !strings.EqualFold(ov.Kind, kindFilter) {
+			continue
+		}
+		if statusFilter != "" && !matchesRemoteObjectiveStatus(ov.Status, statusFilter) {
+			continue
+		}
+		out = append(out, ov)
 	}
 	return cli.ObjectiveListResult{Items: out, NextCursor: resp.Msg.GetNextPageToken()}, nil
 }
@@ -738,13 +802,30 @@ func (c *dualModeClient) remoteUpdateObjective(ctx context.Context, opts cli.Glo
 	if err != nil {
 		return cli.ObjectiveView{}, err
 	}
-	resp, err := sess.prov.ObjectiveClient().UpdateObjective(sess.ctx, connect.NewRequest(&flowsk_objective_pb.UpdateObjectiveRequest{
-		WorkspaceId: sess.workspaceID.String(),
-		ActorId:     sess.actorID.String(),
-		ObjectiveId: cur.ID,
-		Title:       in.Title,
-		Description: in.Summary,
-	}))
+	req := &flowsk_objective_pb.UpdateObjectiveRequest{
+		WorkspaceId:     sess.workspaceID.String(),
+		ActorId:         sess.actorID.String(),
+		ObjectiveId:     cur.ID,
+		Title:           in.Title,
+		Description:     in.Summary,
+		SuccessCriteria: in.Summary,
+	}
+	if in.Status != nil && strings.TrimSpace(*in.Status) != "" {
+		req.Status = mapCLIObjectiveStatusToProto(*in.Status)
+	}
+	if in.TargetDate != nil {
+		trimmedTD := strings.TrimSpace(*in.TargetDate)
+		if trimmedTD == "" {
+			req.ClearTargetDate = true
+		} else {
+			parsed, pErr := time.Parse("2006-01-02", trimmedTD)
+			if pErr != nil {
+				return cli.ObjectiveView{}, errs.Validation("app.remoteUpdateObjective", "invalid --target-date: expected YYYY-MM-DD")
+			}
+			req.TargetDate = timestamppb.New(parsed.UTC())
+		}
+	}
+	resp, err := sess.prov.ObjectiveClient().UpdateObjective(sess.ctx, connect.NewRequest(req))
 	if err != nil {
 		return cli.ObjectiveView{}, err
 	}
@@ -761,7 +842,7 @@ func (c *dualModeClient) remoteCloseObjective(ctx context.Context, opts cli.Glob
 		return cli.ObjectiveView{}, err
 	}
 	term := flowsk_objective_pb.ObjectiveStatus_OBJECTIVE_STATUS_ACHIEVED
-	if strings.EqualFold(in.Resolution, "canceled") || strings.EqualFold(in.Resolution, "dropped") {
+	if strings.EqualFold(in.Resolution, "canceled") || strings.EqualFold(in.Resolution, "superseded") || strings.EqualFold(in.Resolution, "dropped") {
 		term = flowsk_objective_pb.ObjectiveStatus_OBJECTIVE_STATUS_DROPPED
 	}
 	resp, err := sess.prov.ObjectiveClient().CloseObjective(sess.ctx, connect.NewRequest(&flowsk_objective_pb.CloseObjectiveRequest{
@@ -788,17 +869,49 @@ func (c *dualModeClient) remoteCreateTask(ctx context.Context, opts cli.GlobalOp
 	}
 	var objIDPtr *string
 	if strings.TrimSpace(in.Objective) != "" {
-		if o, oErr := c.remoteGetObjective(ctx, opts, in.Workspace, in.Project, in.Objective); oErr == nil {
-			objIDPtr = &o.ID
+		o, oErr := c.remoteGetObjective(ctx, opts, in.Workspace, in.Project, in.Objective)
+		if oErr != nil {
+			return cli.TaskView{}, oErr
 		}
+		objIDPtr = &o.ID
 	}
 	var parentIDPtr *string
 	if strings.TrimSpace(in.Parent) != "" {
-		if pt, _, ptErr := sess.resolveRemoteTask(in.Parent); ptErr == nil {
-			pid := pt.GetId()
-			parentIDPtr = &pid
+		pt, _, ptErr := sess.resolveRemoteTaskInProjectQuiet(in.Project, in.Parent)
+		if ptErr != nil {
+			return cli.TaskView{}, ptErr
+		}
+		pid := pt.GetId()
+		parentIDPtr = &pid
+	}
+
+	var blockerIDs []string
+	seenBlockers := make(map[string]bool, len(in.DependsOn))
+	for _, dep := range in.DependsOn {
+		if strings.TrimSpace(dep) == "" {
+			continue
+		}
+		up, _, upErr := sess.resolveRemoteTaskInProjectQuiet(in.Project, dep)
+		if upErr != nil {
+			return cli.TaskView{}, upErr
+		}
+		if !seenBlockers[up.GetId()] {
+			seenBlockers[up.GetId()] = true
+			blockerIDs = append(blockerIDs, up.GetId())
 		}
 	}
+
+	var assigneeIDPtr *string
+	if strings.TrimSpace(in.Assignee) != "" {
+		aid, aErr := sess.resolveOrRegisterRemoteActor(in.Assignee)
+		if aErr != nil {
+			return cli.TaskView{}, aErr
+		}
+		if aid != "" {
+			assigneeIDPtr = &aid
+		}
+	}
+
 	var stateIDPtr *string
 	if strings.TrimSpace(in.State) != "" {
 		projUUID, _ := uuid.Parse(p.GetId())
@@ -809,7 +922,7 @@ func (c *dualModeClient) remoteCreateTask(ctx context.Context, opts cli.GlobalOp
 		WorkspaceId:        sess.workspaceID.String(),
 		ActorId:            sess.actorID.String(),
 		ProjectId:          p.GetId(),
-		Kind:               flowsk_task_pb.TaskKind_TASK_KIND_FEATURE,
+		Kind:               mapCLITaskKindToProto(in.Kind),
 		Priority:           mapCLIPriorityToProto(in.Priority),
 		WorkflowStateId:    stateIDPtr,
 		Title:              in.Title,
@@ -817,28 +930,31 @@ func (c *dualModeClient) remoteCreateTask(ctx context.Context, opts cli.GlobalOp
 		AcceptanceCriteria: in.Acceptance,
 		ObjectiveId:        objIDPtr,
 		ParentTaskId:       parentIDPtr,
+		AssigneeActorId:    assigneeIDPtr,
 		EstimatePoints:     int32(max(0, in.Estimate)),
 		ExternalId:         strings.TrimSpace(in.ExternalID),
+		Tags:               in.Labels,
 	}))
 	if err != nil {
 		return cli.TaskView{}, err
 	}
 	created := resp.Msg.GetTask()
-	for _, dep := range in.DependsOn {
-		if strings.TrimSpace(dep) == "" {
-			continue
-		}
-		if up, _, upErr := sess.resolveRemoteTask(dep); upErr == nil {
-			_, _ = sess.prov.TaskClient().AddTaskRelation(sess.ctx, connect.NewRequest(&flowsk_task_pb.AddTaskRelationRequest{
-				WorkspaceId:  sess.workspaceID.String(),
-				ActorId:      sess.actorID.String(),
-				SourceTaskId: up.GetId(),
-				TargetTaskId: created.GetId(),
-				RelationType: flowsk_task_pb.TaskRelationType_TASK_RELATION_TYPE_BLOCKS,
-			}))
+	for _, blockerID := range blockerIDs {
+		if _, relErr := sess.prov.TaskClient().AddTaskRelation(sess.ctx, connect.NewRequest(&flowsk_task_pb.AddTaskRelationRequest{
+			WorkspaceId:  sess.workspaceID.String(),
+			ActorId:      sess.actorID.String(),
+			SourceTaskId: blockerID,
+			TargetTaskId: created.GetId(),
+			RelationType: flowsk_task_pb.TaskRelationType_TASK_RELATION_TYPE_BLOCKS,
+		})); relErr != nil && connect.CodeOf(relErr) != connect.CodeAlreadyExists {
+			return cli.TaskView{}, relErr
 		}
 	}
-	return protoTaskToCLI(created), nil
+	reloaded, rels, rErr := sess.resolveRemoteTaskQuiet(created.GetId())
+	if rErr != nil {
+		return protoTaskToCLIWithRelations(sess, created, nil), nil
+	}
+	return protoTaskToCLIWithRelations(sess, reloaded, rels), nil
 }
 
 func (c *dualModeClient) remoteListTasks(ctx context.Context, opts cli.GlobalOptions, in cli.ListTasksInput) (cli.TaskListResult, error) {
@@ -861,13 +977,21 @@ func (c *dualModeClient) remoteListTasks(ctx context.Context, opts cli.GlobalOpt
 	if extFilter != "" {
 		extFilterPtr = &extFilter
 	}
+	reqTags := append([]string(nil), in.Labels...)
+	reqTags = append(reqTags, parsedQ.Tags...)
+	effActor := firstNonEmpty(in.Assignee, parsedQ.Actor)
+	var effActorID string
+	if effActor != "" {
+		effActorID, _ = sess.resolveOrRegisterRemoteActor(effActor)
+	}
+
 	resp, err := sess.prov.TaskClient().ListTasks(sess.ctx, connect.NewRequest(&flowsk_task_pb.ListTasksRequest{
 		WorkspaceId:      sess.workspaceID.String(),
 		ActorId:          sess.actorID.String(),
 		ProjectId:        projIDPtr,
 		UnclaimedOnly:    in.Unclaimed,
 		ExternalIdFilter: extFilterPtr,
-		PageSize:         int32(min(max(1, in.Limit), 200)),
+		PageSize:         int32(min(max(100, in.Limit*2), 200)),
 		PageToken:        in.Cursor,
 	}))
 	if err != nil {
@@ -900,6 +1024,22 @@ func (c *dualModeClient) remoteListTasks(ctx context.Context, opts cli.GlobalOpt
 				continue
 			}
 		}
+		if in.Priority >= 0 && sv.Priority != in.Priority {
+			continue
+		}
+		if parsedQ.Priority != nil && sv.Priority != mapDomainPriorityToCLI(*parsedQ.Priority) {
+			continue
+		}
+		if len(reqTags) > 0 && !hasAllRemoteTags(sv.Labels, reqTags) {
+			continue
+		}
+		if effActor != "" {
+			matchedActor := strings.EqualFold(sv.Holder, effActor) ||
+				(effActorID != "" && (strings.EqualFold(t.GetClaimedByActorId(), effActorID) || strings.EqualFold(t.GetAssigneeActorId(), effActorID)))
+			if !matchedActor {
+				continue
+			}
+		}
 		if (in.Blocked || (parsedQ.Blocked != nil && *parsedQ.Blocked)) && !sv.Blocked {
 			continue
 		}
@@ -907,6 +1047,9 @@ func (c *dualModeClient) remoteListTasks(ctx context.Context, opts cli.GlobalOpt
 			continue
 		}
 		out = append(out, sv)
+		if in.Limit > 0 && len(out) >= in.Limit {
+			break
+		}
 	}
 	return cli.TaskListResult{Items: out, NextCursor: resp.Msg.GetNextPageToken()}, nil
 }
@@ -916,11 +1059,11 @@ func (c *dualModeClient) remoteGetTask(ctx context.Context, opts cli.GlobalOptio
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	t, _, err := sess.resolveRemoteTaskInProject(in.Project, in.Task)
+	t, rels, err := sess.resolveRemoteTaskInProject(in.Project, in.Task)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	return protoTaskToCLI(t), nil
+	return protoTaskToCLIWithRelations(sess, t, rels), nil
 }
 
 func (c *dualModeClient) remoteUpdateTask(ctx context.Context, opts cli.GlobalOptions, in cli.UpdateTaskInput) (cli.TaskView, error) {
@@ -928,7 +1071,7 @@ func (c *dualModeClient) remoteUpdateTask(ctx context.Context, opts cli.GlobalOp
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	t, _, err := sess.resolveRemoteTaskInProject(in.Project, in.Task)
+	t, _, err := sess.resolveRemoteTaskInProjectQuiet(in.Project, in.Task)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
@@ -951,11 +1094,75 @@ func (c *dualModeClient) remoteUpdateTask(ctx context.Context, opts cli.GlobalOp
 	if in.Priority != nil {
 		req.Priority = mapCLIPriorityToProto(*in.Priority)
 	}
+	if in.Objective != nil {
+		trimmed := strings.TrimSpace(*in.Objective)
+		if trimmed == "" {
+			req.ClearObjective = true
+		} else {
+			o, oErr := c.remoteGetObjective(ctx, opts, in.Workspace, firstNonEmpty(in.Project, t.GetProjectId()), trimmed)
+			if oErr != nil {
+				return cli.TaskView{}, oErr
+			}
+			req.ObjectiveId = &o.ID
+		}
+	}
+	if in.Parent != nil {
+		trimmed := strings.TrimSpace(*in.Parent)
+		if trimmed == "" {
+			req.ClearParentTask = true
+		} else {
+			pt, _, ptErr := sess.resolveRemoteTaskInProjectQuiet(in.Project, trimmed)
+			if ptErr != nil {
+				return cli.TaskView{}, ptErr
+			}
+			pid := pt.GetId()
+			req.ParentTaskId = &pid
+		}
+	}
+	if in.Assignee != nil {
+		trimmed := strings.TrimSpace(*in.Assignee)
+		if trimmed == "" {
+			req.ClearAssignee = true
+		} else {
+			aid, aErr := sess.resolveOrRegisterRemoteActor(trimmed)
+			if aErr != nil {
+				return cli.TaskView{}, aErr
+			}
+			req.AssigneeActorId = &aid
+		}
+	}
+	if len(in.AddLabels) > 0 || len(in.RemoveLabels) > 0 {
+		tagSet := make(map[string]bool)
+		for _, tg := range t.GetTags() {
+			tagSet[tg] = true
+		}
+		for _, tg := range in.AddLabels {
+			tagSet[tg] = true
+		}
+		for _, tg := range in.RemoveLabels {
+			delete(tagSet, tg)
+		}
+		merged := make([]string, 0, len(tagSet))
+		for tg := range tagSet {
+			merged = append(merged, tg)
+		}
+		sort.Strings(merged)
+		req.Tags = merged
+		req.ReplaceTags = true
+	}
+	if in.Estimate != nil {
+		est := int32(*in.Estimate)
+		req.EstimatePoints = &est
+	}
 	resp, err := sess.prov.TaskClient().UpdateTask(sess.ctx, connect.NewRequest(req))
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	return protoTaskToCLI(resp.Msg.GetTask()), nil
+	reloaded, rels, rErr := sess.resolveRemoteTaskQuiet(resp.Msg.GetTask().GetId())
+	if rErr != nil {
+		return protoTaskToCLIWithRelations(sess, resp.Msg.GetTask(), nil), nil
+	}
+	return protoTaskToCLIWithRelations(sess, reloaded, rels), nil
 }
 
 func (c *dualModeClient) remoteMoveTask(ctx context.Context, opts cli.GlobalOptions, in cli.MoveTaskInput) (cli.TaskView, error) {
@@ -963,7 +1170,7 @@ func (c *dualModeClient) remoteMoveTask(ctx context.Context, opts cli.GlobalOpti
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	t, _, err := sess.resolveRemoteTask(in.Task)
+	t, _, err := sess.resolveRemoteTaskQuiet(in.Task)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
@@ -981,7 +1188,7 @@ func (c *dualModeClient) remoteMoveTask(ctx context.Context, opts cli.GlobalOpti
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	return protoTaskToCLI(resp.Msg.GetTask()), nil
+	return protoTaskToCLIWithRelations(sess, resp.Msg.GetTask(), nil), nil
 }
 
 func (c *dualModeClient) remoteClaimTask(ctx context.Context, opts cli.GlobalOptions, in cli.ClaimTaskInput) (cli.TaskView, error) {
@@ -989,7 +1196,7 @@ func (c *dualModeClient) remoteClaimTask(ctx context.Context, opts cli.GlobalOpt
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	t, _, err := sess.resolveRemoteTask(in.Task)
+	t, _, err := sess.resolveRemoteTaskQuiet(in.Task)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
@@ -1002,7 +1209,20 @@ func (c *dualModeClient) remoteClaimTask(ctx context.Context, opts cli.GlobalOpt
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	return protoTaskToCLI(resp.Msg.GetTask()), nil
+	if strings.TrimSpace(in.Note) != "" {
+		_, _ = sess.prov.TaskClient().AddTaskComment(sess.ctx, connect.NewRequest(&flowsk_task_pb.AddTaskCommentRequest{
+			WorkspaceId: sess.workspaceID.String(),
+			ActorId:     sess.actorID.String(),
+			TaskId:      t.GetId(),
+			Kind:        flowsk_task_pb.TaskCommentKind_TASK_COMMENT_KIND_COMMENT,
+			Body:        in.Note,
+		}))
+	}
+	reloaded, rels, rErr := sess.resolveRemoteTaskQuiet(t.GetId())
+	if rErr != nil {
+		return protoTaskToCLIWithRelations(sess, resp.Msg.GetTask(), nil), nil
+	}
+	return protoTaskToCLIWithRelations(sess, reloaded, rels), nil
 }
 
 func (c *dualModeClient) remoteReleaseTask(ctx context.Context, opts cli.GlobalOptions, in cli.ReleaseTaskInput) (cli.TaskView, error) {
@@ -1020,20 +1240,22 @@ func (c *dualModeClient) remoteReleaseTask(ctx context.Context, opts cli.GlobalO
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	t, _, err := sess.resolveRemoteTask(in.Task)
+	t, _, err := sess.resolveRemoteTaskQuiet(in.Task)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
+	forceRelease := t.GetClaimedByActorId() != "" && t.GetClaimedByActorId() != sess.actorID.String()
 	resp, err := sess.prov.TaskClient().ReleaseTaskClaim(sess.ctx, connect.NewRequest(&flowsk_task_pb.ReleaseTaskClaimRequest{
 		WorkspaceId: sess.workspaceID.String(),
 		ActorId:     sess.actorID.String(),
 		TaskId:      t.GetId(),
 		HandoffNote: in.Note,
+		Force:       forceRelease,
 	}))
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	return protoTaskToCLI(resp.Msg.GetTask()), nil
+	return protoTaskToCLIWithRelations(sess, resp.Msg.GetTask(), nil), nil
 }
 
 func (c *dualModeClient) remoteBlockTask(ctx context.Context, opts cli.GlobalOptions, in cli.BlockTaskInput) (cli.TaskView, error) {
@@ -1041,26 +1263,56 @@ func (c *dualModeClient) remoteBlockTask(ctx context.Context, opts cli.GlobalOpt
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	t, _, err := sess.resolveRemoteTask(in.Task)
+	t, _, err := sess.resolveRemoteTaskInProjectQuiet(in.Project, in.Task)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
+	var addedBlockers int
 	for _, ref := range in.BlockedBy {
-		if up, _, upErr := sess.resolveRemoteTask(ref); upErr == nil {
-			_, _ = sess.prov.TaskClient().AddTaskRelation(sess.ctx, connect.NewRequest(&flowsk_task_pb.AddTaskRelationRequest{
-				WorkspaceId:  sess.workspaceID.String(),
-				ActorId:      sess.actorID.String(),
-				SourceTaskId: up.GetId(),
-				TargetTaskId: t.GetId(),
-				RelationType: flowsk_task_pb.TaskRelationType_TASK_RELATION_TYPE_BLOCKS,
-			}))
+		if strings.TrimSpace(ref) == "" {
+			continue
 		}
+		up, _, upErr := sess.resolveRemoteTaskInProjectQuiet(in.Project, ref)
+		if upErr != nil {
+			return cli.TaskView{}, upErr
+		}
+		if _, relErr := sess.prov.TaskClient().AddTaskRelation(sess.ctx, connect.NewRequest(&flowsk_task_pb.AddTaskRelationRequest{
+			WorkspaceId:  sess.workspaceID.String(),
+			ActorId:      sess.actorID.String(),
+			SourceTaskId: up.GetId(),
+			TargetTaskId: t.GetId(),
+			RelationType: flowsk_task_pb.TaskRelationType_TASK_RELATION_TYPE_BLOCKS,
+		})); relErr != nil && connect.CodeOf(relErr) != connect.CodeAlreadyExists {
+			return cli.TaskView{}, relErr
+		}
+		addedBlockers++
 	}
-	reloaded, _, err := sess.resolveRemoteTask(t.GetId())
+	if addedBlockers == 0 {
+		projUUID, _ := uuid.Parse(t.GetProjectId())
+		stID := connectrpc.WorkflowStateIDForStatus(projUUID, task.StatusBlocked).String()
+		if _, trErr := sess.prov.TaskClient().TransitionTaskState(sess.ctx, connect.NewRequest(&flowsk_task_pb.TransitionTaskStateRequest{
+			WorkspaceId:     sess.workspaceID.String(),
+			ActorId:         sess.actorID.String(),
+			TaskId:          t.GetId(),
+			WorkflowStateId: stID,
+			ResolutionNote:  in.Reason,
+		})); trErr != nil {
+			return cli.TaskView{}, trErr
+		}
+	} else if strings.TrimSpace(in.Reason) != "" {
+		_, _ = sess.prov.TaskClient().AddTaskComment(sess.ctx, newRemoteTaskRequest(&flowsk_task_pb.AddTaskCommentRequest{
+			WorkspaceId: sess.workspaceID.String(),
+			ActorId:     sess.actorID.String(),
+			TaskId:      t.GetId(),
+			Kind:        flowsk_task_pb.TaskCommentKind_TASK_COMMENT_KIND_BLOCKER_REPORT,
+			Body:        in.Reason,
+		}, true))
+	}
+	reloaded, rels, err := sess.resolveRemoteTaskQuiet(t.GetId())
 	if err != nil {
-		return protoTaskToCLI(t), nil
+		return protoTaskToCLIWithRelations(sess, t, nil), nil
 	}
-	return protoTaskToCLI(reloaded), nil
+	return protoTaskToCLIWithRelations(sess, reloaded, rels), nil
 }
 
 func (c *dualModeClient) remoteUnblockTask(ctx context.Context, opts cli.GlobalOptions, in cli.UnblockTaskInput) (cli.TaskView, error) {
@@ -1068,24 +1320,64 @@ func (c *dualModeClient) remoteUnblockTask(ctx context.Context, opts cli.GlobalO
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	t, rels, err := sess.resolveRemoteTask(in.Task)
+	t, rels, err := sess.resolveRemoteTaskInProjectQuiet(in.Project, in.Task)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
+	clearFilter := make(map[string]bool, len(in.ClearedBy))
+	for _, ref := range in.ClearedBy {
+		if strings.TrimSpace(ref) == "" {
+			continue
+		}
+		up, _, upErr := sess.resolveRemoteTaskInProjectQuiet(in.Project, ref)
+		if upErr != nil {
+			return cli.TaskView{}, upErr
+		}
+		clearFilter[up.GetId()] = true
+	}
 	for _, rel := range rels {
 		if rel.GetTargetTaskId() == t.GetId() && rel.GetRelationType() == flowsk_task_pb.TaskRelationType_TASK_RELATION_TYPE_BLOCKS {
-			_, _ = sess.prov.TaskClient().RemoveTaskRelation(sess.ctx, connect.NewRequest(&flowsk_task_pb.RemoveTaskRelationRequest{
-				WorkspaceId: sess.workspaceID.String(),
-				ActorId:     sess.actorID.String(),
-				RelationId:  rel.GetId(),
-			}))
+			if len(clearFilter) == 0 || clearFilter[rel.GetSourceTaskId()] {
+				if _, rmErr := sess.prov.TaskClient().RemoveTaskRelation(sess.ctx, connect.NewRequest(&flowsk_task_pb.RemoveTaskRelationRequest{
+					WorkspaceId: sess.workspaceID.String(),
+					ActorId:     sess.actorID.String(),
+					RelationId:  rel.GetId(),
+				})); rmErr != nil {
+					return cli.TaskView{}, rmErr
+				}
+			}
 		}
 	}
-	reloaded, _, err := sess.resolveRemoteTask(t.GetId())
+	reloaded, remainingRels, err := sess.resolveRemoteTaskQuiet(t.GetId())
 	if err != nil {
-		return protoTaskToCLI(t), nil
+		return protoTaskToCLIWithRelations(sess, t, nil), nil
 	}
-	return protoTaskToCLI(reloaded), nil
+	unresolvedBlockers := 0
+	for _, rel := range remainingRels {
+		if rel.GetTargetTaskId() == t.GetId() && rel.GetRelationType() == flowsk_task_pb.TaskRelationType_TASK_RELATION_TYPE_BLOCKS {
+			if up, _, upErr := sess.resolveRemoteTaskQuiet(rel.GetSourceTaskId()); upErr == nil {
+				if !isRemoteTaskTerminal(up) {
+					unresolvedBlockers++
+				}
+			} else {
+				unresolvedBlockers++
+			}
+		}
+	}
+	if unresolvedBlockers == 0 && (strings.EqualFold(reloaded.GetStatus(), string(task.StatusBlocked)) || protoTaskToCLI(reloaded).Category == "blocked") {
+		projUUID, _ := uuid.Parse(reloaded.GetProjectId())
+		stID := connectrpc.WorkflowStateIDForStatus(projUUID, task.StatusReady).String()
+		if trResp, trErr := sess.prov.TaskClient().TransitionTaskState(sess.ctx, connect.NewRequest(&flowsk_task_pb.TransitionTaskStateRequest{
+			WorkspaceId:     sess.workspaceID.String(),
+			ActorId:         sess.actorID.String(),
+			TaskId:          reloaded.GetId(),
+			WorkflowStateId: stID,
+			ResolutionNote:  in.Note,
+		})); trErr == nil && trResp.Msg.GetTask() != nil {
+			reloaded = trResp.Msg.GetTask()
+		}
+	}
+	return protoTaskToCLIWithRelations(sess, reloaded, remainingRels), nil
 }
 
 func (c *dualModeClient) remoteAddComment(ctx context.Context, opts cli.GlobalOptions, in cli.AddCommentInput) (cli.CommentView, error) {
@@ -1093,15 +1385,16 @@ func (c *dualModeClient) remoteAddComment(ctx context.Context, opts cli.GlobalOp
 	if err != nil {
 		return cli.CommentView{}, err
 	}
-	t, _, err := sess.resolveRemoteTask(in.Task)
+	t, _, err := sess.resolveRemoteTaskInProjectQuiet(in.Project, in.Task)
 	if err != nil {
 		return cli.CommentView{}, err
 	}
+	pbKind := mapCLICommentKindToProto(in.Kind)
 	resp, err := sess.prov.TaskClient().AddTaskComment(sess.ctx, connect.NewRequest(&flowsk_task_pb.AddTaskCommentRequest{
 		WorkspaceId: sess.workspaceID.String(),
 		ActorId:     sess.actorID.String(),
 		TaskId:      t.GetId(),
-		Kind:        flowsk_task_pb.TaskCommentKind_TASK_COMMENT_KIND_COMMENT,
+		Kind:        pbKind,
 		Body:        in.Body,
 	}))
 	if err != nil {
@@ -1113,7 +1406,7 @@ func (c *dualModeClient) remoteAddComment(ctx context.Context, opts cli.GlobalOp
 		TaskID:    cm.GetTaskId(),
 		TaskKey:   t.GetIdentifier(),
 		Author:    sess.handle,
-		Kind:      in.Kind,
+		Kind:      protoCommentKindToCLI(cm.GetKind(), in.Kind),
 		Body:      cm.GetBody(),
 		CreatedAt: cm.GetCreatedAt().AsTime(),
 	}, nil
@@ -1124,7 +1417,7 @@ func (c *dualModeClient) remoteListComments(ctx context.Context, opts cli.Global
 	if err != nil {
 		return cli.CommentListResult{}, err
 	}
-	t, _, err := sess.resolveRemoteTask(in.Task)
+	t, _, err := sess.resolveRemoteTaskInProjectQuiet(in.Project, in.Task)
 	if err != nil {
 		return cli.CommentListResult{}, err
 	}
@@ -1145,7 +1438,7 @@ func (c *dualModeClient) remoteListComments(ctx context.Context, opts cli.Global
 			TaskID:    cm.GetTaskId(),
 			TaskKey:   t.GetIdentifier(),
 			Author:    cm.GetAuthorActorId(),
-			Kind:      cm.GetKind().String(),
+			Kind:      protoCommentKindToCLI(cm.GetKind(), ""),
 			Body:      cm.GetBody(),
 			CreatedAt: cm.GetCreatedAt().AsTime(),
 		})
@@ -1285,10 +1578,23 @@ func (c *dualModeClient) remoteListAuditEvents(ctx context.Context, opts cli.Glo
 	if in.Since != nil {
 		sincePB = timestamppb.New(in.Since.UTC())
 	}
+	var entityIDPtr *string
+	if eid := strings.TrimSpace(in.EntityID); eid != "" {
+		if _, parseErr := uuid.Parse(eid); parseErr == nil {
+			entityIDPtr = &eid
+		} else if t, _, tErr := sess.resolveRemoteTaskInProjectQuiet(in.Project, eid); tErr == nil && t.GetId() != "" {
+			resolvedID := t.GetId()
+			entityIDPtr = &resolvedID
+		} else {
+			entityIDPtr = &eid
+		}
+	}
 	resp, err := sess.prov.AuditClient().ListAuditEvents(sess.ctx, connect.NewRequest(&flowsk_audit_pb.ListAuditEventsRequest{
 		WorkspaceId:      sess.workspaceID.String(),
 		ActorId:          sess.actorID.String(),
+		EntityId:         entityIDPtr,
 		EntityTypeFilter: in.EntityType,
+		ActionFilter:     mapCLIAuditActionToProto(in.Action),
 		Since:            sincePB,
 		PageSize:         int32(min(max(1, in.Limit), 200)),
 		PageToken:        in.Cursor,
@@ -1408,7 +1714,7 @@ func (c *dualModeClient) remoteGetTaskMarkdown(ctx context.Context, opts cli.Glo
 	if err != nil {
 		return cli.MarkdownDocView{}, err
 	}
-	t, _, err := sess.resolveRemoteTask(taskRef)
+	t, _, err := sess.resolveRemoteTaskQuiet(taskRef)
 	if err != nil {
 		return cli.MarkdownDocView{}, err
 	}
@@ -1436,7 +1742,7 @@ func (c *dualModeClient) remotePutTaskMarkdown(ctx context.Context, opts cli.Glo
 	if err != nil {
 		return cli.MarkdownDocView{}, err
 	}
-	t, _, err := sess.resolveRemoteTask(taskRef)
+	t, _, err := sess.resolveRemoteTaskQuiet(taskRef)
 	if err != nil {
 		return cli.MarkdownDocView{}, err
 	}
@@ -1466,7 +1772,7 @@ func (c *dualModeClient) remoteDeleteTaskMarkdown(ctx context.Context, opts cli.
 	if err != nil {
 		return cli.MarkdownDocView{}, err
 	}
-	t, _, err := sess.resolveRemoteTask(taskRef)
+	t, _, err := sess.resolveRemoteTaskQuiet(taskRef)
 	if err != nil {
 		return cli.MarkdownDocView{}, err
 	}
@@ -1646,6 +1952,8 @@ func protoObjectiveToCLI(o *flowsk_objective_pb.Objective) cli.ObjectiveView {
 	switch o.GetStatus() {
 	case flowsk_objective_pb.ObjectiveStatus_OBJECTIVE_STATUS_PLANNED:
 		status = "planned"
+	case flowsk_objective_pb.ObjectiveStatus_OBJECTIVE_STATUS_AT_RISK:
+		status = "at_risk"
 	case flowsk_objective_pb.ObjectiveStatus_OBJECTIVE_STATUS_ACHIEVED:
 		status = "achieved"
 	case flowsk_objective_pb.ObjectiveStatus_OBJECTIVE_STATUS_DROPPED:
@@ -1691,6 +1999,13 @@ func protoTaskToCLI(t *flowsk_task_pb.Task) cli.TaskView {
 			ExpiresAt: t.GetClaimExpiresAt().AsTime(),
 		}
 	}
+	var lastSignalAt *time.Time
+	if t.GetLastSignalAt() != nil {
+		ts := t.GetLastSignalAt().AsTime().UTC()
+		if !ts.IsZero() {
+			lastSignalAt = &ts
+		}
+	}
 	return cli.TaskView{
 		ID:             t.GetId(),
 		WorkspaceID:    t.GetWorkspaceId(),
@@ -1702,13 +2017,94 @@ func protoTaskToCLI(t *flowsk_task_pb.Task) cli.TaskView {
 		State:          state,
 		Category:       cat,
 		Priority:       mapProtoPriorityToCLI(t.GetPriority()),
+		Labels:         append([]string(nil), t.GetTags()...),
 		Estimate:       int(t.GetEstimatePoints()),
 		Acceptance:     t.GetAcceptanceCriteria(),
 		Blocked:        cat == "blocked",
 		Lease:          lease,
 		HasMarkdownDoc: t.GetHasMarkdownDoc(),
+		LastSignalAt:   lastSignalAt,
 		CreatedAt:      t.GetCreatedAt().AsTime(),
 		UpdatedAt:      t.GetUpdatedAt().AsTime(),
+	}
+}
+
+func protoTaskToCLIWithRelations(sess *remoteSession, t *flowsk_task_pb.Task, rels []*flowsk_task_pb.TaskRelation) cli.TaskView {
+	v := protoTaskToCLI(t)
+	if sess == nil || t == nil {
+		return v
+	}
+	if t.GetObjectiveId() != "" {
+		projID := t.GetProjectId()
+		if oResp, oErr := sess.prov.ObjectiveClient().ListObjectives(sess.ctx, connect.NewRequest(&flowsk_objective_pb.ListObjectivesRequest{
+			WorkspaceId: sess.workspaceID.String(),
+			ActorId:     sess.actorID.String(),
+			ProjectId:   &projID,
+			PageSize:    200,
+		})); oErr == nil {
+			for _, obj := range oResp.Msg.GetObjectives() {
+				if obj.GetId() == t.GetObjectiveId() {
+					v.ObjectiveKey = slugifyIdentifier(obj.GetTitle())
+					break
+				}
+			}
+		}
+	}
+	if t.GetParentTaskId() != "" {
+		if pt, _, ptErr := sess.resolveRemoteTaskQuiet(t.GetParentTaskId()); ptErr == nil && pt != nil {
+			v.ParentKey = pt.GetIdentifier()
+		}
+	}
+	if t.GetAssigneeActorId() != "" {
+		v.Assignee = t.GetAssigneeActorId()
+		actorStr := sess.actorID.String()
+		if aResp, aErr := sess.prov.WorkspaceClient().ListActors(sess.ctx, connect.NewRequest(&flowsk_workspace_pb.ListActorsRequest{
+			WorkspaceId: sess.workspaceID.String(),
+			ActorId:     &actorStr,
+			PageSize:    200,
+		})); aErr == nil {
+			for _, a := range aResp.Msg.GetActors() {
+				if a.GetId() == t.GetAssigneeActorId() {
+					v.Assignee = firstNonEmpty(a.GetHandle(), a.GetId())
+					break
+				}
+			}
+		}
+	}
+	for _, rel := range rels {
+		if rel.GetRelationType() != flowsk_task_pb.TaskRelationType_TASK_RELATION_TYPE_BLOCKS {
+			continue
+		}
+		if rel.GetTargetTaskId() == t.GetId() {
+			if up, _, upErr := sess.resolveRemoteTaskQuiet(rel.GetSourceTaskId()); upErr == nil && up != nil {
+				if !isRemoteTaskTerminal(up) {
+					v.BlockedBy = append(v.BlockedBy, up.GetIdentifier())
+					v.Blocked = true
+				}
+			}
+		} else if rel.GetSourceTaskId() == t.GetId() {
+			if down, _, downErr := sess.resolveRemoteTaskQuiet(rel.GetTargetTaskId()); downErr == nil && down != nil {
+				v.Blocks = append(v.Blocks, down.GetIdentifier())
+			}
+		}
+	}
+	return v
+}
+
+func isRemoteTaskTerminal(t *flowsk_task_pb.Task) bool {
+	if t == nil {
+		return false
+	}
+	if rawSt := strings.TrimSpace(t.GetStatus()); rawSt != "" {
+		return parseCLIWorkflowStatus(rawSt).IsTerminal()
+	}
+	switch t.GetStateCategory() {
+	case flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_COMPLETED,
+		flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_CANCELED,
+		flowsk_project_pb.WorkflowStateCategory_WORKFLOW_STATE_CATEGORY_ARCHIVED:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1723,6 +2119,13 @@ func protoTaskToSummaryCLI(t *flowsk_task_pb.Task) cli.TaskSummaryView {
 		cat = canonicalCategoryForStatus(parsedSt)
 		state = displayWorkflowStateName(parsedSt)
 	}
+	var lastSignalAt *time.Time
+	if t.GetLastSignalAt() != nil {
+		ts := t.GetLastSignalAt().AsTime().UTC()
+		if !ts.IsZero() {
+			lastSignalAt = &ts
+		}
+	}
 	return cli.TaskSummaryView{
 		ID:             t.GetId(),
 		Key:            t.GetIdentifier(),
@@ -1732,8 +2135,10 @@ func protoTaskToSummaryCLI(t *flowsk_task_pb.Task) cli.TaskSummaryView {
 		Category:       cat,
 		Priority:       mapProtoPriorityToCLI(t.GetPriority()),
 		Holder:         t.GetClaimedByActorId(),
+		Labels:         append([]string(nil), t.GetTags()...),
 		Blocked:        cat == "blocked",
 		HasMarkdownDoc: t.GetHasMarkdownDoc(),
+		LastSignalAt:   lastSignalAt,
 		UpdatedAt:      t.GetUpdatedAt().AsTime(),
 	}
 }
@@ -1741,6 +2146,13 @@ func protoTaskToSummaryCLI(t *flowsk_task_pb.Task) cli.TaskSummaryView {
 func protoCompactSummaryToCLI(s *flowsk_task_pb.CompactTaskSummary) cli.TaskSummaryView {
 	if s == nil {
 		return cli.TaskSummaryView{}
+	}
+	var lastSignalAt *time.Time
+	if s.GetLastSignalAt() != nil {
+		ts := s.GetLastSignalAt().AsTime().UTC()
+		if !ts.IsZero() {
+			lastSignalAt = &ts
+		}
 	}
 	return cli.TaskSummaryView{
 		ID:             s.GetId(),
@@ -1753,6 +2165,7 @@ func protoCompactSummaryToCLI(s *flowsk_task_pb.CompactTaskSummary) cli.TaskSumm
 		Holder:         s.GetClaimedByActorId(),
 		Blocked:        s.GetIsBlocked(),
 		HasMarkdownDoc: s.GetHasMarkdownDoc(),
+		LastSignalAt:   lastSignalAt,
 	}
 }
 
@@ -1860,4 +2273,126 @@ func mapProtoPriorityToCLI(p flowsk_task_pb.TaskPriority) int {
 	default:
 		return 4
 	}
+}
+
+func mapCLIObjectiveKindToProto(raw string) flowsk_objective_pb.ObjectiveKind {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "goal":
+		return flowsk_objective_pb.ObjectiveKind_OBJECTIVE_KIND_GOAL
+	case "milestone":
+		return flowsk_objective_pb.ObjectiveKind_OBJECTIVE_KIND_MILESTONE
+	case "cycle":
+		return flowsk_objective_pb.ObjectiveKind_OBJECTIVE_KIND_CYCLE
+	default:
+		return flowsk_objective_pb.ObjectiveKind_OBJECTIVE_KIND_UNSPECIFIED
+	}
+}
+
+func mapCLIObjectiveStatusToProto(raw string) flowsk_objective_pb.ObjectiveStatus {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "planned", "draft":
+		return flowsk_objective_pb.ObjectiveStatus_OBJECTIVE_STATUS_PLANNED
+	case "active":
+		return flowsk_objective_pb.ObjectiveStatus_OBJECTIVE_STATUS_ACTIVE
+	case "at_risk", "at-risk":
+		return flowsk_objective_pb.ObjectiveStatus_OBJECTIVE_STATUS_AT_RISK
+	case "achieved", "completed", "done":
+		return flowsk_objective_pb.ObjectiveStatus_OBJECTIVE_STATUS_ACHIEVED
+	case "dropped", "canceled", "cancelled", "superseded":
+		return flowsk_objective_pb.ObjectiveStatus_OBJECTIVE_STATUS_DROPPED
+	default:
+		return flowsk_objective_pb.ObjectiveStatus_OBJECTIVE_STATUS_UNSPECIFIED
+	}
+}
+
+func matchesRemoteObjectiveStatus(viewStatus, filter string) bool {
+	if strings.EqualFold(viewStatus, filter) {
+		return true
+	}
+	return mapCLIObjectiveStatusToProto(viewStatus) != flowsk_objective_pb.ObjectiveStatus_OBJECTIVE_STATUS_UNSPECIFIED &&
+		mapCLIObjectiveStatusToProto(viewStatus) == mapCLIObjectiveStatusToProto(filter)
+}
+
+func mapCLITaskKindToProto(raw string) flowsk_task_pb.TaskKind {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "epic":
+		return flowsk_task_pb.TaskKind_TASK_KIND_EPIC
+	case "bug":
+		return flowsk_task_pb.TaskKind_TASK_KIND_BUG
+	case "chore", "task":
+		return flowsk_task_pb.TaskKind_TASK_KIND_TASK
+	case "research", "issue":
+		return flowsk_task_pb.TaskKind_TASK_KIND_ISSUE
+	default:
+		return flowsk_task_pb.TaskKind_TASK_KIND_FEATURE
+	}
+}
+
+func mapCLICommentKindToProto(raw string) flowsk_task_pb.TaskCommentKind {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "handoff":
+		return flowsk_task_pb.TaskCommentKind_TASK_COMMENT_KIND_HANDOFF
+	case "blocker", "blocker_report":
+		return flowsk_task_pb.TaskCommentKind_TASK_COMMENT_KIND_BLOCKER_REPORT
+	case "decision", "resolution":
+		return flowsk_task_pb.TaskCommentKind_TASK_COMMENT_KIND_RESOLUTION
+	default:
+		return flowsk_task_pb.TaskCommentKind_TASK_COMMENT_KIND_COMMENT
+	}
+}
+
+func protoCommentKindToCLI(pbKind flowsk_task_pb.TaskCommentKind, fallback string) string {
+	switch pbKind {
+	case flowsk_task_pb.TaskCommentKind_TASK_COMMENT_KIND_HANDOFF:
+		return "handoff"
+	case flowsk_task_pb.TaskCommentKind_TASK_COMMENT_KIND_BLOCKER_REPORT:
+		return "blocker"
+	case flowsk_task_pb.TaskCommentKind_TASK_COMMENT_KIND_RESOLUTION:
+		if strings.EqualFold(strings.TrimSpace(fallback), "resolution") {
+			return "resolution"
+		}
+		return "decision"
+	default:
+		if trimmed := strings.ToLower(strings.TrimSpace(fallback)); trimmed != "" {
+			return trimmed
+		}
+		return "note"
+	}
+}
+
+func mapCLIAuditActionToProto(raw string) flowsk_audit_pb.AuditAction {
+	switch mapCLIAuditAction(raw) {
+	case tx.AuditActionCreate:
+		return flowsk_audit_pb.AuditAction_AUDIT_ACTION_CREATE
+	case tx.AuditActionUpdate:
+		return flowsk_audit_pb.AuditAction_AUDIT_ACTION_UPDATE
+	case tx.AuditActionDelete:
+		return flowsk_audit_pb.AuditAction_AUDIT_ACTION_DELETE
+	case tx.AuditActionTransition:
+		return flowsk_audit_pb.AuditAction_AUDIT_ACTION_TRANSITION
+	case tx.AuditActionClaim:
+		return flowsk_audit_pb.AuditAction_AUDIT_ACTION_CLAIM
+	case tx.AuditActionRelease:
+		return flowsk_audit_pb.AuditAction_AUDIT_ACTION_RELEASE
+	case tx.AuditActionBatchExec:
+		return flowsk_audit_pb.AuditAction_AUDIT_ACTION_BATCH_EXEC
+	default:
+		return flowsk_audit_pb.AuditAction_AUDIT_ACTION_UNSPECIFIED
+	}
+}
+
+func hasAllRemoteTags(have, required []string) bool {
+	for _, req := range required {
+		found := false
+		for _, h := range have {
+			if strings.EqualFold(strings.TrimSpace(h), strings.TrimSpace(req)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }

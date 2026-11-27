@@ -8,7 +8,7 @@
 //     coordination (`/data/flowsk`), and MCP server transports. `ClientConfig` governs
 //     server endpoint connectivity, actor credentials, default token-compact output
 //     formatting, and the strictly client-local path registry file
-//     (`~/.config/flowsk/local_paths.json`).
+//     (`~/.flowsk/local_paths.json`).
 //   - Secret Hygiene: Credential fields (`Postgres.DSN`, `ClientConfig.AuthToken`)
 //     MUST never be emitted in diagnostic `String()` or startup log dumps.
 package config
@@ -221,7 +221,7 @@ func (c ServerConfig) String() string {
 // vs. token-frugal output defaults.
 type ClientConfig struct {
 	// LocalSQLitePath is the local SQLite WAL database path (for example,
-	// `~/.local/share/flowsk/flowsk.db`) opened directly in-process when ServerURL
+	// `~/.flowsk/flowsk.db`) opened directly in-process when ServerURL
 	// is empty so standalone local CLI/MCP usage requires zero background daemons.
 	LocalSQLitePath string
 
@@ -239,8 +239,8 @@ type ClientConfig struct {
 	// AuthToken carries the bearer authentication credential resolved from env/keychain/config.
 	AuthToken string
 
-	// LocalPathRegistryFile is the client-local OS user config path (for example,
-	// `~/.config/flowsk/local_paths.json`) used by `internal/adapter/localpath` to map
+	// LocalPathRegistryFile is the client-local Flowsk home path (for example,
+	// `~/.flowsk/local_paths.json`) used by `internal/adapter/localpath` to map
 	// local checkout directories to server Project IDs without touching git repositories
 	// or sending local filesystem paths to the server.
 	LocalPathRegistryFile string
@@ -304,7 +304,7 @@ type Loader interface {
 	LoadServerConfig(ctx context.Context, opts LoadOptions) (ServerConfig, error)
 
 	// LoadClientConfig loads and validates workstation/agent CLI configuration,
-	// resolving `os.UserConfigDir()` for `LocalPathRegistryFile` when unset.
+	// resolving `~/.flowsk/local_paths.json` for `LocalPathRegistryFile` when unset.
 	LoadClientConfig(ctx context.Context, opts LoadOptions) (ClientConfig, error)
 }
 
@@ -345,17 +345,17 @@ func (l *ViperLoader) LoadServerConfig(ctx context.Context, opts LoadOptions) (S
 		Environment: stringFromViper(v, prefix, "development", "environment"),
 		LogLevel:    strings.ToLower(stringFromViper(v, prefix, "info", "log_level")),
 		HTTP: HTTPServerConfig{
-			ListenAddr:          stringFromViper(v, prefix, "127.0.0.1:8080", "http.listen_addr", "listen_addr"),
+			ListenAddr:          stringFromViper(v, prefix, "127.0.0.1:8080", "http.listen_addr", "listen", "listen_addr", "http_addr"),
 			ReadHeaderTimeout:   durationFromViper(v, prefix, 5*time.Second, "http.read_header_timeout"),
 			ReadTimeout:         durationFromViper(v, prefix, 30*time.Second, "http.read_timeout"),
 			WriteTimeout:        durationFromViper(v, prefix, 30*time.Second, "http.write_timeout"),
 			ShutdownGracePeriod: durationFromViper(v, prefix, 15*time.Second, "http.shutdown_grace_period"),
 		},
 		Database: DatabaseConfig{
-			Dialect:     db.Dialect(strings.ToLower(stringFromViper(v, prefix, string(db.DialectSQLite), "database.dialect", "db_dialect"))),
+			Dialect:     db.Dialect(strings.ToLower(stringFromViper(v, prefix, string(db.DialectSQLite), "database.dialect", "db_dialect", "db_driver"))),
 			AutoMigrate: boolFromViper(v, prefix, true, "database.auto_migrate", "auto_migrate"),
 			SQLite: sqlite.Config{
-				FilePath:               stringFromViper(v, prefix, defaultSQLiteFile, "database.sqlite.file_path", "sqlite_path", "db_path"),
+				FilePath:               stringFromViper(v, prefix, defaultSQLiteFile, "database.sqlite.file_path", "db_dsn", "sqlite_path", "db_path"),
 				EnableWAL:              boolFromViper(v, prefix, true, "database.sqlite.enable_wal"),
 				ForeignKeys:            boolFromViper(v, prefix, true, "database.sqlite.foreign_keys"),
 				BusyTimeout:            durationFromViper(v, prefix, 5*time.Second, "database.sqlite.busy_timeout"),
@@ -364,7 +364,7 @@ func (l *ViperLoader) LoadServerConfig(ctx context.Context, opts LoadOptions) (S
 				MaxReadOpenConns:       intFromViper(v, prefix, 4, "database.sqlite.max_read_open_conns"),
 			},
 			Postgres: postgres.Config{
-				DSN:               stringFromViper(v, prefix, "", "database.postgres.dsn", "postgres_dsn"),
+				DSN:               stringFromViper(v, prefix, "", "database.postgres.dsn", "postgres_dsn", "db_dsn"),
 				MaxConns:          int32(intFromViper(v, prefix, 16, "database.postgres.max_conns")),
 				MinConns:          int32(intFromViper(v, prefix, 2, "database.postgres.min_conns")),
 				MaxConnLifetime:   durationFromViper(v, prefix, 30*time.Minute, "database.postgres.max_conn_lifetime"),

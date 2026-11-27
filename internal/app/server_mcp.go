@@ -7,14 +7,21 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +51,55 @@ import (
 	"github.com/mindmain/flowsk/internal/transport/mcp"
 )
 
+const (
+	uiSessionCookieName    = "flowsk_ui_session"
+	maxUIAuthRequestBodyKB = 4096
+)
+
+func generateSessionSecret() ([]byte, error) {
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return nil, fmt.Errorf("generate UI session secret: %w", err)
+	}
+	return secret, nil
+}
+
+func hmacSHA256Hex(secret []byte, message string) string {
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(message))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func verifyRequestToken(rHeaders http.Header, cookies []*http.Cookie, expectedToken string, sessionSecret []byte) bool {
+	if expectedToken == "" {
+		return true
+	}
+	for _, h := range rHeaders.Values("Authorization") {
+		scheme, creds, ok := strings.Cut(strings.TrimSpace(h), " ")
+		if !ok || !strings.EqualFold(scheme, "Bearer") {
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(creds)), []byte(expectedToken)) == 1 {
+			return true
+		}
+	}
+	if len(cookies) == 0 && len(rHeaders.Values("Cookie")) > 0 {
+		cookies = (&http.Request{Header: rHeaders}).Cookies()
+	}
+	if len(sessionSecret) > 0 && len(cookies) > 0 {
+		expectedCookieVal := hmacSHA256Hex(sessionSecret, expectedToken)
+		for _, c := range cookies {
+			if c == nil || c.Name != uiSessionCookieName {
+				continue
+			}
+			if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(c.Value)), []byte(expectedCookieVal)) == 1 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 type appServerRunner struct {
 	rt *Runtime
 }
@@ -53,8 +109,13 @@ func (s *appServerRunner) RunServer(ctx context.Context, cfg cli.ServeConfig) er
 	opts := s.rt.optionsFromCtx(ctx)
 	expectedToken := firstNonEmpty(opts.AuthToken, os.Getenv("FLOWSK_AUTH_TOKEN"))
 
+	sessionSecret, err := generateSessionSecret()
+	if err != nil {
+		return err
+	}
+
 	if cfg.EnableUI && opts.IsRemoteMode() {
-		return s.runRemoteUIProxy(ctx, cfg, opts, expectedToken)
+		return s.runRemoteUIProxy(ctx, cfg, opts, expectedToken, sessionSecret)
 	}
 
 	driver := strings.ToLower(strings.TrimSpace(cfg.DBDriver))
@@ -68,10 +129,7 @@ func (s *appServerRunner) RunServer(ctx context.Context, cfg cli.ServeConfig) er
 		}
 	}
 
-	var (
-		eng *localEngine
-		err error
-	)
+	var eng *localEngine
 	switch driver {
 	case "sqlite":
 		dsn := strings.TrimSpace(cfg.DBDSN)
@@ -93,13 +151,9 @@ func (s *appServerRunner) RunServer(ctx context.Context, cfg cli.ServeConfig) er
 	defer func() { _ = eng.adapter.Close() }()
 
 	resolver := connectrpc.IdentityResolverFunc(func(rCtx context.Context, spec connect.Spec, headers http.Header) (authctx.Identity, error) {
-		if expectedToken != "" {
-			got := strings.TrimSpace(headers.Get("Authorization"))
-			got = strings.TrimSpace(strings.TrimPrefix(got, "Bearer"))
-			got = strings.TrimSpace(strings.TrimPrefix(got, "bearer"))
-			if subtle.ConstantTimeCompare([]byte(got), []byte(expectedToken)) != 1 {
-				return authctx.Identity{}, errs.New(errs.ErrUnauthenticated, "app.ServerAuth", "invalid or missing bearer token")
-			}
+		cookies := (&http.Request{Header: headers}).Cookies()
+		if !verifyRequestToken(headers, cookies, expectedToken, sessionSecret) {
+			return authctx.Identity{}, errs.New(errs.ErrUnauthenticated, "app.ServerAuth", "invalid or missing bearer token")
 		}
 
 		rawWS := strings.TrimSpace(headers.Get(connectrpc.HeaderWorkspaceID))
@@ -159,12 +213,16 @@ func (s *appServerRunner) RunServer(ctx context.Context, cfg cli.ServeConfig) er
 		broker.RunAuditRelay(
 			relayCtx,
 			eng.AuditService(),
-			func(pCtx context.Context, wsID uuid.UUID) (authctx.Identity, bool) {
-				_, _, ident := eng.ensureWorkspaceAndActor(pCtx, wsID.String(), "stream-relay", "human")
-				if ident.WorkspaceID != wsID {
+			func(_ context.Context, wsID uuid.UUID) (authctx.Identity, bool) {
+				if wsID == uuid.Nil {
 					return authctx.Identity{}, false
 				}
-				return ident, true
+				return authctx.Identity{
+					WorkspaceID: wsID,
+					ActorID:     deterministicUUID("system", wsID.String(), "stream-relay"),
+					Kind:        authctx.ActorKindAgent,
+					Handle:      "stream-relay",
+				}, true
 			},
 			connectrpc.DefaultAuditPollInterval,
 		)
@@ -175,13 +233,8 @@ func (s *appServerRunner) RunServer(ctx context.Context, cfg cli.ServeConfig) er
 	}()
 
 	streamAuth := func(rCtx context.Context, r *http.Request) (authctx.Identity, uuid.UUID, error) {
-		if expectedToken != "" {
-			got := strings.TrimSpace(r.Header.Get("Authorization"))
-			got = strings.TrimSpace(strings.TrimPrefix(got, "Bearer"))
-			got = strings.TrimSpace(strings.TrimPrefix(got, "bearer"))
-			if subtle.ConstantTimeCompare([]byte(got), []byte(expectedToken)) != 1 {
-				return authctx.Identity{}, uuid.Nil, errs.New(errs.ErrUnauthenticated, "app.StreamAuth", "invalid or missing bearer token")
-			}
+		if !verifyRequestToken(r.Header, r.Cookies(), expectedToken, sessionSecret) {
+			return authctx.Identity{}, uuid.Nil, errs.New(errs.ErrUnauthenticated, "app.StreamAuth", "invalid or missing bearer token")
 		}
 
 		headerWS := strings.TrimSpace(r.Header.Get(connectrpc.HeaderWorkspaceID))
@@ -198,8 +251,8 @@ func (s *appServerRunner) RunServer(ctx context.Context, cfg cli.ServeConfig) er
 		)
 		kind := firstNonEmpty(strings.TrimSpace(r.Header.Get(connectrpc.HeaderActorKind)), "human")
 
-		_, ws, ident := eng.ensureWorkspaceAndActor(rCtx, targetRef, handle, kind)
-		if ws.ID == uuid.Nil || ident.WorkspaceID == uuid.Nil {
+		ws, ident, resolveErr := eng.resolveReadOnlyStreamIdentity(rCtx, targetRef, handle, kind)
+		if resolveErr != nil || ws.ID == uuid.Nil || ident.WorkspaceID == uuid.Nil {
 			return authctx.Identity{}, uuid.Nil, errs.New(errs.ErrUnauthenticated, "app.StreamAuth", "workspace could not be resolved")
 		}
 		return ident, ws.ID, nil
@@ -208,12 +261,12 @@ func (s *appServerRunner) RunServer(ctx context.Context, cfg cli.ServeConfig) er
 
 	if cfg.EnableUI {
 		wsRef := firstNonEmpty(cfg.UIWorkspace, opts.Workspace, "default")
-		actorRef := firstNonEmpty(cfg.UIActor, opts.Actor, "web-operator")
+		actorRef := sanitizeActorHandle(firstNonEmpty(cfg.UIActor, opts.Actor, "web-operator"))
 		_, ws, ident := eng.ensureWorkspaceAndActor(ctx, wsRef, actorRef, "human")
 		bootCfg := webui.RuntimeBootstrap{
 			WorkspaceSlug: firstNonEmpty(ws.Slug, wsRef),
 			ProjectSlug:   firstNonEmpty(cfg.UIProject, opts.Project),
-			ActorHandle:   firstNonEmpty(ident.Handle, actorRef),
+			ActorHandle:   sanitizeActorHandle(firstNonEmpty(ident.Handle, actorRef)),
 		}
 		if ws.ID != ([16]byte{}) {
 			bootCfg.WorkspaceID = ws.ID.String()
@@ -221,7 +274,7 @@ func (s *appServerRunner) RunServer(ctx context.Context, cfg cli.ServeConfig) er
 		if ident.ActorID != ([16]byte{}) {
 			bootCfg.ActorID = ident.ActorID.String()
 		}
-		if err := mountWebUIRoutes(srv.Mux(), bootCfg); err != nil {
+		if err := mountWebUIRoutes(srv.Mux(), bootCfg, expectedToken, sessionSecret); err != nil {
 			return err
 		}
 	}
@@ -229,17 +282,195 @@ func (s *appServerRunner) RunServer(ctx context.Context, cfg cli.ServeConfig) er
 	return srv.Serve(ctx)
 }
 
-func mountWebUIRoutes(mux *http.ServeMux, bootCfg webui.RuntimeBootstrap) error {
+type uiConfigUnauthenticatedResponse struct {
+	WorkspaceSlug string `json:"workspaceSlug"`
+	AuthRequired  bool   `json:"authRequired"`
+	Authenticated bool   `json:"authenticated"`
+}
+
+type uiConfigAuthenticatedResponse struct {
+	WorkspaceID   string `json:"workspaceId,omitempty"`
+	WorkspaceSlug string `json:"workspaceSlug"`
+	ProjectSlug   string `json:"projectSlug,omitempty"`
+	ActorID       string `json:"actorId,omitempty"`
+	ActorHandle   string `json:"actorHandle,omitempty"`
+	AuthRequired  bool   `json:"authRequired"`
+	Authenticated bool   `json:"authenticated"`
+}
+
+type uiAuthResponse struct {
+	Authenticated bool   `json:"authenticated"`
+	Error         string `json:"error,omitempty"`
+}
+
+func mountWebUIRoutes(mux *http.ServeMux, bootCfg webui.RuntimeBootstrap, expectedToken string, sessionSecret []byte) error {
 	spaHandler, err := webui.NewSPAHandler()
 	if err != nil {
 		return fmt.Errorf("mount embedded webui: %w", err)
 	}
-	mux.Handle("/api/ui-config", webui.NewBootstrapHandler(bootCfg))
+	mux.HandleFunc("/api/ui-auth", newUIAuthHandler(expectedToken, sessionSecret))
+	mux.HandleFunc("/api/ui-config", newUIConfigHandler(bootCfg, expectedToken, sessionSecret))
 	mux.Handle("/", spaHandler)
 	return nil
 }
 
-func (s *appServerRunner) runRemoteUIProxy(ctx context.Context, cfg cli.ServeConfig, opts cli.GlobalOptions, bearerToken string) error {
+func newUIConfigHandler(bootCfg webui.RuntimeBootstrap, expectedToken string, sessionSecret []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+
+		if expectedToken != "" && !verifyRequestToken(r.Header, r.Cookies(), expectedToken, sessionSecret) {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(uiConfigUnauthenticatedResponse{
+				WorkspaceSlug: bootCfg.WorkspaceSlug,
+				AuthRequired:  true,
+				Authenticated: false,
+			})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(uiConfigAuthenticatedResponse{
+			WorkspaceID:   bootCfg.WorkspaceID,
+			WorkspaceSlug: bootCfg.WorkspaceSlug,
+			ProjectSlug:   bootCfg.ProjectSlug,
+			ActorID:       bootCfg.ActorID,
+			ActorHandle:   bootCfg.ActorHandle,
+			AuthRequired:  expectedToken != "",
+			Authenticated: true,
+		})
+	}
+}
+
+func newUIAuthHandler(expectedToken string, sessionSecret []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+
+		switch r.Method {
+		case http.MethodPost:
+			limited := http.MaxBytesReader(w, r.Body, maxUIAuthRequestBodyKB)
+			defer func() { _ = limited.Close() }()
+			raw, err := io.ReadAll(limited)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(uiAuthResponse{
+					Authenticated: false,
+					Error:         "request body exceeds limit or is unreadable",
+				})
+				return
+			}
+			var payload struct {
+				Token string `json:"token"`
+			}
+			if len(bytes.TrimSpace(raw)) > 0 {
+				if uErr := json.Unmarshal(raw, &payload); uErr != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(uiAuthResponse{
+						Authenticated: false,
+						Error:         "invalid JSON payload",
+					})
+					return
+				}
+			}
+			if expectedToken != "" {
+				if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(payload.Token)), []byte(expectedToken)) != 1 {
+					w.WriteHeader(http.StatusUnauthorized)
+					_ = json.NewEncoder(w).Encode(uiAuthResponse{
+						Authenticated: false,
+						Error:         "invalid auth token",
+					})
+					return
+				}
+			}
+			http.SetCookie(w, &http.Cookie{
+				Name:     uiSessionCookieName,
+				Value:    hmacSHA256Hex(sessionSecret, expectedToken),
+				Path:     "/",
+				HttpOnly: true,
+				SameSite: http.SameSiteStrictMode,
+				MaxAge:   86400,
+			})
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(uiAuthResponse{Authenticated: true})
+
+		case http.MethodDelete:
+			http.SetCookie(w, &http.Cookie{
+				Name:     uiSessionCookieName,
+				Value:    "",
+				Path:     "/",
+				HttpOnly: true,
+				SameSite: http.SameSiteStrictMode,
+				MaxAge:   -1,
+			})
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(uiAuthResponse{Authenticated: false})
+
+		default:
+			w.Header().Set("Allow", "POST, DELETE")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_ = json.NewEncoder(w).Encode(uiAuthResponse{
+				Authenticated: false,
+				Error:         "method not allowed",
+			})
+		}
+	}
+}
+
+func isLoopbackHostHeader(rawHost string) bool {
+	trimmed := strings.TrimSpace(rawHost)
+	if trimmed == "" {
+		return false
+	}
+	host := trimmed
+	if h, _, err := net.SplitHostPort(trimmed); err == nil {
+		host = h
+	} else if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+		host = trimmed[1 : len(trimmed)-1]
+	}
+	host = strings.TrimSpace(host)
+	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
+func guardLoopbackSameOriginProxy(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isLoopbackHostHeader(r.Host) {
+			http.Error(w, "forbidden: local UI proxy accepts loopback Host headers only", http.StatusForbidden)
+			return
+		}
+		if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+			http.Error(w, "forbidden: cross-site request rejected", http.StatusForbidden)
+			return
+		}
+		if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+			originURL, err := url.Parse(origin)
+			if err != nil || originURL.Host == "" || !strings.EqualFold(originURL.Host, r.Host) {
+				http.Error(w, "forbidden: cross-origin request rejected", http.StatusForbidden)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func writeProxyUnauthenticated(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusUnauthorized)
+	_, _ = w.Write([]byte(`{"code":"unauthenticated","message":"invalid or missing bearer token"}` + "\n"))
+}
+
+func (s *appServerRunner) runRemoteUIProxy(ctx context.Context, cfg cli.ServeConfig, opts cli.GlobalOptions, bearerToken string, sessionSecret []byte) error {
 	targetURL, err := url.Parse(strings.TrimSpace(opts.ServerURL))
 	if err != nil || targetURL.Scheme == "" || targetURL.Host == "" {
 		return errs.Validation("app.runRemoteUIProxy", fmt.Sprintf("invalid remote server URL %q", opts.ServerURL))
@@ -250,11 +481,21 @@ func (s *appServerRunner) runRemoteUIProxy(ctx context.Context, cfg cli.ServeCon
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(targetURL)
 			pr.Out.Host = targetURL.Host
+			pr.Out.Header.Del("Origin")
+			pr.Out.Header.Del("Cookie")
 			if bearerToken != "" && strings.TrimSpace(pr.In.Header.Get("Authorization")) == "" {
 				pr.Out.Header.Set("Authorization", "Bearer "+bearerToken)
 			}
 		},
 	}
+
+	authedProxy := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if bearerToken != "" && !verifyRequestToken(r.Header, r.Cookies(), bearerToken, sessionSecret) {
+			writeProxyUnauthenticated(w)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	})
 
 	mux := http.NewServeMux()
 	for _, svcName := range []string{
@@ -265,9 +506,16 @@ func (s *appServerRunner) runRemoteUIProxy(ctx context.Context, cfg cli.ServeCon
 		flowsk_language_pbconnect.LanguageServiceName,
 		flowsk_audit_pbconnect.AuditServiceName,
 	} {
-		mux.Handle("/"+svcName+"/", proxy)
+		mux.Handle("/"+svcName+"/", authedProxy)
 	}
-	mux.Handle(connectrpc.EventsPath, proxy)
+	mux.HandleFunc(connectrpc.EventsPath, func(w http.ResponseWriter, r *http.Request) {
+		if bearerToken != "" && !verifyRequestToken(r.Header, r.Cookies(), bearerToken, sessionSecret) {
+			writeProxyUnauthenticated(w)
+			return
+		}
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+		proxy.ServeHTTP(w, r)
+	})
 	mux.HandleFunc(connectrpc.HealthzPath, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
@@ -276,14 +524,14 @@ func (s *appServerRunner) runRemoteUIProxy(ctx context.Context, cfg cli.ServeCon
 	if err := mountWebUIRoutes(mux, webui.RuntimeBootstrap{
 		WorkspaceSlug: firstNonEmpty(cfg.UIWorkspace, opts.Workspace, "default"),
 		ProjectSlug:   firstNonEmpty(cfg.UIProject, opts.Project),
-		ActorHandle:   firstNonEmpty(cfg.UIActor, opts.Actor, "web-operator"),
-	}); err != nil {
+		ActorHandle:   sanitizeActorHandle(firstNonEmpty(cfg.UIActor, opts.Actor, "web-operator")),
+	}, bearerToken, sessionSecret); err != nil {
 		return err
 	}
 
 	listenAddr := strings.TrimSpace(cfg.ListenAddr)
 	if listenAddr == "" {
-		listenAddr = connectrpc.DefaultListenAddr
+		listenAddr = cli.DefaultUIListenAddr
 	}
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", listenAddr)
@@ -296,7 +544,7 @@ func (s *appServerRunner) runRemoteUIProxy(ctx context.Context, cfg cli.ServeCon
 
 	httpSrv := &http.Server{
 		Addr:              ln.Addr().String(),
-		Handler:           mux,
+		Handler:           guardLoopbackSameOriginProxy(mux),
 		ReadHeaderTimeout: connectrpc.DefaultReadHeaderTimeout,
 		ReadTimeout:       connectrpc.DefaultReadTimeout,
 		WriteTimeout:      connectrpc.DefaultWriteTimeout,
@@ -327,6 +575,12 @@ type appMCPRunner struct {
 
 // NewMCPServer builds a functional MCP server wired to the dual-mode runtime.
 func (m *appMCPRunner) NewMCPServer(cfg mcp.Config) mcp.Server {
+	rv := reflect.ValueOf(&cfg).Elem()
+	if f := rv.FieldByName("AuthToken"); f.IsValid() && f.CanSet() && f.Kind() == reflect.String && strings.TrimSpace(f.String()) == "" {
+		if tok := strings.TrimSpace(os.Getenv("FLOWSK_AUTH_TOKEN")); tok != "" {
+			f.SetString(tok)
+		}
+	}
 	bridge := &mcpDepsBridge{
 		client: &dualModeClient{rt: m.rt},
 		fmt:    formatter.NewOutputFormatter(),
@@ -434,8 +688,14 @@ func (b *mcpDepsBridge) Execute(ctx context.Context, in mcp.ExecuteScriptInput) 
 	if err != nil {
 		return mcp.ExecuteScriptOutput{}, err
 	}
+	summary := res.FormattedSummary
+	if in.MaxTokens > 0 && summary != "" {
+		var buf bytes.Buffer
+		_ = cli.Render(&buf, cli.FormatCompact, in.MaxTokens, res)
+		summary = strings.TrimRight(buf.String(), "\n")
+	}
 	return mcp.ExecuteScriptOutput{
-		FormattedSummary: res.FormattedSummary,
+		FormattedSummary: summary,
 		AppliedCount:     res.AppliedCount,
 		DryRun:           res.DryRun,
 	}, nil
@@ -446,10 +706,20 @@ func (b *mcpDepsBridge) Guide(ctx context.Context, in mcp.GuideInput) (mcp.Guide
 	if err != nil {
 		return mcp.GuideOutput{}, err
 	}
+	md := sliceGuideMarkdown(g.Markdown, string(in.Section))
+	if in.MaxTokens > 0 && md != "" {
+		var buf bytes.Buffer
+		_ = cli.Render(&buf, cli.FormatCompact, in.MaxTokens, cli.LanguageGuideView{
+			Section:  string(in.Section),
+			Version:  g.Version,
+			Markdown: md,
+		})
+		md = buf.String()
+	}
 	return mcp.GuideOutput{
 		Version:  g.Version,
 		MIMEType: mcp.ResourceMIMETextMarkdown,
-		Markdown: g.Markdown,
+		Markdown: md,
 	}, nil
 }
 

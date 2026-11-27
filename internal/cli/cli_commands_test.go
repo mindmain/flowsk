@@ -1767,6 +1767,10 @@ func TestCodeModeDBConfigMCPAndServeCommands(t *testing.T) {
 	}
 
 	// 5. Web UI (`flowsk ui` / `flowsk web`), Markdown docs, Archive Purge, and Orphan Prune.
+	mustExecCLI(t, env, "", "ui", "--no-open")
+	if !env.lastServeCfg.EnableUI || env.lastServeCfg.ListenAddr != cli.DefaultUIListenAddr || cli.DefaultUIListenAddr != "127.0.0.1:1616" {
+		t.Fatalf("expected default flowsk ui ListenAddr=127.0.0.1:1616 with EnableUI=true, got: %+v", env.lastServeCfg)
+	}
 	mustExecCLI(t, env, "", "ui", "--listen", "127.0.0.1:18888", "--no-open")
 	if !env.lastServeCfg.EnableUI || env.lastServeCfg.ListenAddr != "127.0.0.1:18888" {
 		t.Fatalf("expected EnableUI=true on flowsk ui, got: %+v", env.lastServeCfg)
@@ -1802,8 +1806,8 @@ func TestCodeModeDBConfigMCPAndServeCommands(t *testing.T) {
 
 	env.orphanCnt = 2
 	statusWarn := mustExecCLI(t, env, "", "--format", "human", "status", "--all")
-	if !strings.Contains(statusWarn, "Warning: 2 orphan") || !strings.Contains(statusWarn, "\033[33m") {
-		t.Fatalf("expected yellow ANSI orphan warning in flowsk status, got:\n%s", statusWarn)
+	if !strings.Contains(statusWarn, "Warning: 2 orphan") || strings.Contains(statusWarn, "\033[33m") {
+		t.Fatalf("expected Lip Gloss orphan warning in flowsk status without raw ANSI in non-TTY, got:\n%s", statusWarn)
 	}
 	pruneDry := mustExecCLI(t, env, "", "--format", "compact", "prune", "--dry-run")
 	if !strings.Contains(pruneDry, "dry_run=true") || !strings.Contains(pruneDry, "total=2") {

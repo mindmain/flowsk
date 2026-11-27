@@ -306,6 +306,54 @@ func (e *localEngine) ensureWorkspaceAndActor(
 	return authctx.WithIdentity(ctx, id), ws, id
 }
 
+// resolveReadOnlyStreamIdentity resolves an existing workspace by UUID or slug
+// and constructs an authenticated Identity for read-only SSE streams without
+// enrolling unknown query-string handles as Workspace Owners in the database.
+func (e *localEngine) resolveReadOnlyStreamIdentity(
+	ctx context.Context,
+	workspaceRef, rawHandle, rawKind string,
+) (workspace.Workspace, authctx.Identity, error) {
+	wsRef := strings.TrimSpace(workspaceRef)
+	if wsRef == "" {
+		wsRef = "default"
+	}
+
+	var (
+		ws  workspace.Workspace
+		err error
+	)
+	if parsedWS, parseErr := uuid.Parse(wsRef); parseErr == nil && parsedWS != uuid.Nil {
+		ws, err = e.workspaceRepo.GetByID(ctx, parsedWS)
+	} else {
+		ws, err = e.workspaceRepo.GetBySlug(ctx, strings.ToLower(wsRef))
+	}
+	if err != nil || ws.ID == uuid.Nil {
+		return workspace.Workspace{}, authctx.Identity{}, errs.New(errs.ErrUnauthenticated, "app.StreamAuth", "workspace could not be resolved")
+	}
+
+	handle := sanitizeActorHandle(rawHandle)
+	kind := classifyActorKind(rawKind, handle)
+	actorID := deterministicUUID("actor", ws.ID.String(), handle)
+	if members, listErr := e.workspaceRepo.ListMembers(ctx, ws.ID); listErr == nil {
+		for _, m := range members {
+			if strings.EqualFold(m.Handle, handle) {
+				actorID = m.ActorID
+				if m.Kind.Valid() && rawKind == "" {
+					kind = m.Kind
+				}
+				break
+			}
+		}
+	}
+
+	return ws, authctx.Identity{
+		WorkspaceID: ws.ID,
+		ActorID:     actorID,
+		Kind:        kind,
+		Handle:      handle,
+	}, nil
+}
+
 func (e *localEngine) resolveProject(ctx context.Context, workspaceID uuid.UUID, projectRef string) (project.Project, error) {
 	ref := strings.TrimSpace(projectRef)
 	if ref == "" {
@@ -974,6 +1022,27 @@ func (c *dualModeClient) ListStates(ctx context.Context, workspaceRef, projectRe
 	if err != nil {
 		return nil, err
 	}
+	if boardSvc, ok := eng.projectSvc.(project.BoardMetadataService); ok {
+		persisted, listErr := boardSvc.ListWorkflowStates(authCtx, ws.ID, proj.ID)
+		if listErr != nil {
+			return nil, listErr
+		}
+		if len(persisted) > 0 {
+			out := make([]cli.WorkflowStateView, 0, len(persisted))
+			for _, st := range persisted {
+				out = append(out, cli.WorkflowStateView{
+					ID:        st.ID.String(),
+					ProjectID: proj.ID.String(),
+					Name:      st.Name,
+					Category:  st.Category,
+					Position:  int(st.Position),
+					Color:     st.ColorHex,
+				})
+			}
+			sort.Slice(out, func(i, j int) bool { return out[i].Position < out[j].Position })
+			return out, nil
+		}
+	}
 	base := defaultCLIWorkflowStates(proj.ID.String())
 	eng.customMu.RLock()
 	extra := append([]cli.WorkflowStateView(nil), eng.customStates[proj.ID]...)
@@ -981,6 +1050,21 @@ func (c *dualModeClient) ListStates(ctx context.Context, workspaceRef, projectRe
 	out := append(base, extra...)
 	sort.Slice(out, func(i, j int) bool { return out[i].Position < out[j].Position })
 	return out, nil
+}
+
+func normalizeCLIStateCategory(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "todo", "ready":
+		return "unstarted"
+	case "in_progress", "in-progress", "review", "in_review", "in-review", "blocked":
+		return "started"
+	case "done":
+		return "completed"
+	case "cancelled":
+		return "canceled"
+	default:
+		return strings.TrimSpace(raw)
+	}
 }
 
 func (c *dualModeClient) CreateState(ctx context.Context, in cli.CreateStateInput) (cli.WorkflowStateView, error) {
@@ -996,6 +1080,27 @@ func (c *dualModeClient) CreateState(ctx context.Context, in cli.CreateStateInpu
 	proj, err := eng.resolveProject(authCtx, ws.ID, in.Project)
 	if err != nil {
 		return cli.WorkflowStateView{}, err
+	}
+	if boardSvc, ok := eng.projectSvc.(project.BoardMetadataService); ok {
+		saved, createErr := boardSvc.CreateWorkflowState(authCtx, project.CreateWorkflowStateInput{
+			WorkspaceID: ws.ID,
+			ProjectID:   proj.ID,
+			Name:        in.Name,
+			Category:    normalizeCLIStateCategory(in.Category),
+			ColorHex:    in.Color,
+			Position:    int32(in.Position),
+		})
+		if createErr != nil {
+			return cli.WorkflowStateView{}, createErr
+		}
+		return cli.WorkflowStateView{
+			ID:        saved.ID.String(),
+			ProjectID: proj.ID.String(),
+			Name:      saved.Name,
+			Category:  saved.Category,
+			Position:  int(saved.Position),
+			Color:     saved.ColorHex,
+		}, nil
 	}
 	st := cli.WorkflowStateView{
 		ID:        uuid.NewString(),
@@ -1025,6 +1130,26 @@ func (c *dualModeClient) ListLabels(ctx context.Context, workspaceRef, projectRe
 	if err != nil {
 		return nil, err
 	}
+	if boardSvc, ok := eng.projectSvc.(project.BoardMetadataService); ok {
+		labels, listErr := boardSvc.ListLabels(authCtx, ws.ID, proj.ID)
+		if listErr != nil {
+			return nil, listErr
+		}
+		out := make([]cli.LabelView, 0, len(labels))
+		for _, lbl := range labels {
+			out = append(out, cli.LabelView{
+				ID:          lbl.ID.String(),
+				ProjectID:   proj.ID.String(),
+				Name:        lbl.Name,
+				Color:       lbl.ColorHex,
+				Description: lbl.Description,
+			})
+		}
+		sort.Slice(out, func(i, j int) bool {
+			return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+		})
+		return out, nil
+	}
 	eng.customMu.RLock()
 	out := append([]cli.LabelView(nil), eng.customLabels[proj.ID]...)
 	eng.customMu.RUnlock()
@@ -1044,6 +1169,25 @@ func (c *dualModeClient) CreateLabel(ctx context.Context, in cli.CreateLabelInpu
 	proj, err := eng.resolveProject(authCtx, ws.ID, in.Project)
 	if err != nil {
 		return cli.LabelView{}, err
+	}
+	if boardSvc, ok := eng.projectSvc.(project.BoardMetadataService); ok {
+		saved, createErr := boardSvc.CreateLabel(authCtx, project.CreateProjectLabelInput{
+			WorkspaceID: ws.ID,
+			ProjectID:   proj.ID,
+			Name:        in.Name,
+			ColorHex:    in.Color,
+			Description: in.Description,
+		})
+		if createErr != nil {
+			return cli.LabelView{}, createErr
+		}
+		return cli.LabelView{
+			ID:          saved.ID.String(),
+			ProjectID:   proj.ID.String(),
+			Name:        saved.Name,
+			Color:       saved.ColorHex,
+			Description: saved.Description,
+		}, nil
 	}
 	lbl := cli.LabelView{
 		ID:          uuid.NewString(),
@@ -1085,9 +1229,11 @@ func (c *dualModeClient) CreateObjective(ctx context.Context, in cli.CreateObjec
 	if strings.TrimSpace(in.Summary) != "" {
 		criteria = []string{strings.TrimSpace(in.Summary)}
 	}
+	objKind := mapCLIObjectiveKind(in.Kind)
 	obj, err := eng.objectiveSvc.CreateObjective(authCtx, objective.CreateObjectiveInput{
 		WorkspaceID:     ws.ID,
 		ProjectID:       proj.ID,
+		Kind:            objKind,
 		Slug:            slugifyIdentifier(in.Title),
 		Title:           in.Title,
 		Summary:         in.Summary,
@@ -1099,7 +1245,7 @@ func (c *dualModeClient) CreateObjective(ctx context.Context, in cli.CreateObjec
 	if err != nil {
 		return cli.ObjectiveView{}, err
 	}
-	view := toObjectiveView(obj, firstNonEmpty(in.Kind, "goal"), in.Owner)
+	view := toObjectiveView(obj, string(obj.Kind), in.Owner)
 	eng.populateObjectiveTaskCounts(authCtx, ws.ID, proj.ID, &view, obj.ID)
 	return view, nil
 }
@@ -1122,19 +1268,28 @@ func (c *dualModeClient) ListObjectives(ctx context.Context, in cli.ListObjectiv
 		}
 		projID = proj.ID
 	}
-	items, err := eng.objectiveSvc.ListObjectives(authCtx, objective.ListObjectivesFilter{
+	filter := objective.ListObjectivesFilter{
 		WorkspaceID: ws.ID,
 		ProjectID:   projID,
 		Limit:       int32(max(1, in.Limit)),
-	})
+	}
+	kindFilter := strings.ToLower(strings.TrimSpace(in.Kind))
+	if kindFilter != "" {
+		k := mapCLIObjectiveKind(kindFilter)
+		filter.Kind = &k
+	}
+	items, err := eng.objectiveSvc.ListObjectives(authCtx, filter)
 	if err != nil {
 		return cli.ObjectiveListResult{}, err
 	}
 	var out []cli.ObjectiveView
 	statusFilter := strings.ToLower(strings.TrimSpace(in.Status))
 	for _, item := range items {
-		v := toObjectiveView(item, "goal", "")
-		if statusFilter != "" && !strings.EqualFold(v.Status, statusFilter) {
+		v := toObjectiveView(item, string(item.Kind), "")
+		if kindFilter != "" && !strings.EqualFold(v.Kind, kindFilter) {
+			continue
+		}
+		if statusFilter != "" && !matchesObjectiveStatusFilter(item.Status, v.Status, statusFilter) {
 			continue
 		}
 		eng.populateObjectiveTaskCounts(authCtx, ws.ID, item.ProjectID, &v, item.ID)
@@ -1163,7 +1318,7 @@ func (c *dualModeClient) GetObjective(ctx context.Context, workspaceRef, project
 	if err != nil {
 		return cli.ObjectiveView{}, err
 	}
-	v := toObjectiveView(obj, "goal", "")
+	v := toObjectiveView(obj, string(obj.Kind), "")
 	eng.populateObjectiveTaskCounts(authCtx, ws.ID, obj.ProjectID, &v, obj.ID)
 	return v, nil
 }
@@ -1199,13 +1354,19 @@ func (c *dualModeClient) UpdateObjective(ctx context.Context, in cli.UpdateObjec
 		prioPtr = &p
 	}
 	var targetDate *time.Time
-	if in.TargetDate != nil && strings.TrimSpace(*in.TargetDate) != "" {
-		parsed, parseErr := time.Parse("2006-01-02", strings.TrimSpace(*in.TargetDate))
-		if parseErr != nil {
-			return cli.ObjectiveView{}, errs.Validation("app.UpdateObjective", "invalid --target-date: expected YYYY-MM-DD")
+	if in.TargetDate != nil {
+		trimmedTD := strings.TrimSpace(*in.TargetDate)
+		if trimmedTD == "" {
+			zeroTime := time.Time{}
+			targetDate = &zeroTime
+		} else {
+			parsed, parseErr := time.Parse("2006-01-02", trimmedTD)
+			if parseErr != nil {
+				return cli.ObjectiveView{}, errs.Validation("app.UpdateObjective", "invalid --target-date: expected YYYY-MM-DD")
+			}
+			utc := parsed.UTC()
+			targetDate = &utc
 		}
-		utc := parsed.UTC()
-		targetDate = &utc
 	}
 	updated, err := eng.objectiveSvc.UpdateObjective(authCtx, objective.UpdateObjectiveInput{
 		WorkspaceID:  ws.ID,
@@ -1219,7 +1380,7 @@ func (c *dualModeClient) UpdateObjective(ctx context.Context, in cli.UpdateObjec
 	if err != nil {
 		return cli.ObjectiveView{}, err
 	}
-	v := toObjectiveView(updated, "goal", "")
+	v := toObjectiveView(updated, string(updated.Kind), "")
 	eng.populateObjectiveTaskCounts(authCtx, ws.ID, updated.ProjectID, &v, updated.ID)
 	return v, nil
 }
@@ -1256,7 +1417,7 @@ func (c *dualModeClient) CloseObjective(ctx context.Context, in cli.CloseObjecti
 	if err != nil {
 		return cli.ObjectiveView{}, err
 	}
-	v := toObjectiveView(updated, "goal", "")
+	v := toObjectiveView(updated, string(updated.Kind), "")
 	v.Resolution = in.Resolution
 	eng.populateObjectiveTaskCounts(authCtx, ws.ID, updated.ProjectID, &v, updated.ID)
 	return v, nil
@@ -1287,14 +1448,34 @@ func (c *dualModeClient) CreateTask(ctx context.Context, in cli.CreateTaskInput)
 		objID = &idCopy
 	}
 
+	quietCtx := authctx.WithSuppressTaskSignal(authCtx)
+
 	var parentID *uuid.UUID
 	if strings.TrimSpace(in.Parent) != "" {
-		pt, ptErr := eng.resolveTask(authCtx, ws.ID, in.Parent)
+		pt, ptErr := eng.resolveTask(quietCtx, ws.ID, in.Parent)
 		if ptErr != nil {
 			return cli.TaskView{}, ptErr
 		}
 		idCopy := pt.ID
 		parentID = &idCopy
+	}
+
+	// Validate all DependsOn blocker references BEFORE creating the task so an
+	// unknown dependency never leaves behind an orphaned half-wired task.
+	var blockerIDs []uuid.UUID
+	seenBlockers := make(map[uuid.UUID]bool, len(in.DependsOn))
+	for _, depRef := range in.DependsOn {
+		if strings.TrimSpace(depRef) == "" {
+			continue
+		}
+		blockerTask, depErr := eng.resolveTask(quietCtx, ws.ID, depRef)
+		if depErr != nil {
+			return cli.TaskView{}, depErr
+		}
+		if !seenBlockers[blockerTask.ID] {
+			seenBlockers[blockerTask.ID] = true
+			blockerIDs = append(blockerIDs, blockerTask.ID)
+		}
 	}
 
 	var assigneeID *uuid.UUID
@@ -1317,7 +1498,7 @@ func (c *dualModeClient) CreateTask(ctx context.Context, in cli.CreateTaskInput)
 		ObjectiveID:        objID,
 		ParentTaskID:       parentID,
 		ExternalID:         strings.TrimSpace(in.ExternalID),
-		Kind:               task.KindFeature,
+		Kind:               mapCLITaskKind(in.Kind),
 		Title:              in.Title,
 		Description:        in.Description,
 		AcceptanceCriteria: criteria,
@@ -1330,29 +1511,22 @@ func (c *dualModeClient) CreateTask(ctx context.Context, in cli.CreateTaskInput)
 		return cli.TaskView{}, err
 	}
 
-	for _, depRef := range in.DependsOn {
-		if strings.TrimSpace(depRef) == "" {
-			continue
-		}
-		blockerTask, depErr := eng.resolveTask(authCtx, ws.ID, depRef)
-		if depErr != nil {
-			return cli.TaskView{}, depErr
-		}
+	for _, blockerID := range blockerIDs {
 		if _, relErr := eng.taskSvc.AddRelation(authCtx, task.AddRelationInput{
 			WorkspaceID:  ws.ID,
-			SourceTaskID: blockerTask.ID,
+			SourceTaskID: blockerID,
 			TargetTaskID: created.ID,
 			Type:         task.RelationBlocks,
-		}); relErr != nil {
+		}); relErr != nil && !errors.Is(relErr, errs.ErrConflict) {
 			return cli.TaskView{}, relErr
 		}
 	}
 
-	reloaded, err := eng.taskSvc.GetTask(authCtx, ws.ID, created.ID)
+	reloaded, err := eng.taskSvc.GetTask(quietCtx, ws.ID, created.ID)
 	if err != nil {
 		reloaded = created
 	}
-	return eng.buildTaskView(authCtx, ws.ID, reloaded, true, true, true), nil
+	return eng.buildTaskView(quietCtx, ws.ID, reloaded, true, true, true), nil
 }
 
 func (c *dualModeClient) ListTasks(ctx context.Context, in cli.ListTasksInput) (cli.TaskListResult, error) {
@@ -1386,7 +1560,7 @@ func (c *dualModeClient) ListTasks(ctx context.Context, in cli.ListTasksInput) (
 
 	var parentID *uuid.UUID
 	if strings.TrimSpace(in.Parent) != "" {
-		pt, ptErr := eng.resolveTask(authCtx, ws.ID, in.Parent)
+		pt, ptErr := eng.resolveTask(authctx.WithSuppressTaskSignal(authCtx), ws.ID, in.Parent)
 		if ptErr != nil {
 			return cli.TaskListResult{}, ptErr
 		}
@@ -1421,6 +1595,7 @@ func (c *dualModeClient) ListTasks(ctx context.Context, in cli.ListTasksInput) (
 	unclaimedOnly := in.Unclaimed || (parsedQ.Claimed != nil && !*parsedQ.Claimed)
 	extFilter := firstNonEmpty(in.ExternalID, parsedQ.ExternalID)
 
+	pollLimit := int32(max(100, min(max(1, in.Limit)*5, 1000)))
 	rows, err := eng.taskSvc.PollWorkQueue(authCtx, task.AgentWorkQueueFilter{
 		WorkspaceID:   ws.ID,
 		ProjectID:     projID,
@@ -1430,10 +1605,30 @@ func (c *dualModeClient) ListTasks(ctx context.Context, in cli.ListTasksInput) (
 		Statuses:      statuses,
 		RequiredTags:  reqTags,
 		OnlyUnclaimed: unclaimedOnly,
-		Limit:         int32(max(1, min(in.Limit, 100))),
+		Limit:         pollLimit,
 	})
 	if err != nil {
 		return cli.TaskListResult{}, err
+	}
+
+	effActor := firstNonEmpty(in.Assignee, parsedQ.Actor)
+	effActorNorm := ""
+	var effActorID uuid.UUID
+	if effActor != "" {
+		effActorNorm = sanitizeActorHandle(effActor)
+		if parsedActorUUID, pErr := uuid.Parse(effActor); pErr == nil && parsedActorUUID != uuid.Nil {
+			effActorID = parsedActorUUID
+		} else if members, mErr := eng.workspaceRepo.ListMembers(authCtx, ws.ID); mErr == nil {
+			for _, m := range members {
+				if strings.EqualFold(m.Handle, effActor) || strings.EqualFold(m.Handle, effActorNorm) {
+					effActorID = m.ActorID
+					break
+				}
+			}
+			if effActorID == uuid.Nil {
+				effActorID = deterministicUUID("actor", ws.ID.String(), effActorNorm)
+			}
+		}
 	}
 
 	var out []cli.TaskSummaryView
@@ -1457,9 +1652,28 @@ func (c *dualModeClient) ListTasks(ctx context.Context, in cli.ListTasksInput) (
 		if parsedQ.Priority != nil && r.Priority != *parsedQ.Priority {
 			continue
 		}
-		effActor := firstNonEmpty(in.Assignee, parsedQ.Actor)
-		if effActor != "" && !strings.EqualFold(r.HolderHandle, effActor) {
-			continue
+
+		var fullCached *task.Task
+		loadFull := func() (*task.Task, error) {
+			if fullCached != nil {
+				return fullCached, nil
+			}
+			ft, gErr := eng.taskSvc.GetTask(authctx.WithSuppressTaskSignal(authCtx), ws.ID, r.ID)
+			if gErr != nil {
+				return nil, gErr
+			}
+			fullCached = &ft
+			return fullCached, nil
+		}
+
+		if effActor != "" {
+			matchedHolder := strings.EqualFold(r.HolderHandle, effActor) || (effActorNorm != "" && strings.EqualFold(r.HolderHandle, effActorNorm))
+			if !matchedHolder {
+				ft, gErr := loadFull()
+				if gErr != nil || ft.AssigneeActorID == nil || *ft.AssigneeActorID != effActorID {
+					continue
+				}
+			}
 		}
 		if parsedQ.Objective != "" && !strings.EqualFold(r.ObjectiveSlug, parsedQ.Objective) {
 			continue
@@ -1468,7 +1682,7 @@ func (c *dualModeClient) ListTasks(ctx context.Context, in cli.ListTasksInput) (
 			continue
 		}
 		if len(parsedQ.Terms) > 0 {
-			full, gErr := eng.taskSvc.GetTask(authCtx, ws.ID, r.ID)
+			full, gErr := loadFull()
 			var commentText string
 			if cms, cErr := eng.taskSvc.ListComments(authCtx, ws.ID, r.ID, 20); cErr == nil {
 				var cb strings.Builder
@@ -1487,6 +1701,9 @@ func (c *dualModeClient) ListTasks(ctx context.Context, in cli.ListTasksInput) (
 			}
 		}
 		out = append(out, toTaskSummaryView(r))
+		if in.Limit > 0 && len(out) >= in.Limit {
+			break
+		}
 	}
 	return cli.TaskListResult{Items: out}, nil
 }
@@ -1524,13 +1741,14 @@ func (c *dualModeClient) UpdateTask(ctx context.Context, in cli.UpdateTaskInput)
 		return cli.TaskView{}, err
 	}
 	authCtx, ws, _ := eng.ensureWorkspaceAndActor(ctx, firstNonEmpty(in.Workspace, opts.Workspace), firstNonEmpty(in.Actor, opts.Actor), "")
+	quietCtx := authctx.WithSuppressTaskSignal(authCtx)
 	var projID uuid.UUID
 	if strings.TrimSpace(in.Project) != "" {
-		if p, pErr := eng.resolveProject(authCtx, ws.ID, in.Project); pErr == nil {
+		if p, pErr := eng.resolveProject(quietCtx, ws.ID, in.Project); pErr == nil {
 			projID = p.ID
 		}
 	}
-	target, err := eng.resolveTaskInProject(authCtx, ws.ID, projID, in.Task)
+	target, err := eng.resolveTaskInProject(quietCtx, ws.ID, projID, in.Task)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
@@ -1546,21 +1764,43 @@ func (c *dualModeClient) UpdateTask(ctx context.Context, in cli.UpdateTaskInput)
 		p := mapCLIPriorityToDomain(*in.Priority)
 		upd.Priority = &p
 	}
-	if in.Objective != nil && strings.TrimSpace(*in.Objective) != "" {
-		obj, oErr := eng.resolveObjective(authCtx, ws.ID, target.ProjectID, *in.Objective)
-		if oErr != nil {
-			return cli.TaskView{}, oErr
+	if in.Objective != nil {
+		if strings.TrimSpace(*in.Objective) == "" {
+			nilID := uuid.Nil
+			upd.ObjectiveID = &nilID
+		} else {
+			obj, oErr := eng.resolveObjective(quietCtx, ws.ID, target.ProjectID, *in.Objective)
+			if oErr != nil {
+				return cli.TaskView{}, oErr
+			}
+			idCopy := obj.ID
+			upd.ObjectiveID = &idCopy
 		}
-		idCopy := obj.ID
-		upd.ObjectiveID = &idCopy
 	}
-	if in.Parent != nil && strings.TrimSpace(*in.Parent) != "" {
-		pt, ptErr := eng.resolveTask(authCtx, ws.ID, *in.Parent)
-		if ptErr != nil {
-			return cli.TaskView{}, ptErr
+	if in.Parent != nil {
+		if strings.TrimSpace(*in.Parent) == "" {
+			nilID := uuid.Nil
+			upd.ParentTaskID = &nilID
+		} else {
+			pt, ptErr := eng.resolveTask(quietCtx, ws.ID, *in.Parent)
+			if ptErr != nil {
+				return cli.TaskView{}, ptErr
+			}
+			idCopy := pt.ID
+			upd.ParentTaskID = &idCopy
 		}
-		idCopy := pt.ID
-		upd.ParentTaskID = &idCopy
+	}
+	if in.Assignee != nil {
+		if strings.TrimSpace(*in.Assignee) == "" {
+			nilID := uuid.Nil
+			upd.AssigneeActorID = &nilID
+		} else {
+			_, _, assigneeIdent := eng.ensureWorkspaceAndActor(ctx, ws.ID.String(), *in.Assignee, "")
+			if assigneeIdent.ActorID != uuid.Nil {
+				idCopy := assigneeIdent.ActorID
+				upd.AssigneeActorID = &idCopy
+			}
+		}
 	}
 	if in.Acceptance != nil {
 		upd.AcceptanceCriteria = strings.Split(*in.Acceptance, "\n")
@@ -1576,7 +1816,7 @@ func (c *dualModeClient) UpdateTask(ctx context.Context, in cli.UpdateTaskInput)
 		for _, tg := range in.RemoveLabels {
 			delete(tagSet, tg)
 		}
-		var merged []string
+		merged := make([]string, 0, len(tagSet))
 		for tg := range tagSet {
 			merged = append(merged, tg)
 		}
@@ -1601,7 +1841,8 @@ func (c *dualModeClient) MoveTask(ctx context.Context, in cli.MoveTaskInput) (cl
 		return cli.TaskView{}, err
 	}
 	authCtx, ws, _ := eng.ensureWorkspaceAndActor(ctx, firstNonEmpty(in.Workspace, opts.Workspace), firstNonEmpty(in.Actor, opts.Actor), "")
-	target, err := eng.resolveTask(authCtx, ws.ID, in.Task)
+	quietCtx := authctx.WithSuppressTaskSignal(authCtx)
+	target, err := eng.resolveTask(quietCtx, ws.ID, in.Task)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
@@ -1616,7 +1857,7 @@ func (c *dualModeClient) MoveTask(ctx context.Context, in cli.MoveTaskInput) (cl
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	return eng.buildTaskView(authCtx, ws.ID, moved, true, true, true), nil
+	return eng.buildTaskView(quietCtx, ws.ID, moved, true, true, true), nil
 }
 
 func (c *dualModeClient) ClaimTask(ctx context.Context, in cli.ClaimTaskInput) (cli.TaskView, error) {
@@ -1629,7 +1870,8 @@ func (c *dualModeClient) ClaimTask(ctx context.Context, in cli.ClaimTaskInput) (
 		return cli.TaskView{}, err
 	}
 	authCtx, ws, _ := eng.ensureWorkspaceAndActor(ctx, firstNonEmpty(in.Workspace, opts.Workspace), firstNonEmpty(in.Actor, opts.Actor), "")
-	target, err := eng.resolveTask(authCtx, ws.ID, in.Task)
+	quietCtx := authctx.WithSuppressTaskSignal(authCtx)
+	target, err := eng.resolveTask(quietCtx, ws.ID, in.Task)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
@@ -1653,11 +1895,11 @@ func (c *dualModeClient) ClaimTask(ctx context.Context, in cli.ClaimTaskInput) (
 			Body:        in.Note,
 		})
 	}
-	reloaded, err := eng.taskSvc.GetTask(authCtx, ws.ID, target.ID)
+	reloaded, err := eng.taskSvc.GetTask(quietCtx, ws.ID, target.ID)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	return eng.buildTaskView(authCtx, ws.ID, reloaded, true, true, true), nil
+	return eng.buildTaskView(quietCtx, ws.ID, reloaded, true, true, true), nil
 }
 
 func (c *dualModeClient) ReleaseTask(ctx context.Context, in cli.ReleaseTaskInput) (cli.TaskView, error) {
@@ -1670,7 +1912,8 @@ func (c *dualModeClient) ReleaseTask(ctx context.Context, in cli.ReleaseTaskInpu
 		return cli.TaskView{}, err
 	}
 	authCtx, ws, _ := eng.ensureWorkspaceAndActor(ctx, firstNonEmpty(in.Workspace, opts.Workspace), firstNonEmpty(in.Actor, opts.Actor), "")
-	target, err := eng.resolveTask(authCtx, ws.ID, in.Task)
+	quietCtx := authctx.WithSuppressTaskSignal(authCtx)
+	target, err := eng.resolveTask(quietCtx, ws.ID, in.Task)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
@@ -1690,7 +1933,7 @@ func (c *dualModeClient) ReleaseTask(ctx context.Context, in cli.ReleaseTaskInpu
 		if moveErr != nil {
 			return cli.TaskView{}, moveErr
 		}
-		return eng.buildTaskView(authCtx, ws.ID, moved, true, true, true), nil
+		return eng.buildTaskView(quietCtx, ws.ID, moved, true, true, true), nil
 	}
 	if err := eng.taskSvc.ReleaseTask(authCtx, task.ReleaseTaskInput{
 		WorkspaceID:    ws.ID,
@@ -1701,11 +1944,11 @@ func (c *dualModeClient) ReleaseTask(ctx context.Context, in cli.ReleaseTaskInpu
 	}); err != nil {
 		return cli.TaskView{}, err
 	}
-	reloaded, err := eng.taskSvc.GetTask(authCtx, ws.ID, target.ID)
+	reloaded, err := eng.taskSvc.GetTask(quietCtx, ws.ID, target.ID)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	return eng.buildTaskView(authCtx, ws.ID, reloaded, true, true, true), nil
+	return eng.buildTaskView(quietCtx, ws.ID, reloaded, true, true, true), nil
 }
 
 func (c *dualModeClient) BlockTask(ctx context.Context, in cli.BlockTaskInput) (cli.TaskView, error) {
@@ -1718,7 +1961,8 @@ func (c *dualModeClient) BlockTask(ctx context.Context, in cli.BlockTaskInput) (
 		return cli.TaskView{}, err
 	}
 	authCtx, ws, _ := eng.ensureWorkspaceAndActor(ctx, firstNonEmpty(in.Workspace, opts.Workspace), firstNonEmpty(in.Actor, opts.Actor), "")
-	target, err := eng.resolveTask(authCtx, ws.ID, in.Task)
+	quietCtx := authctx.WithSuppressTaskSignal(authCtx)
+	target, err := eng.resolveTask(quietCtx, ws.ID, in.Task)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
@@ -1726,7 +1970,7 @@ func (c *dualModeClient) BlockTask(ctx context.Context, in cli.BlockTaskInput) (
 		if strings.TrimSpace(upRef) == "" {
 			continue
 		}
-		upstream, upErr := eng.resolveTask(authCtx, ws.ID, upRef)
+		upstream, upErr := eng.resolveTask(quietCtx, ws.ID, upRef)
 		if upErr != nil {
 			return cli.TaskView{}, upErr
 		}
@@ -1751,18 +1995,18 @@ func (c *dualModeClient) BlockTask(ctx context.Context, in cli.BlockTaskInput) (
 			return cli.TaskView{}, err
 		}
 	} else if strings.TrimSpace(in.Reason) != "" {
-		_, _ = eng.taskSvc.AddComment(authCtx, task.AddCommentInput{
+		_, _ = eng.taskSvc.AddComment(quietCtx, task.AddCommentInput{
 			WorkspaceID: ws.ID,
 			TaskID:      target.ID,
 			Kind:        task.CommentKindBlocker,
 			Body:        in.Reason,
 		})
 	}
-	reloaded, err := eng.taskSvc.GetTask(authCtx, ws.ID, target.ID)
+	reloaded, err := eng.taskSvc.GetTask(quietCtx, ws.ID, target.ID)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	return eng.buildTaskView(authCtx, ws.ID, reloaded, true, true, true), nil
+	return eng.buildTaskView(quietCtx, ws.ID, reloaded, true, true, true), nil
 }
 
 func (c *dualModeClient) UnblockTask(ctx context.Context, in cli.UnblockTaskInput) (cli.TaskView, error) {
@@ -1775,14 +2019,15 @@ func (c *dualModeClient) UnblockTask(ctx context.Context, in cli.UnblockTaskInpu
 		return cli.TaskView{}, err
 	}
 	authCtx, ws, _ := eng.ensureWorkspaceAndActor(ctx, firstNonEmpty(in.Workspace, opts.Workspace), firstNonEmpty(in.Actor, opts.Actor), "")
-	target, err := eng.resolveTask(authCtx, ws.ID, in.Task)
+	quietCtx := authctx.WithSuppressTaskSignal(authCtx)
+	target, err := eng.resolveTask(quietCtx, ws.ID, in.Task)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
-	rels, _ := eng.taskSvc.ListRelations(authCtx, ws.ID, target.ID)
+	rels, _ := eng.taskSvc.ListRelations(quietCtx, ws.ID, target.ID)
 	clearFilter := make(map[uuid.UUID]bool)
 	for _, ref := range in.ClearedBy {
-		if up, upErr := eng.resolveTask(authCtx, ws.ID, ref); upErr == nil {
+		if up, upErr := eng.resolveTask(quietCtx, ws.ID, ref); upErr == nil {
 			clearFilter[up.ID] = true
 		}
 	}
@@ -1793,7 +2038,7 @@ func (c *dualModeClient) UnblockTask(ctx context.Context, in cli.UnblockTaskInpu
 			}
 		}
 	}
-	reloaded, err := eng.taskSvc.GetTask(authCtx, ws.ID, target.ID)
+	reloaded, err := eng.taskSvc.GetTask(quietCtx, ws.ID, target.ID)
 	if err != nil {
 		return cli.TaskView{}, err
 	}
@@ -1805,7 +2050,7 @@ func (c *dualModeClient) UnblockTask(ctx context.Context, in cli.UnblockTaskInpu
 			ResolutionComment: in.Note,
 		})
 	}
-	return eng.buildTaskView(authCtx, ws.ID, reloaded, true, true, true), nil
+	return eng.buildTaskView(quietCtx, ws.ID, reloaded, true, true, true), nil
 }
 
 func (c *dualModeClient) AddComment(ctx context.Context, in cli.AddCommentInput) (cli.CommentView, error) {
@@ -1818,7 +2063,7 @@ func (c *dualModeClient) AddComment(ctx context.Context, in cli.AddCommentInput)
 		return cli.CommentView{}, err
 	}
 	authCtx, ws, ident := eng.ensureWorkspaceAndActor(ctx, firstNonEmpty(in.Workspace, opts.Workspace), firstNonEmpty(in.Actor, opts.Actor), "")
-	target, err := eng.resolveTask(authCtx, ws.ID, in.Task)
+	target, err := eng.resolveTask(authctx.WithSuppressTaskSignal(authCtx), ws.ID, in.Task)
 	if err != nil {
 		return cli.CommentView{}, err
 	}
@@ -1853,7 +2098,8 @@ func (c *dualModeClient) ListComments(ctx context.Context, in cli.ListCommentsIn
 		return cli.CommentListResult{}, err
 	}
 	authCtx, ws, _ := eng.ensureWorkspaceAndActor(ctx, firstNonEmpty(in.Workspace, opts.Workspace), opts.Actor, "")
-	target, err := eng.resolveTask(authCtx, ws.ID, in.Task)
+	quietCtx := authctx.WithSuppressTaskSignal(authCtx)
+	target, err := eng.resolveTask(quietCtx, ws.ID, in.Task)
 	if err != nil {
 		return cli.CommentListResult{}, err
 	}
@@ -1932,11 +2178,15 @@ func (c *dualModeClient) NextTask(ctx context.Context, in cli.NextTaskInput) (cl
 		}
 		claimed = true
 	}
-	full, err := eng.taskSvc.GetTask(authCtx, ws.ID, bestID)
+	fetchCtx := authCtx
+	if claimed {
+		fetchCtx = authctx.WithSuppressTaskSignal(authCtx)
+	}
+	full, err := eng.taskSvc.GetTask(fetchCtx, ws.ID, bestID)
 	if err != nil {
 		return cli.NextTaskResult{}, err
 	}
-	view := eng.buildTaskView(authCtx, ws.ID, full, true, true, true)
+	view := eng.buildTaskView(authctx.WithSuppressTaskSignal(authCtx), ws.ID, full, true, true, true)
 	return cli.NextTaskResult{Task: &view, Claimed: claimed}, nil
 }
 
@@ -1966,6 +2216,16 @@ func (c *dualModeClient) Digest(ctx context.Context, in cli.TaskDigestInput) (cl
 	for st, cnt := range dig.CountsByStatus {
 		counts[string(st)] = int(cnt)
 	}
+	kindByObjID := make(map[uuid.UUID]string)
+	if allObjs, listErr := eng.objectiveSvc.ListObjectives(authCtx, objective.ListObjectivesFilter{
+		WorkspaceID: ws.ID,
+		ProjectID:   proj.ID,
+		Limit:       200,
+	}); listErr == nil {
+		for _, item := range allObjs {
+			kindByObjID[item.ID] = string(item.Kind)
+		}
+	}
 	var objViews []cli.ObjectiveView
 	for _, o := range dig.ActiveObjectives {
 		objViews = append(objViews, cli.ObjectiveView{
@@ -1973,7 +2233,7 @@ func (c *dualModeClient) Digest(ctx context.Context, in cli.TaskDigestInput) (cl
 			WorkspaceID:    ws.ID.String(),
 			ProjectID:      proj.ID.String(),
 			Key:            o.Slug,
-			Kind:           "goal",
+			Kind:           firstNonEmpty(kindByObjID[o.ID], "goal"),
 			Title:          o.Title,
 			Status:         "active",
 			Priority:       int(o.PriorityRank),
@@ -2047,10 +2307,11 @@ func (c *dualModeClient) GetGuide(ctx context.Context, section string) (cli.Lang
 	if err != nil {
 		return cli.LanguageGuideView{}, err
 	}
+	effSection := firstNonEmpty(section, "all")
 	return cli.LanguageGuideView{
-		Section:  firstNonEmpty(section, "all"),
+		Section:  effSection,
 		Version:  "2.0.0",
-		Markdown: spec,
+		Markdown: sliceGuideMarkdown(spec, effSection),
 	}, nil
 }
 
@@ -2066,6 +2327,7 @@ func (c *dualModeClient) ListAuditEvents(ctx context.Context, in cli.ListAuditEv
 	authCtx, ws, _ := eng.ensureWorkspaceAndActor(ctx, firstNonEmpty(in.Workspace, opts.Workspace), opts.Actor, "")
 	records, err := eng.auditSvc.QueryRecords(authCtx, audit.QueryFilter{
 		WorkspaceID:  ws.ID,
+		Action:       mapCLIAuditAction(in.Action),
 		ResourceType: strings.TrimSpace(in.EntityType),
 		ResourceID:   strings.TrimSpace(in.EntityID),
 		Since:        in.Since,
@@ -2198,7 +2460,7 @@ func (c *dualModeClient) GetTaskMarkdown(ctx context.Context, workspaceRef, task
 		return cli.MarkdownDocView{}, err
 	}
 	authCtx, ws, _ := eng.ensureWorkspaceAndActor(ctx, firstNonEmpty(workspaceRef, opts.Workspace), opts.Actor, "")
-	t, err := eng.resolveTask(authCtx, ws.ID, taskRef)
+	t, err := eng.resolveTask(authctx.WithSuppressTaskSignal(authCtx), ws.ID, taskRef)
 	if err != nil {
 		return cli.MarkdownDocView{}, err
 	}
@@ -2227,7 +2489,7 @@ func (c *dualModeClient) PutTaskMarkdown(ctx context.Context, workspaceRef, task
 		return cli.MarkdownDocView{}, err
 	}
 	authCtx, ws, _ := eng.ensureWorkspaceAndActor(ctx, firstNonEmpty(workspaceRef, opts.Workspace), firstNonEmpty(actor, opts.Actor), "")
-	t, err := eng.resolveTask(authCtx, ws.ID, taskRef)
+	t, err := eng.resolveTask(authctx.WithSuppressTaskSignal(authCtx), ws.ID, taskRef)
 	if err != nil {
 		return cli.MarkdownDocView{}, err
 	}
@@ -2256,7 +2518,7 @@ func (c *dualModeClient) DeleteTaskMarkdown(ctx context.Context, workspaceRef, t
 		return cli.MarkdownDocView{}, err
 	}
 	authCtx, ws, _ := eng.ensureWorkspaceAndActor(ctx, firstNonEmpty(workspaceRef, opts.Workspace), firstNonEmpty(actor, opts.Actor), "")
-	t, err := eng.resolveTask(authCtx, ws.ID, taskRef)
+	t, err := eng.resolveTask(authctx.WithSuppressTaskSignal(authCtx), ws.ID, taskRef)
 	if err != nil {
 		return cli.MarkdownDocView{}, err
 	}
@@ -2393,6 +2655,12 @@ func (e *localEngine) buildTaskView(
 	t task.Task,
 	includeDeps, includeSubtasks, includeComments bool,
 ) cli.TaskView {
+	ctx = authctx.WithSuppressTaskSignal(ctx)
+	var lastSignalCopy *time.Time
+	if t.LastSignalAt != nil && !t.LastSignalAt.IsZero() {
+		sig := t.LastSignalAt.UTC()
+		lastSignalCopy = &sig
+	}
 	v := cli.TaskView{
 		ID:          t.ID.String(),
 		WorkspaceID: t.WorkspaceID.String(),
@@ -2408,6 +2676,7 @@ func (e *localEngine) buildTaskView(
 		Acceptance:     strings.Join(t.AcceptanceCriteriaCopy(), "\n"),
 		Blocked:        t.UnresolvedBlockerCount > 0 || t.Status == task.StatusBlocked,
 		HasMarkdownDoc: t.HasMarkdownDoc,
+		LastSignalAt:   lastSignalCopy,
 		CreatedAt:      t.CreatedAt,
 		UpdatedAt:      t.UpdatedAt,
 	}
@@ -2419,6 +2688,17 @@ func (e *localEngine) buildTaskView(
 	if t.ParentTaskID != nil {
 		if pt, err := e.taskSvc.GetTask(ctx, wsID, *t.ParentTaskID); err == nil {
 			v.ParentKey = pt.Key
+		}
+	}
+	if t.AssigneeActorID != nil && *t.AssigneeActorID != uuid.Nil {
+		v.Assignee = t.AssigneeActorID.String()
+		if members, err := e.workspaceRepo.ListMembers(ctx, wsID); err == nil {
+			for _, m := range members {
+				if m.ActorID == *t.AssigneeActorID {
+					v.Assignee = firstNonEmpty(m.Handle, m.ActorID.String())
+					break
+				}
+			}
 		}
 	}
 	if t.ActiveLease != nil {
@@ -2545,6 +2825,11 @@ func toObjectiveView(o objective.Objective, kind, owner string) cli.ObjectiveVie
 }
 
 func toTaskSummaryView(s task.CompactTaskSummary) cli.TaskSummaryView {
+	var lastSignalCopy *time.Time
+	if s.LastSignalAt != nil && !s.LastSignalAt.IsZero() {
+		sig := s.LastSignalAt.UTC()
+		lastSignalCopy = &sig
+	}
 	return cli.TaskSummaryView{
 		ID:           s.ID.String(),
 		Key:          s.Key,
@@ -2559,6 +2844,7 @@ func toTaskSummaryView(s task.CompactTaskSummary) cli.TaskSummaryView {
 		Labels:         append([]string(nil), s.Tags...),
 		Blocked:        s.UnresolvedBlockerCount > 0 || s.Status == task.StatusBlocked,
 		HasMarkdownDoc: s.HasMarkdownDoc,
+		LastSignalAt:   lastSignalCopy,
 		UpdatedAt:      s.UpdatedAt,
 	}
 }
@@ -2612,16 +2898,117 @@ func summarizeAuditPayload(action, entityType, newRaw, oldRaw string) string {
 	return fmt.Sprintf("%s %s", action, entityType)
 }
 
+func mapCLIObjectiveKind(raw string) objective.Kind {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "milestone":
+		return objective.KindMilestone
+	case "cycle":
+		return objective.KindCycle
+	default:
+		return objective.KindGoal
+	}
+}
+
 func mapCLIObjectiveStatus(raw string) objective.Status {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "planned", "draft":
 		return objective.StatusDraft
+	case "at_risk", "at-risk":
+		return objective.StatusAtRisk
 	case "achieved", "completed", "done":
 		return objective.StatusAchieved
-	case "dropped", "canceled", "cancelled":
+	case "dropped", "canceled", "cancelled", "superseded":
 		return objective.StatusDropped
 	default:
 		return objective.StatusActive
+	}
+}
+
+func matchesObjectiveStatusFilter(domainSt objective.Status, viewSt, filter string) bool {
+	if strings.EqualFold(viewSt, filter) {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(filter)) {
+	case "planned", "draft":
+		return domainSt == objective.StatusDraft
+	case "active":
+		return domainSt == objective.StatusActive
+	case "at_risk", "at-risk":
+		return domainSt == objective.StatusAtRisk
+	case "achieved", "completed", "done":
+		return domainSt == objective.StatusAchieved
+	case "dropped", "canceled", "cancelled", "superseded":
+		return domainSt == objective.StatusDropped
+	default:
+		return false
+	}
+}
+
+func mapCLITaskKind(raw string) task.Kind {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "epic":
+		return task.KindEpic
+	case "bug":
+		return task.KindBug
+	case "chore", "task":
+		return task.KindChore
+	case "research", "issue":
+		return task.KindResearch
+	default:
+		return task.KindFeature
+	}
+}
+
+func mapCLIAuditAction(raw string) tx.AuditAction {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	lower := strings.ToLower(trimmed)
+	lower = strings.TrimPrefix(lower, "audit_action_")
+	if dotIdx := strings.LastIndexByte(lower, '.'); dotIdx >= 0 {
+		lower = lower[dotIdx+1:]
+	}
+	switch lower {
+	case "create", "created":
+		return tx.AuditActionCreate
+	case "update", "updated":
+		return tx.AuditActionUpdate
+	case "delete", "deleted", "archived", "purged":
+		return tx.AuditActionDelete
+	case "transition", "transitioned", "move", "moved":
+		return tx.AuditActionTransition
+	case "claim", "claimed":
+		return tx.AuditActionClaim
+	case "release", "released":
+		return tx.AuditActionRelease
+	case "batchexec", "batch_exec", "exec", "executed":
+		return tx.AuditActionBatchExec
+	default:
+		return tx.AuditAction(trimmed)
+	}
+}
+
+func sliceGuideMarkdown(md, section string) string {
+	norm := strings.ToLower(strings.TrimSpace(section))
+	if norm == "" || norm == "all" {
+		return md
+	}
+	parts := strings.Split(md, "\n---\n")
+	if len(parts) < 4 {
+		return md
+	}
+	switch norm {
+	case "overview":
+		return strings.TrimSpace(parts[0]) + "\n"
+	case "filters", "queries", "search":
+		return strings.TrimSpace(parts[1]) + "\n"
+	case "syntax", "verbs", "mutations", "sdk":
+		return strings.TrimSpace(parts[2]) + "\n"
+	case "examples", "recipes":
+		return strings.TrimSpace(parts[3]) + "\n"
+	default:
+		return md
 	}
 }
 

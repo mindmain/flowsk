@@ -54,7 +54,7 @@ strictly client-local directory bindings.
 
 Zero Repo & Server Path Footprint:
   Host directory associations created with 'flowsk project link' are stored
-  100% locally in ~/.config/flowsk/local_paths.json on your machine (so Mario's
+  100% locally in ~/.flowsk/local_paths.json on your machine (so Mario's
   ~/Desktop/app and Paolo's ~/Downloads/app map independently to the same server
   project without polluting the Git repo or sending host paths to the server).`,
 	}
@@ -423,13 +423,13 @@ func (h *projectHandler) newBindingsSubcommand() *cobra.Command {
 func (h *projectHandler) newLinkSubcommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "link [dir]",
-		Short: "Bind a local directory to a logical project in ~/.config/flowsk/local_paths.json (100% client-local)",
+		Short: "Bind a local directory to a logical project in ~/.flowsk/local_paths.json (100% client-local)",
 		Long: `Associates [dir] (or the current working directory when omitted) with the logical
 project specified via --project (and --workspace).
 
 Strict Local-Only Isolation Rules:
   1. 100% Local Per Machine: The directory mapping is written ONLY to
-     ~/.config/flowsk/local_paths.json on THIS client machine.
+     ~/.flowsk/local_paths.json on THIS client machine.
   2. Zero Target-Repository Footprint: Flowsk NEVER creates .flowsk, config files,
      or gitignored artifacts inside [dir].
   3. Zero Server Path Leakage: [dir] is NEVER transmitted, logged, or persisted
@@ -469,7 +469,7 @@ func (h *projectHandler) newUnlinkSubcommand() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "unlink [dir]",
-		Short: "Remove a client-local directory binding from ~/.config/flowsk/local_paths.json",
+		Short: "Remove a client-local directory binding from ~/.flowsk/local_paths.json",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -529,7 +529,7 @@ func (h *projectHandler) newUnlinkSubcommand() *cobra.Command {
 func (h *projectHandler) newWhereSubcommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "where [dir]",
-		Short: "Show the client-local project binding from ~/.config/flowsk/local_paths.json",
+		Short: "Show the client-local project binding from ~/.flowsk/local_paths.json",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()

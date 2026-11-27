@@ -64,7 +64,7 @@ func TestLocalZeroSetupAutoBootstrapAndTerminalWorkflow(t *testing.T) {
 	rt := app.NewRuntime()
 	t.Cleanup(func() { _ = rt.Close() })
 
-	// 1. First command ever: creates ~/.local/share/flowsk/flowsk.db, migrates schema,
+	// 1. First command ever: creates ~/.flowsk/flowsk.db, migrates schema,
 	//    provisions default workspace, and creates logical project FLW!
 	out := runCLI(t, rt, "--format", "human", "--actor", "mario", "project", "create", "FLW", "--name", "Flowsk Core")
 	if !strings.Contains(out, "FLW") || !strings.Contains(out, "Flowsk Core") {
@@ -587,8 +587,8 @@ func TestWebUIEmbeddedServerArchivePurgeMarkdownDocsAndOrphanPrune(t *testing.T)
 	}
 
 	statusWithOrphans := runCLI(t, rt, "--format", "human", "status", "--all")
-	if !strings.Contains(statusWithOrphans, "2 orphan or missing Markdown resource(s)") || !strings.Contains(statusWithOrphans, "\033[33m") {
-		t.Fatalf("expected yellow ANSI orphan warning for 2 issues in status, got:\n%s", statusWithOrphans)
+	if !strings.Contains(statusWithOrphans, "⚠ Warning: 2 orphan or missing Markdown resource(s)") || strings.Contains(statusWithOrphans, "\033[33m") {
+		t.Fatalf("expected Lip Gloss orphan warning for 2 issues without raw ANSI in non-TTY status, got:\n%s", statusWithOrphans)
 	}
 
 	dryOut := runCLI(t, rt, "--format", "json", "prune", "--dry-run")

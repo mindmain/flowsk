@@ -168,8 +168,8 @@ func (h *workspaceHandler) newGetSubcommand() *cobra.Command {
 func (h *workspaceHandler) newUseSubcommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "use <workspace-id-or-slug>",
-		Short: "Persist the default workspace in ~/.config/flowsk/config.yaml",
-		Long: `Updates the user-level ~/.config/flowsk/config.yaml default workspace setting.
+		Short: "Persist the default workspace in ~/.flowsk/config.yaml",
+		Long: `Updates the user-level ~/.flowsk/config.yaml default workspace setting.
 Never writes files inside the current working directory or target Git repository.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
