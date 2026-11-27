@@ -216,3 +216,41 @@ func TestValidateBaseURLAndNewValidatedProvider(t *testing.T) {
 		t.Fatalf("expected BaseURL %q, got %q", client.DefaultBaseURL, defaultProv.BaseURL())
 	}
 }
+
+// TestNewProvider_HonorsConfigTimeoutWithoutMutatingCallerHTTPClient verifies that
+// passing a custom *http.Client with Timeout==0 applies cfg.Timeout to a shallow copy
+// without mutating the caller's *http.Client struct.
+func TestNewProvider_HonorsConfigTimeoutWithoutMutatingCallerHTTPClient(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(250 * time.Millisecond):
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	callerClient := &http.Client{
+		Transport: srv.Client().Transport,
+		Timeout:   0,
+	}
+	prov := client.NewProvider(client.Config{
+		BaseURL:    srv.URL,
+		Timeout:    40 * time.Millisecond,
+		HTTPClient: callerClient,
+	})
+	if callerClient.Timeout != 0 {
+		t.Fatalf("caller http.Client.Timeout was mutated to %s; want 0", callerClient.Timeout)
+	}
+
+	_, err := prov.WorkspaceClient().GetWorkspace(
+		context.Background(),
+		connect.NewRequest(&workspacepb.GetWorkspaceRequest{WorkspaceId: uuid.New().String()}),
+	)
+	if err == nil {
+		t.Fatal("expected request to time out via cfg.Timeout on cloned http.Client")
+	}
+}

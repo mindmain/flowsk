@@ -48,3 +48,33 @@ func TestStaticGuideProvider(t *testing.T) {
 		t.Fatalf("expected defensive copy, got mutated slug %q", examples2[0].Slug)
 	}
 }
+
+// TestExtractGuideSection verifies clean extraction of overview, syntax, verbs,
+// filters, and examples sections from the language guide Markdown.
+func TestExtractGuideSection(t *testing.T) {
+	t.Parallel()
+
+	provider := language.NewGuideProvider()
+	ctx := context.Background()
+
+	sections := map[string]string{
+		"overview": "Core Guarantees",
+		"filters":  "Search Qualifiers",
+		"syntax":   "declare const flowsk",
+		"verbs":    "upsertExternal",
+		"examples": "Multi-Step Atomic JavaScript Recipes",
+	}
+	for sec, wantToken := range sections {
+		got := language.ExtractGuideSection(language.DefaultLanguageGuideMarkdown, sec)
+		if !strings.Contains(got, wantToken) {
+			t.Fatalf("ExtractGuideSection(%q) missing expected token %q; got:\n%s", sec, wantToken, got)
+		}
+		if sec == "filters" && strings.Contains(got, "Multi-Step Atomic JavaScript Recipes") {
+			t.Fatalf("ExtractGuideSection(%q) leaked unrelated examples section:\n%s", sec, got)
+		}
+		fromProvider, err := provider.SectionMarkdown(ctx, sec)
+		if err != nil || fromProvider != got {
+			t.Fatalf("SectionMarkdown(%q) mismatch: err=%v", sec, err)
+		}
+	}
+}

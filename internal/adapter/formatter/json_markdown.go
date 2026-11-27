@@ -58,6 +58,9 @@ func projectToJSONMap(p project.Project, opts TokenBudgetOptions) map[string]any
 	if p.DefaultBranch != "" {
 		m["default_branch"] = p.DefaultBranch
 	}
+	if p.HasMarkdownDoc {
+		m["has_markdown_doc"] = true
+	}
 	if len(p.Tags) > 0 {
 		m["tags"] = p.TagsCopy()
 	}
@@ -106,6 +109,12 @@ func taskToJSONMap(t task.Task, opts TokenBudgetOptions) map[string]any {
 		m["workspace_id"] = t.WorkspaceID.String()
 		m["project_id"] = t.ProjectID.String()
 	}
+	if t.ExternalID != "" {
+		m["external_id"] = t.ExternalID
+	}
+	if t.HasMarkdownDoc {
+		m["has_markdown_doc"] = true
+	}
 	if t.Description != "" {
 		m["description"] = truncateRunes(t.Description, opts.TruncateBodyChars)
 	}
@@ -135,6 +144,12 @@ func compactTaskToJSONMap(t task.CompactTaskSummary, opts TokenBudgetOptions) ma
 	}
 	if !opts.OmitUUIDs {
 		m["id"] = t.ID.String()
+	}
+	if t.ExternalID != "" {
+		m["external_id"] = t.ExternalID
+	}
+	if t.HasMarkdownDoc {
+		m["has_markdown_doc"] = true
 	}
 	if t.HolderHandle != "" {
 		m["holder_handle"] = t.HolderHandle
@@ -232,8 +247,7 @@ func auditToJSONMap(r audit.Record, opts TokenBudgetOptions) map[string]any {
 
 func formatJSONLRecords(w io.Writer, records []map[string]any, opts TokenBudgetOptions) error {
 	if len(records) == 0 {
-		_, err := io.WriteString(w, "{}\n")
-		return err
+		return nil
 	}
 	lines := make([]string, 0, len(records))
 	for _, rec := range records {
@@ -243,7 +257,7 @@ func formatJSONLRecords(w io.Writer, records []map[string]any, opts TokenBudgetO
 		}
 		lines = append(lines, string(raw))
 	}
-	return writeBudgetedItems(w, "", lines, "{}\n", FormatJSONL, opts.MaxTokens)
+	return writeBudgetedItems(w, "", lines, "", FormatJSONL, opts.MaxTokens)
 }
 
 func formatSingleJSON(w io.Writer, obj map[string]any, opts TokenBudgetOptions) error {
@@ -414,6 +428,9 @@ func formatProjectMarkdown(w io.Writer, p project.Project, opts TokenBudgetOptio
 	var sb strings.Builder
 	_, _ = fmt.Fprintf(&sb, "## Project: %s (`%s`)\n\n", escapeMD(p.Name), escapeMD(p.KeyPrefix))
 	_, _ = fmt.Fprintf(&sb, "- **Slug**: `%s`\n- **Status**: `%s`\n- **Branch**: `%s`\n", escapeMD(p.Slug), p.Status, escapeMD(fallbackDash(p.DefaultBranch)))
+	if p.HasMarkdownDoc {
+		sb.WriteString("- **Markdown Doc**: `true`\n")
+	}
 	if p.Description != "" {
 		_, _ = fmt.Fprintf(&sb, "\n%s\n", truncateRunes(p.Description, opts.TruncateBodyChars))
 	}
@@ -454,6 +471,12 @@ func formatTaskMarkdown(w io.Writer, item task.Task, opts TokenBudgetOptions) er
 	var sb strings.Builder
 	_, _ = fmt.Fprintf(&sb, "## %s: %s\n\n", escapeMD(item.Key), escapeMD(item.Title))
 	_, _ = fmt.Fprintf(&sb, "- **Priority**: `%s`\n- **Status**: `%s`\n- **Kind**: `%s`\n", priorityBadge(item.Priority), item.Status, item.Kind)
+	if item.ExternalID != "" {
+		_, _ = fmt.Fprintf(&sb, "- **External ID**: `%s`\n", escapeMD(item.ExternalID))
+	}
+	if item.HasMarkdownDoc {
+		sb.WriteString("- **Markdown Doc**: `true`\n")
+	}
 	if item.ActiveLease != nil && item.ActiveLease.HolderHandle != "" {
 		_, _ = fmt.Fprintf(&sb, "- **Lease**: `@%s`\n", escapeMD(item.ActiveLease.HolderHandle))
 	}
@@ -464,14 +487,22 @@ func formatTaskMarkdown(w io.Writer, item task.Task, opts TokenBudgetOptions) er
 }
 
 func formatTaskQueueMarkdown(w io.Writer, items []task.CompactTaskSummary, opts TokenBudgetOptions) error {
-	header := "## Task Queue\n\n| Key | Priority | Status | Lease | Title | Tags |\n| --- | --- | --- | --- | --- | --- |\n"
+	header := "## Task Queue\n\n| Key | External ID | Priority | Status | Lease | MD | Title | Tags |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n"
 	rows := make([]string, 0, len(items))
 	for _, t := range items {
 		lease := "-"
 		if t.HolderHandle != "" {
 			lease = "@" + t.HolderHandle
 		}
-		rows = append(rows, fmt.Sprintf("| `%s` | `%s` | `%s` | %s | %s | %s |", escapeMD(t.Key), priorityBadge(t.Priority), t.Status, escapeMD(lease), escapeMD(t.Title), escapeMD(formatTagsInline(t.Tags))))
+		ext := "-"
+		if t.ExternalID != "" {
+			ext = "`" + escapeMD(t.ExternalID) + "`"
+		}
+		md := "-"
+		if t.HasMarkdownDoc {
+			md = "`md`"
+		}
+		rows = append(rows, fmt.Sprintf("| `%s` | %s | `%s` | `%s` | %s | %s | %s | %s |", escapeMD(t.Key), ext, priorityBadge(t.Priority), t.Status, escapeMD(lease), md, escapeMD(t.Title), escapeMD(formatTagsInline(t.Tags))))
 	}
 	return writeBudgetedItems(w, header, rows, "_Queue is empty._\n", FormatMarkdown, opts.MaxTokens)
 }

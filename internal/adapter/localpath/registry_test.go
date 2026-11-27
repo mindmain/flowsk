@@ -321,3 +321,45 @@ func TestFileRegistry_ConcurrentAccessIsRaceSafe(t *testing.T) {
 		t.Fatalf("expected all %d concurrent bindings persisted without lost updates, got %d", workers, len(all))
 	}
 }
+
+// TestFileRegistry_ExactMatchSkipsGitSubprocesses verifies that ResolveByWorkingDir
+// returns immediately on an exact LocalAbsPath match without spawning git subprocesses.
+func TestFileRegistry_ExactMatchSkipsGitSubprocesses(t *testing.T) {
+	configDir := t.TempDir()
+	registryPath := filepath.Join(configDir, "local_paths.json")
+	reg, err := localpath.NewFileRegistry(registryPath)
+	if err != nil {
+		t.Fatalf("NewFileRegistry: %v", err)
+	}
+
+	targetDir := t.TempDir()
+	projID := uuid.New()
+	ctx := context.Background()
+	if _, err := reg.LinkProject(ctx, localpath.LinkProjectInput{
+		WorkspaceSlug: "fast-ws",
+		ProjectID:     projID,
+		ProjectSlug:   "fast-proj",
+		LocalPath:     targetDir,
+	}); err != nil {
+		t.Fatalf("LinkProject: %v", err)
+	}
+
+	// Point PATH to a directory containing a failing `git` shim; if ResolveByWorkingDir
+	// spawned `git`, we would touch the sentinel file.
+	shimDir := t.TempDir()
+	sentinel := filepath.Join(shimDir, "git-invoked")
+	gitShim := filepath.Join(shimDir, "git")
+	shimScript := "#!/bin/sh\necho invoked > " + sentinel + "\nexit 1\n"
+	if err := os.WriteFile(gitShim, []byte(shimScript), 0o755); err != nil {
+		t.Fatalf("write git shim: %v", err)
+	}
+	t.Setenv("PATH", shimDir)
+
+	got, err := reg.ResolveByWorkingDir(ctx, targetDir)
+	if err != nil || got.ProjectID != projID {
+		t.Fatalf("ResolveByWorkingDir exact match = %+v, err=%v", got, err)
+	}
+	if _, statErr := os.Stat(sentinel); !os.IsNotExist(statErr) {
+		t.Fatal("expected exact LocalAbsPath match to skip spawning git subprocesses")
+	}
+}

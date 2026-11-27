@@ -88,3 +88,64 @@ func TestSearchQuery_MatchesTextFields(t *testing.T) {
 		t.Fatal("expected query terms not to match unrelated fields")
 	}
 }
+
+// TestCodeModeSDKCatalogAndSpecCompleteness verifies that every method bound in
+// codemode/engine.go is present in both CodeModeSDKCatalog() and CodeModeTypeScriptSpec().
+func TestCodeModeSDKCatalogAndSpecCompleteness(t *testing.T) {
+	t.Parallel()
+
+	wantMethods := []string{
+		"flowsk.search",
+		"flowsk.board",
+		"flowsk.projects.list",
+		"flowsk.projects.get",
+		"flowsk.projects.create",
+		"flowsk.projects.bind",
+		"flowsk.projects.unbind",
+		"flowsk.projects.bindings",
+		"flowsk.projects.getDoc",
+		"flowsk.projects.setDoc",
+		"flowsk.projects.deleteDoc",
+		"flowsk.goals.list",
+		"flowsk.goals.create",
+		"flowsk.goals.update",
+		"flowsk.goals.close",
+		"flowsk.tasks.list",
+		"flowsk.tasks.search",
+		"flowsk.tasks.ready",
+		"flowsk.tasks.next",
+		"flowsk.tasks.get",
+		"flowsk.tasks.getByExternal",
+		"flowsk.tasks.create",
+		"flowsk.tasks.upsertExternal",
+		"flowsk.tasks.update",
+		"flowsk.tasks.claim",
+		"flowsk.tasks.release",
+		"flowsk.tasks.move",
+		"flowsk.tasks.done",
+		"flowsk.tasks.block",
+		"flowsk.tasks.unblock",
+		"flowsk.tasks.comment",
+		"flowsk.tasks.getDoc",
+		"flowsk.tasks.setDoc",
+		"flowsk.tasks.deleteDoc",
+	}
+
+	catalog := language.CodeModeSDKCatalog()
+	catalogSet := make(map[string]bool, len(catalog))
+	for _, doc := range catalog {
+		catalogSet[doc.Name] = true
+	}
+
+	tsSpec := language.CodeModeTypeScriptSpec()
+	for _, m := range wantMethods {
+		if !catalogSet[m] {
+			t.Errorf("CodeModeSDKCatalog() missing method %q", m)
+		}
+		parts := strings.Split(m, ".")
+		shortMethod := parts[len(parts)-1] + "("
+		if !strings.Contains(tsSpec, shortMethod) {
+			t.Errorf("CodeModeTypeScriptSpec() missing method signature %q for %q", shortMethod, m)
+		}
+	}
+}

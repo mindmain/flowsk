@@ -101,4 +101,23 @@ func TestFileStore_SiblingLayoutAndTenantIsolation(t *testing.T) {
 	if _, statErr := os.Stat(strayPath); !os.IsNotExist(statErr) {
 		t.Fatalf("expected malformed file to be removed, statErr=%v", statErr)
 	}
+
+	// Shared parent <baseDir>/ files must NEVER be scanned or deleted by any workspace.
+	sharedParentTaskFile := filepath.Join(root, mdstore.TasksSubdir, "shared-parent.md")
+	if err := os.WriteFile(sharedParentTaskFile, []byte("shared"), 0o600); err != nil {
+		t.Fatalf("write shared parent file: %v", err)
+	}
+	scanBAfterParent, err := store.ScanTaskMarkdown(ctx, wsB)
+	if err != nil {
+		t.Fatalf("ScanTaskMarkdown wsB with shared parent file: %v", err)
+	}
+	if len(scanBAfterParent.MalformedRelKeys) != 0 {
+		t.Fatalf("expected shared parent file excluded from workspace scan, got %v", scanBAfterParent.MalformedRelKeys)
+	}
+	if err := store.RemoveMalformedTaskMarkdown(ctx, "shared-parent.md"); !errors.Is(err, errs.ErrValidation) {
+		t.Fatalf("expected shared parent deletion attempt to fail with ErrValidation, got %v", err)
+	}
+	if _, statErr := os.Stat(sharedParentTaskFile); statErr != nil {
+		t.Fatalf("shared parent file must remain untouched on disk, statErr=%v", statErr)
+	}
 }

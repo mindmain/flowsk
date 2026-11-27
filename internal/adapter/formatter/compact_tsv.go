@@ -48,6 +48,9 @@ func formatProjectsCompact(w io.Writer, items []project.Project, opts TokenBudge
 	rows := make([]string, 0, len(items))
 	for _, p := range items {
 		line := fmt.Sprintf("proj %s %s [%s] %q", p.KeyPrefix, p.Slug, p.Status, cleanOneLine(p.Name))
+		if p.HasMarkdownDoc {
+			line += " md"
+		}
 		if len(p.Tags) > 0 {
 			line += " " + formatTagsInline(p.Tags)
 		}
@@ -112,6 +115,9 @@ func formatObjectivesTSV(w io.Writer, items []ObjectiveProgress, opts TokenBudge
 func compactSummaryLine(t task.CompactTaskSummary) string {
 	var sb strings.Builder
 	_, _ = fmt.Fprintf(&sb, "%s [P%d|%s] %s", t.Key, t.Priority, t.Status, cleanOneLine(t.Title))
+	if t.ExternalID != "" {
+		sb.WriteString(" ext=" + cleanOneLine(t.ExternalID))
+	}
 	if t.HolderHandle != "" {
 		sb.WriteString(" @" + t.HolderHandle)
 	}
@@ -123,6 +129,9 @@ func compactSummaryLine(t task.CompactTaskSummary) string {
 	}
 	if t.ObjectiveSlug != "" {
 		sb.WriteString(" ~" + t.ObjectiveSlug)
+	}
+	if t.HasMarkdownDoc {
+		sb.WriteString(" md")
 	}
 	for _, tag := range t.Tags {
 		sb.WriteString(" #" + tag)
@@ -138,12 +147,14 @@ func formatTaskCompact(w io.Writer, item task.Task, opts TokenBudgetOptions) err
 	line := compactSummaryLine(task.CompactTaskSummary{
 		ID:                     item.ID,
 		Key:                    item.Key,
+		ExternalID:             item.ExternalID,
 		Kind:                   item.Kind,
 		Title:                  item.Title,
 		Status:                 item.Status,
 		Priority:               item.Priority,
 		HolderHandle:           holder,
 		UnresolvedBlockerCount: item.UnresolvedBlockerCount,
+		HasMarkdownDoc:         item.HasMarkdownDoc,
 		Tags:                   item.Tags,
 		UpdatedAt:              item.UpdatedAt,
 	})
@@ -160,15 +171,17 @@ func formatTaskTSV(w io.Writer, item task.Task, opts TokenBudgetOptions) error {
 	if item.ActiveLease != nil && item.ActiveLease.HolderHandle != "" {
 		holder = item.ActiveLease.HolderHandle
 	}
-	header := "key\tkind\tpriority\tstatus\tholder\tblockers\ttitle\ttags\n"
+	header := "key\texternal_id\tkind\tpriority\tstatus\tholder\tblockers\thas_markdown_doc\ttitle\ttags\n"
 	row := fmt.Sprintf(
-		"%s\t%s\tP%d\t%s\t%s\t%d\t%s\t%s",
+		"%s\t%s\t%s\tP%d\t%s\t%s\t%d\t%t\t%s\t%s",
 		cleanOneLine(item.Key),
+		cleanOneLine(fallbackDash(item.ExternalID)),
 		item.Kind,
 		item.Priority,
 		item.Status,
 		cleanOneLine(holder),
 		item.UnresolvedBlockerCount,
+		item.HasMarkdownDoc,
 		cleanOneLine(item.Title),
 		cleanOneLine(strings.Join(item.Tags, ",")),
 	)
@@ -184,16 +197,18 @@ func formatTaskQueueCompact(w io.Writer, items []task.CompactTaskSummary, opts T
 }
 
 func formatTaskQueueTSV(w io.Writer, items []task.CompactTaskSummary, opts TokenBudgetOptions) error {
-	header := "key\tpriority\tstatus\tholder\tblockers\ttitle\ttags\n"
+	header := "key\texternal_id\tpriority\tstatus\tholder\tblockers\thas_markdown_doc\ttitle\ttags\n"
 	rows := make([]string, 0, len(items))
 	for _, t := range items {
 		rows = append(rows, fmt.Sprintf(
-			"%s\tP%d\t%s\t%s\t%d\t%s\t%s",
+			"%s\t%s\tP%d\t%s\t%s\t%d\t%t\t%s\t%s",
 			cleanOneLine(t.Key),
+			cleanOneLine(fallbackDash(t.ExternalID)),
 			t.Priority,
 			t.Status,
 			cleanOneLine(fallbackDash(t.HolderHandle)),
 			t.UnresolvedBlockerCount,
+			t.HasMarkdownDoc,
 			cleanOneLine(t.Title),
 			cleanOneLine(strings.Join(t.Tags, ",")),
 		))

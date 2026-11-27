@@ -306,6 +306,10 @@ func NewProvider(cfg Config) *Provider {
 			timeout = 30 * time.Second
 		}
 		httpClient = &http.Client{Timeout: timeout}
+	} else if stdClient, ok := httpClient.(*http.Client); ok && stdClient != nil && stdClient.Timeout == 0 && cfg.Timeout > 0 {
+		cloned := *stdClient
+		cloned.Timeout = cfg.Timeout
+		httpClient = &cloned
 	}
 
 	opts := make([]connect.ClientOption, 0, len(cfg.ClientOptions)+1)

@@ -111,6 +111,9 @@ func formatProjectHuman(w io.Writer, item project.Project, opts TokenBudgetOptio
 	if item.RemoteRepoURL != "" {
 		_, _ = fmt.Fprintf(&sb, "  Remote URL:  %s\n", item.RemoteRepoURL)
 	}
+	if item.HasMarkdownDoc {
+		_, _ = fmt.Fprintf(&sb, "  Markdown:    [MD] attached\n")
+	}
 	if item.Description != "" {
 		_, _ = fmt.Fprintf(&sb, "  Description: %s\n", truncateRunes(item.Description, opts.TruncateBodyChars))
 	}
@@ -236,16 +239,22 @@ func formatTaskHuman(w io.Writer, item task.Task, opts TokenBudgetOptions) error
 		width,
 	))
 	if !opts.OmitUUIDs {
-		_, _ = fmt.Fprintf(&sb, "  ID:        %s (v%d)\n", item.ID, item.Version)
+		_, _ = fmt.Fprintf(&sb, "  ID:          %s (v%d)\n", item.ID, item.Version)
+	}
+	if item.ExternalID != "" {
+		_, _ = fmt.Fprintf(&sb, "  External ID: %s\n", item.ExternalID)
+	}
+	if item.HasMarkdownDoc {
+		_, _ = fmt.Fprintf(&sb, "  Markdown:    [MD] attached\n")
 	}
 	if item.UnresolvedBlockerCount > 0 {
-		_, _ = fmt.Fprintf(&sb, "  Blockers:  [BLOCKED] %d unresolved upstream blocker(s)\n", item.UnresolvedBlockerCount)
+		_, _ = fmt.Fprintf(&sb, "  Blockers:    [BLOCKED] %d unresolved upstream blocker(s)\n", item.UnresolvedBlockerCount)
 	}
 	if len(item.Labels) > 0 {
-		_, _ = fmt.Fprintf(&sb, "  Labels:    %s\n", formatLabelsInline(item.Labels))
+		_, _ = fmt.Fprintf(&sb, "  Labels:      %s\n", formatLabelsInline(item.Labels))
 	}
 	if item.Description != "" {
-		_, _ = fmt.Fprintf(&sb, "  Details:   %s\n", truncateRunes(item.Description, opts.TruncateBodyChars))
+		_, _ = fmt.Fprintf(&sb, "  Details:     %s\n", truncateRunes(item.Description, opts.TruncateBodyChars))
 	}
 	if len(item.AcceptanceCriteria) > 0 {
 		sb.WriteString("  Acceptance Criteria:\n")
@@ -274,6 +283,20 @@ func formatTaskQueueHuman(w io.Writer, items []task.CompactTaskSummary, opts Tok
 		if t.HolderHandle != "" {
 			lease = "@" + t.HolderHandle
 		}
+		var extras []string
+		if t.ExternalID != "" {
+			extras = append(extras, "ext="+t.ExternalID)
+		}
+		if t.HasMarkdownDoc {
+			extras = append(extras, "[MD]")
+		}
+		if len(t.Tags) > 0 {
+			extras = append(extras, formatTagsInline(t.Tags))
+		}
+		metaCol := "-"
+		if len(extras) > 0 {
+			metaCol = strings.Join(extras, " ")
+		}
 		rows = append(rows, fmt.Sprintf(
 			"%s  %s  %s  %s  %s  %s",
 			padRight(t.Key, 10),
@@ -281,7 +304,7 @@ func formatTaskQueueHuman(w io.Writer, items []task.CompactTaskSummary, opts Tok
 			padRight(statusBadge(t.Status, t.UnresolvedBlockerCount), 14),
 			padRight(lease, 14),
 			padRight(t.Title, 38),
-			formatTagsInline(t.Tags),
+			metaCol,
 		))
 	}
 	return writeBudgetedItems(w, header, rows, "(no tasks in queue)\n", FormatHuman, opts.MaxTokens)
@@ -392,18 +415,28 @@ func writeHumanDigestSection(sb *strings.Builder, title string, items []task.Com
 		if t.HolderHandle != "" {
 			leaseBadge = "  @" + t.HolderHandle
 		}
+		extBadge := ""
+		if t.ExternalID != "" {
+			extBadge = "  ext=" + t.ExternalID
+		}
+		mdBadge := ""
+		if t.HasMarkdownDoc {
+			mdBadge = "  [MD]"
+		}
 		tags := ""
 		if len(t.Tags) > 0 {
 			tags = "  " + formatTagsInline(t.Tags)
 		}
 		_, _ = fmt.Fprintf(
 			sb,
-			"  %s  %s  %s  %s%s%s\n",
+			"  %s  %s  %s  %s%s%s%s%s\n",
 			padRight(t.Key, 9),
 			padRight(priorityBadge(t.Priority), 8),
 			padRight(sBadge, 13),
 			t.Title,
 			leaseBadge,
+			extBadge,
+			mdBadge,
 			tags,
 		)
 	}

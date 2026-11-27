@@ -46,6 +46,7 @@ const (
 var (
 	errDryRunRollback = errors.New("codemode dry_run intentional rollback")
 	slugNonAlnum      = regexp.MustCompile(`[^a-z0-9]+`)
+	nonUpperAlnum     = regexp.MustCompile(`[^A-Z0-9]+`)
 )
 
 // MarkdownStore abstracts tenant-isolated persistence of optional Task and Project
@@ -205,6 +206,7 @@ func (e *Engine) Execute(ctx context.Context, in ExecuteInput) (ExecuteOutput, e
 			projSvc:     projSvc,
 			objSvc:      objSvc,
 			taskSvc:     taskSvc,
+			taskRepo:    scopedTaskRepo,
 		}
 
 		vm := goja.New()
@@ -231,8 +233,13 @@ func (e *Engine) Execute(ctx context.Context, in ExecuteInput) (ExecuteOutput, e
 			}
 			var jsExc *goja.Exception
 			if errors.As(runErr, &jsExc) {
-				if rt.lastDomainErr != nil {
-					return rt.lastDomainErr
+				if unwrapped := jsExc.Unwrap(); unwrapped != nil {
+					return unwrapped
+				}
+				if excVal := jsExc.Value(); excVal != nil && !goja.IsUndefined(excVal) && !goja.IsNull(excVal) {
+					if goErr, ok := excVal.Export().(error); ok && goErr != nil {
+						return goErr
+					}
 				}
 				return errs.Validation(op, fmt.Sprintf("JavaScript runtime error: %s", jsExc.Value().String()))
 			}
@@ -240,6 +247,14 @@ func (e *Engine) Execute(ctx context.Context, in ExecuteInput) (ExecuteOutput, e
 		}
 
 		exported := exportJSValue(val)
+		if exported != nil {
+			if _, marshalErr := json.Marshal(exported); marshalErr != nil {
+				return errs.Validation(op, fmt.Sprintf("JavaScript return value is not JSON-serializable: %v", marshalErr), errs.FieldViolation{
+					Field:       "return_value",
+					Description: marshalErr.Error(),
+				})
+			}
+		}
 		if rt.mutations > 0 && !in.DryRun {
 			meta, _ := json.Marshal(map[string]any{
 				"engine":    "codemode_js",
@@ -275,7 +290,9 @@ func (e *Engine) Execute(ctx context.Context, in ExecuteInput) (ExecuteOutput, e
 		return ExecuteOutput{}, txErr
 	}
 	if !in.DryRun {
-		if flushErr := stagedMD.flush(execCtx, in.WorkspaceID); flushErr != nil {
+		flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer flushCancel()
+		if flushErr := stagedMD.flush(flushCtx, in.WorkspaceID); flushErr != nil {
 			return ExecuteOutput{}, flushErr
 		}
 	}
@@ -457,9 +474,17 @@ type scriptSession struct {
 	projSvc       project.Service
 	objSvc        objective.Service
 	taskSvc       task.Service
+	taskRepo      task.Repository
 	mutations     int
 	console       []string
 	lastDomainErr error
+}
+
+func (s *scriptSession) hostFn(fn func(goja.FunctionCall) goja.Value) func(goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		s.lastDomainErr = nil
+		return fn(call)
+	}
 }
 
 func (s *scriptSession) throwErr(vm *goja.Runtime, err error) {
@@ -496,8 +521,8 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 	}
 
 	projectsObj := vm.NewObject()
-	_ = projectsObj.Set("list", func(_ goja.FunctionCall) goja.Value {
-		items, err := s.projSvc.ListProjects(s.ctx, project.ListProjectsFilter{WorkspaceID: s.wsID, Limit: 100})
+	_ = projectsObj.Set("list", s.hostFn(func(_ goja.FunctionCall) goja.Value {
+		items, err := s.projSvc.ListProjects(s.ctx, project.ListProjectsFilter{WorkspaceID: s.wsID, Limit: 500})
 		if err != nil {
 			s.throwErr(vm, err)
 		}
@@ -506,25 +531,26 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			out = append(out, projectMap(p))
 		}
 		return vm.ToValue(out)
-	})
-	_ = projectsObj.Set("get", func(call goja.FunctionCall) goja.Value {
+	}))
+	_ = projectsObj.Set("get", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		ref := optArgString(call, 0)
 		p, err := s.resolveProject(ref)
 		if err != nil {
 			s.throwErr(vm, err)
 		}
 		return vm.ToValue(projectMap(p))
-	})
-	_ = projectsObj.Set("create", func(call goja.FunctionCall) goja.Value {
+	}))
+	_ = projectsObj.Set("create", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		m := argMap(vm, call, 0)
 		key := strings.ToUpper(strings.TrimSpace(strField(m, "key", "keyPrefix")))
 		name := strings.TrimSpace(strField(m, "name", "title"))
-		slug := strings.ToLower(strings.TrimSpace(strField(m, "slug")))
+		rawSlug := strings.ToLower(strings.TrimSpace(strField(m, "slug")))
+		slug := rawSlug
 		if slug == "" {
 			slug = slugify(firstNonEmpty(key, name))
 		}
 		if key == "" {
-			key = strings.ToUpper(slug[:min(len(slug), 6)])
+			key = deriveProjectKeyPrefix(firstNonEmpty(rawSlug, name))
 		}
 		created, err := s.projSvc.CreateProject(s.ctx, project.CreateProjectInput{
 			WorkspaceID: s.wsID,
@@ -542,8 +568,8 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			s.defaultProj = &idCopy
 		}
 		return vm.ToValue(projectMap(created))
-	})
-	_ = projectsObj.Set("bind", func(call goja.FunctionCall) goja.Value {
+	}))
+	_ = projectsObj.Set("bind", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		parent, err := s.resolveProject(optArgString(call, 0))
 		if err != nil {
 			s.throwErr(vm, err)
@@ -570,8 +596,8 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			"parentProject": parent.ID.String(),
 			"childProject":  child.ID.String(),
 		})
-	})
-	_ = projectsObj.Set("unbind", func(call goja.FunctionCall) goja.Value {
+	}))
+	_ = projectsObj.Set("unbind", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		parent, err := s.resolveProject(optArgString(call, 0))
 		if err != nil {
 			s.throwErr(vm, err)
@@ -596,13 +622,16 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			"childKey":  child.KeyPrefix,
 			"removed":   removed,
 		})
-	})
-	_ = projectsObj.Set("bindings", func(_ goja.FunctionCall) goja.Value {
+	}))
+	_ = projectsObj.Set("bindings", s.hostFn(func(_ goja.FunctionCall) goja.Value {
 		items, err := s.projSvc.ListBindings(s.ctx, project.ListBindingsFilter{WorkspaceID: s.wsID})
 		if err != nil {
 			s.throwErr(vm, err)
 		}
-		projs, _ := s.projSvc.ListProjects(s.ctx, project.ListProjectsFilter{WorkspaceID: s.wsID, Limit: 200})
+		projs, err := s.projSvc.ListProjects(s.ctx, project.ListProjectsFilter{WorkspaceID: s.wsID, Limit: 500})
+		if err != nil {
+			s.throwErr(vm, err)
+		}
 		keys := make(map[uuid.UUID]string, len(projs))
 		for _, p := range projs {
 			keys[p.ID] = p.KeyPrefix
@@ -617,8 +646,8 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			})
 		}
 		return vm.ToValue(out)
-	})
-	_ = projectsObj.Set("getDoc", func(call goja.FunctionCall) goja.Value {
+	}))
+	_ = projectsObj.Set("getDoc", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		p, err := s.resolveProject(optArgString(call, 0))
 		if err != nil {
 			s.throwErr(vm, err)
@@ -634,8 +663,8 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			"markdown":       md,
 			"hasMarkdownDoc": hasDoc,
 		})
-	})
-	_ = projectsObj.Set("setDoc", func(call goja.FunctionCall) goja.Value {
+	}))
+	_ = projectsObj.Set("setDoc", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		var projRef, md string
 		if len(call.Arguments) == 1 {
 			md = rawArgString(call, 0)
@@ -658,8 +687,8 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 		}
 		s.mutations++
 		return vm.ToValue(projectMap(updated))
-	})
-	_ = projectsObj.Set("deleteDoc", func(call goja.FunctionCall) goja.Value {
+	}))
+	_ = projectsObj.Set("deleteDoc", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		p, err := s.resolveProject(optArgString(call, 0))
 		if err != nil {
 			s.throwErr(vm, err)
@@ -670,10 +699,10 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 		}
 		s.mutations++
 		return vm.ToValue(projectMap(updated))
-	})
+	}))
 
 	goalsObj := vm.NewObject()
-	_ = goalsObj.Set("list", func(call goja.FunctionCall) goja.Value {
+	_ = goalsObj.Set("list", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		rawFilter := optArgString(call, 0)
 		p, err := s.resolveProject("")
 		if err != nil {
@@ -682,12 +711,15 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 		objs, err := s.objSvc.ListObjectives(s.ctx, objective.ListObjectivesFilter{
 			WorkspaceID: s.wsID,
 			ProjectID:   p.ID,
-			Limit:       100,
+			Limit:       500,
 		})
 		if err != nil {
 			s.throwErr(vm, err)
 		}
-		tasks, _ := s.listAllProjectTasks(p.ID)
+		tasks, err := s.listAllProjectTasks(p.ID)
+		if err != nil {
+			s.throwErr(vm, err)
+		}
 		q := language.ParseSearchQuery(rawFilter)
 		out := make([]map[string]any, 0, len(objs))
 		for _, o := range objs {
@@ -697,8 +729,8 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			out = append(out, objectiveMap(o, tasks))
 		}
 		return vm.ToValue(out)
-	})
-	_ = goalsObj.Set("create", func(call goja.FunctionCall) goja.Value {
+	}))
+	_ = goalsObj.Set("create", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		m := argMap(vm, call, 0)
 		p, err := s.resolveProject(strField(m, "project"))
 		if err != nil {
@@ -710,17 +742,14 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			slug = slugify(title)
 		}
 		prio := parseJSPriorityRank(m["priority"])
-		var td *time.Time
-		if rawTD := strField(m, "targetDate", "target_date", "due"); rawTD != "" {
-			if parsed, pErr := time.Parse("2006-01-02", rawTD); pErr == nil {
-				utc := parsed.UTC()
-				td = &utc
-			}
+		td, tdHas, tdErr := parseOptionalTargetDate("flowsk.goals.create", m, "targetDate", "target_date", "due")
+		if tdErr != nil {
+			s.throwErr(vm, tdErr)
 		}
-		criteria := strSliceField(m, "successCriteria", "criteria")
-		if len(criteria) == 0 {
-			criteria = []string{firstNonEmpty(strField(m, "summary", "description"), title)}
+		if tdHas && td != nil && td.IsZero() {
+			td = nil
 		}
+		criteria, _ := optStrSliceField(m, "successCriteria", "criteria")
 		kind := parseJSObjectiveKind(strField(m, "kind"))
 		status := parseJSObjectiveStatus(strField(m, "status", "state"), objective.StatusActive)
 		created, err := s.objSvc.CreateObjective(s.ctx, objective.CreateObjectiveInput{
@@ -740,8 +769,8 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 		}
 		s.mutations++
 		return vm.ToValue(objectiveMap(created, nil))
-	})
-	_ = goalsObj.Set("update", func(call goja.FunctionCall) goja.Value {
+	}))
+	_ = goalsObj.Set("update", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		ref := optArgString(call, 0)
 		m := argMap(vm, call, 1)
 		p, err := s.resolveProject(strField(m, "project"))
@@ -778,13 +807,14 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			pr := parseJSPriorityRank(m["priority"])
 			upd.PriorityRank = &pr
 		}
-		if rawTD := strField(m, "targetDate", "target_date", "due"); rawTD != "" {
-			if parsed, pErr := time.Parse("2006-01-02", rawTD); pErr == nil {
-				utc := parsed.UTC()
-				upd.TargetDate = &utc
-			}
+		td, tdHas, tdErr := parseOptionalTargetDate("flowsk.goals.update", m, "targetDate", "target_date", "due")
+		if tdErr != nil {
+			s.throwErr(vm, tdErr)
 		}
-		if criteria := strSliceField(m, "successCriteria", "criteria"); len(criteria) > 0 {
+		if tdHas {
+			upd.TargetDate = td
+		}
+		if criteria, hasCriteria := optStrSliceField(m, "successCriteria", "criteria"); hasCriteria {
 			upd.SuccessCriteria = criteria
 		}
 		updated, err := s.objSvc.UpdateObjective(s.ctx, upd)
@@ -792,12 +822,25 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			s.throwErr(vm, err)
 		}
 		s.mutations++
-		tasks, _ := s.listAllProjectTasks(p.ID)
+		tasks, err := s.listAllProjectTasks(p.ID)
+		if err != nil {
+			s.throwErr(vm, err)
+		}
 		return vm.ToValue(objectiveMap(updated, tasks))
-	})
-	_ = goalsObj.Set("close", func(call goja.FunctionCall) goja.Value {
+	}))
+	_ = goalsObj.Set("close", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		ref := optArgString(call, 0)
-		p, err := s.resolveProject("")
+		var note, projRef string
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) && !goja.IsNull(call.Arguments[1]) {
+			switch v := exportJSValue(call.Arguments[1]).(type) {
+			case string:
+				note = strings.TrimSpace(v)
+			case map[string]any:
+				note = strField(v, "note", "reason", "summary")
+				projRef = strField(v, "project")
+			}
+		}
+		p, err := s.resolveProject(projRef)
 		if err != nil {
 			s.throwErr(vm, err)
 		}
@@ -806,26 +849,39 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			s.throwErr(vm, err)
 		}
 		st := objective.StatusAchieved
-		updated, err := s.objSvc.UpdateObjective(s.ctx, objective.UpdateObjectiveInput{
+		upd := objective.UpdateObjectiveInput{
 			WorkspaceID: s.wsID,
 			ObjectiveID: obj.ID,
 			Status:      &st,
-		})
+		}
+		if note != "" {
+			merged := note
+			if existing := strings.TrimSpace(obj.Summary); existing != "" {
+				merged = existing + "\n\n" + note
+			}
+			upd.Summary = &merged
+		}
+		updated, err := s.objSvc.UpdateObjective(s.ctx, upd)
 		if err != nil {
 			s.throwErr(vm, err)
 		}
 		s.mutations++
-		tasks, _ := s.listAllProjectTasks(p.ID)
-		return vm.ToValue(objectiveMap(updated, tasks))
-	})
-
-	tasksObj := vm.NewObject()
-	searchTasksFn := func(call goja.FunctionCall) goja.Value {
-		p, err := s.resolveProject("")
+		tasks, err := s.listAllProjectTasks(p.ID)
 		if err != nil {
 			s.throwErr(vm, err)
 		}
-		var q language.SearchQuery
+		return vm.ToValue(objectiveMap(updated, tasks))
+	}))
+
+	tasksObj := vm.NewObject()
+	searchTasksFn := s.hostFn(func(call goja.FunctionCall) goja.Value {
+		var (
+			q                language.SearchQuery
+			projRef          string
+			limit            int
+			includeCompleted = true
+			hasIncCompleted  bool
+		)
 		if len(call.Arguments) > 0 && !goja.IsUndefined(call.Arguments[0]) && !goja.IsNull(call.Arguments[0]) {
 			exp := exportJSValue(call.Arguments[0])
 			switch v := exp.(type) {
@@ -833,48 +889,89 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 				q = language.ParseSearchQuery(v)
 			case map[string]any:
 				q = mapToSearchQuery(v)
+				projRef = strField(v, "project")
+				limit = intField(v, "limit", "max")
+				if inc, ok := v["includeCompleted"].(bool); ok {
+					includeCompleted = inc
+					hasIncCompleted = true
+				}
+			}
+		}
+		p, err := s.resolveProject(projRef)
+		if err != nil {
+			s.throwErr(vm, err)
+		}
+		if hasIncCompleted && !includeCompleted && len(q.Statuses) == 0 {
+			q.Statuses = []task.Status{
+				task.StatusBacklog, task.StatusReady, task.StatusInProgress,
+				task.StatusInReview, task.StatusBlocked,
 			}
 		}
 		matched, err := s.searchProjectTasks(p.ID, q)
 		if err != nil {
 			s.throwErr(vm, err)
 		}
+		if limit > 0 && len(matched) > limit {
+			matched = matched[:limit]
+		}
 		return vm.ToValue(matched)
-	}
+	})
 	_ = tasksObj.Set("list", searchTasksFn)
 	_ = tasksObj.Set("search", searchTasksFn)
-	_ = tasksObj.Set("ready", func(call goja.FunctionCall) goja.Value {
-		p, err := s.resolveProject("")
+	_ = tasksObj.Set("ready", s.hostFn(func(call goja.FunctionCall) goja.Value {
+		limit := int32(50)
+		var projRef, objRef string
+		if len(call.Arguments) > 0 && !goja.IsUndefined(call.Arguments[0]) && !goja.IsNull(call.Arguments[0]) {
+			if m, ok := exportJSValue(call.Arguments[0]).(map[string]any); ok {
+				if n := intField(m, "limit", "max"); n > 0 {
+					limit = int32(n)
+				}
+				projRef = strField(m, "project")
+				objRef = strField(m, "objective", "goal")
+			} else if n := call.Arguments[0].ToInteger(); n > 0 {
+				limit = int32(n)
+			}
+		}
+		p, err := s.resolveProject(projRef)
 		if err != nil {
 			s.throwErr(vm, err)
 		}
-		unblocked := true
-		items, err := s.taskSvc.PollWorkQueue(s.ctx, task.AgentWorkQueueFilter{
+		filter := task.AgentWorkQueueFilter{
 			WorkspaceID:   s.wsID,
 			ProjectID:     p.ID,
 			Statuses:      []task.Status{task.StatusReady, task.StatusBacklog},
 			OnlyUnblocked: true,
 			OnlyUnclaimed: true,
-			Limit:         50,
-		})
-		_ = unblocked
+			Limit:         limit,
+		}
+		if objRef != "" {
+			o, oErr := s.resolveObjective(p.ID, objRef)
+			if oErr != nil {
+				s.throwErr(vm, oErr)
+			}
+			filter.ObjectiveID = &o.ID
+		}
+		items, err := s.taskSvc.PollWorkQueue(s.ctx, filter)
 		if err != nil {
 			s.throwErr(vm, err)
+		}
+		if int32(len(items)) > limit {
+			items = items[:limit]
 		}
 		out := make([]map[string]any, 0, len(items))
 		for _, it := range items {
 			out = append(out, summaryMap(it))
 		}
 		return vm.ToValue(out)
-	})
-	_ = tasksObj.Set("get", func(call goja.FunctionCall) goja.Value {
+	}))
+	_ = tasksObj.Set("get", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		t, err := s.resolveTask(optArgString(call, 0))
 		if err != nil {
 			s.throwErr(vm, err)
 		}
 		return vm.ToValue(s.fullTaskMap(t))
-	})
-	_ = tasksObj.Set("getByExternal", func(call goja.FunctionCall) goja.Value {
+	}))
+	_ = tasksObj.Set("getByExternal", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		extID := optArgString(call, 0)
 		projRef := optArgString(call, 1)
 		p, err := s.resolveProject(projRef)
@@ -889,8 +986,8 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			s.throwErr(vm, err)
 		}
 		return vm.ToValue(s.fullTaskMap(t))
-	})
-	_ = tasksObj.Set("next", func(call goja.FunctionCall) goja.Value {
+	}))
+	_ = tasksObj.Set("next", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		p, err := s.resolveProject("")
 		if err != nil {
 			s.throwErr(vm, err)
@@ -922,6 +1019,7 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			return goja.Null()
 		}
 		bestID := ready[0].ID
+		fetchCtx := s.ctx
 		if claim {
 			if _, err := s.taskSvc.ClaimTask(s.ctx, task.ClaimTaskInput{
 				WorkspaceID: s.wsID,
@@ -930,20 +1028,23 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			}); err != nil {
 				s.throwErr(vm, err)
 			}
-			_, _ = s.taskSvc.TransitionTask(s.ctx, task.TransitionTaskInput{
+			if _, err := s.taskSvc.TransitionTask(s.ctx, task.TransitionTaskInput{
 				WorkspaceID:  s.wsID,
 				TaskID:       bestID,
 				TargetStatus: task.StatusInProgress,
-			})
+			}); err != nil {
+				s.throwErr(vm, err)
+			}
 			s.mutations++
+			fetchCtx = authctx.WithSuppressTaskSignal(s.ctx)
 		}
-		full, err := s.taskSvc.GetTask(s.ctx, s.wsID, bestID)
+		full, err := s.taskSvc.GetTask(fetchCtx, s.wsID, bestID)
 		if err != nil {
 			s.throwErr(vm, err)
 		}
 		return vm.ToValue(s.fullTaskMap(full))
-	})
-	_ = tasksObj.Set("create", func(call goja.FunctionCall) goja.Value {
+	}))
+	_ = tasksObj.Set("create", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		m := argMap(vm, call, 0)
 		p, err := s.resolveProject(strField(m, "project"))
 		if err != nil {
@@ -959,7 +1060,7 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 		}
 		var parentID *uuid.UUID
 		if parRef := strField(m, "parent"); parRef != "" {
-			pt, pErr := s.resolveTask(parRef)
+			pt, pErr := s.resolveTaskQuiet(parRef)
 			if pErr != nil {
 				s.throwErr(vm, pErr)
 			}
@@ -972,12 +1073,10 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			}
 		}
 		kind := task.KindFeature
-		if rawKind := strings.ToLower(strField(m, "kind")); rawKind != "" {
-			switch task.Kind(rawKind) {
-			case task.KindEpic, task.KindFeature, task.KindBug, task.KindChore, task.KindResearch:
-				kind = task.Kind(rawKind)
-			}
+		if parsedKind, ok := parseJSTaskKind(strField(m, "kind")); ok {
+			kind = parsedKind
 		}
+		assigneeID := s.resolveAssigneeInput(strField(m, "assignee", "assigneeActorId"))
 		created, err := s.taskSvc.CreateTask(s.ctx, task.CreateTaskInput{
 			WorkspaceID:        s.wsID,
 			ProjectID:          p.ID,
@@ -990,6 +1089,7 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			AcceptanceCriteria: strSliceField(m, "acceptance", "acceptanceCriteria"),
 			Status:             st,
 			Priority:           parseJSTaskPriority(m["priority"]),
+			AssigneeActorID:    assigneeID,
 			Tags:               strSliceField(m, "tags", "labels"),
 		})
 		if err != nil {
@@ -1002,7 +1102,7 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			}
 		}
 		for _, depRef := range strSliceField(m, "dependsOn", "depends_on", "blockedBy", "blocked_by") {
-			up, dErr := s.resolveTask(depRef)
+			up, dErr := s.resolveTaskQuiet(depRef)
 			if dErr != nil {
 				s.throwErr(vm, dErr)
 			}
@@ -1015,10 +1115,13 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 				s.throwErr(vm, rErr)
 			}
 		}
-		reloaded, _ := s.taskSvc.GetTask(s.ctx, s.wsID, created.ID)
+		reloaded, rErr := s.taskSvc.GetTask(authctx.WithSuppressTaskSignal(s.ctx), s.wsID, created.ID)
+		if rErr != nil {
+			s.throwErr(vm, rErr)
+		}
 		return vm.ToValue(s.fullTaskMap(reloaded))
-	})
-	_ = tasksObj.Set("upsertExternal", func(call goja.FunctionCall) goja.Value {
+	}))
+	_ = tasksObj.Set("upsertExternal", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		m := argMap(vm, call, 0)
 		extID := strField(m, "externalId", "external_id")
 		if extID == "" {
@@ -1028,7 +1131,8 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 		if err != nil {
 			s.throwErr(vm, err)
 		}
-		existing, getErr := s.taskSvc.GetTaskByExternalID(s.ctx, s.wsID, p.ID, extID)
+		quietCtx := authctx.WithSuppressTaskSignal(s.ctx)
+		existing, getErr := s.taskSvc.GetTaskByExternalID(quietCtx, s.wsID, p.ID, extID)
 		if getErr != nil && !errors.Is(getErr, errs.ErrNotFound) {
 			s.throwErr(vm, getErr)
 		}
@@ -1037,26 +1141,58 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 				WorkspaceID: s.wsID,
 				TaskID:      existing.ID,
 			}
+			if parsedKind, ok := parseJSTaskKind(strField(m, "kind")); ok {
+				upd.Kind = &parsedKind
+			}
 			if v := strField(m, "title", "name"); v != "" {
 				upd.Title = &v
 			}
-			if _, hasDesc := m["description"]; hasDesc {
-				v := strField(m, "description", "body")
-				upd.Description = &v
+			if desc, hasDesc := hasRawMapString(m, "description", "body"); hasDesc {
+				trimmed := strings.TrimSpace(desc)
+				upd.Description = &trimmed
 			}
 			if rawP, hasP := m["priority"]; hasP {
 				pr := parseJSTaskPriority(rawP)
 				upd.Priority = &pr
 			}
-			if tags := strSliceField(m, "tags", "labels"); len(tags) > 0 {
+			if tags, hasTags := optStrSliceField(m, "tags", "labels"); hasTags {
 				upd.Tags = tags
 			}
-			if acc := strSliceField(m, "acceptance", "acceptanceCriteria"); len(acc) > 0 {
+			if acc, hasAcc := optStrSliceField(m, "acceptance", "acceptanceCriteria"); hasAcc {
 				upd.AcceptanceCriteria = acc
+			}
+			if objRef, hasObj := hasRawMapString(m, "objective", "goal"); hasObj {
+				if strings.TrimSpace(objRef) == "" {
+					nilUUID := uuid.Nil
+					upd.ObjectiveID = &nilUUID
+				} else {
+					o, oErr := s.resolveObjective(p.ID, objRef)
+					if oErr != nil {
+						s.throwErr(vm, oErr)
+					}
+					upd.ObjectiveID = &o.ID
+				}
+			}
+			if parRef, hasPar := hasRawMapString(m, "parent"); hasPar {
+				if strings.TrimSpace(parRef) == "" {
+					nilUUID := uuid.Nil
+					upd.ParentTaskID = &nilUUID
+				} else {
+					pt, pErr := s.resolveTaskQuiet(parRef)
+					if pErr != nil {
+						s.throwErr(vm, pErr)
+					}
+					upd.ParentTaskID = &pt.ID
+				}
 			}
 			updated, uErr := s.taskSvc.UpdateTask(s.ctx, upd)
 			if uErr != nil {
 				s.throwErr(vm, uErr)
+			}
+			if deps, hasDeps := optStrSliceField(m, "dependsOn", "depends_on", "blockedBy", "blocked_by"); hasDeps {
+				if syncErr := s.syncTaskBlockers(existing.ID, deps); syncErr != nil {
+					s.throwErr(vm, syncErr)
+				}
 			}
 			if rawSt := strField(m, "state", "status"); rawSt != "" {
 				if mapped, ok := language.NormalizeStatusToken(rawSt); ok && mapped != updated.Status {
@@ -1081,8 +1217,12 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 					s.throwErr(vm, uErr)
 				}
 			}
+			reloaded, rErr := s.taskSvc.GetTask(quietCtx, s.wsID, existing.ID)
+			if rErr != nil {
+				s.throwErr(vm, rErr)
+			}
 			s.mutations++
-			res := s.fullTaskMap(updated)
+			res := s.fullTaskMap(reloaded)
 			res["upserted"] = "updated"
 			return vm.ToValue(res)
 		}
@@ -1097,7 +1237,7 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 		}
 		var parentID *uuid.UUID
 		if parRef := strField(m, "parent"); parRef != "" {
-			pt, pErr := s.resolveTask(parRef)
+			pt, pErr := s.resolveTaskQuiet(parRef)
 			if pErr != nil {
 				s.throwErr(vm, pErr)
 			}
@@ -1109,13 +1249,17 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 				st = mapped
 			}
 		}
+		kind := task.KindFeature
+		if parsedKind, ok := parseJSTaskKind(strField(m, "kind")); ok {
+			kind = parsedKind
+		}
 		created, cErr := s.taskSvc.CreateTask(s.ctx, task.CreateTaskInput{
 			WorkspaceID:        s.wsID,
 			ProjectID:          p.ID,
 			ObjectiveID:        objID,
 			ParentTaskID:       parentID,
 			ExternalID:         extID,
-			Kind:               task.KindFeature,
+			Kind:               kind,
 			Title:              strField(m, "title", "name"),
 			Description:        strField(m, "description", "body"),
 			AcceptanceCriteria: strSliceField(m, "acceptance", "acceptanceCriteria"),
@@ -1133,7 +1277,7 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			}
 		}
 		for _, depRef := range strSliceField(m, "dependsOn", "depends_on", "blockedBy", "blocked_by") {
-			up, dErr := s.resolveTask(depRef)
+			up, dErr := s.resolveTaskQuiet(depRef)
 			if dErr != nil {
 				s.throwErr(vm, dErr)
 			}
@@ -1146,13 +1290,16 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 				s.throwErr(vm, rErr)
 			}
 		}
-		reloaded, _ := s.taskSvc.GetTask(s.ctx, s.wsID, created.ID)
+		reloaded, rErr := s.taskSvc.GetTask(quietCtx, s.wsID, created.ID)
+		if rErr != nil {
+			s.throwErr(vm, rErr)
+		}
 		res := s.fullTaskMap(reloaded)
 		res["upserted"] = "created"
 		return vm.ToValue(res)
-	})
-	_ = tasksObj.Set("update", func(call goja.FunctionCall) goja.Value {
-		t, err := s.resolveTask(optArgString(call, 0))
+	}))
+	_ = tasksObj.Set("update", s.hostFn(func(call goja.FunctionCall) goja.Value {
+		t, err := s.resolveTaskQuiet(optArgString(call, 0))
 		if err != nil {
 			s.throwErr(vm, err)
 		}
@@ -1161,12 +1308,15 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			WorkspaceID: s.wsID,
 			TaskID:      t.ID,
 		}
-		if v := strField(m, "title"); v != "" {
+		if parsedKind, ok := parseJSTaskKind(strField(m, "kind")); ok {
+			upd.Kind = &parsedKind
+		}
+		if v := strField(m, "title", "name"); v != "" {
 			upd.Title = &v
 		}
-		if _, ok := m["description"]; ok {
-			v := strField(m, "description")
-			upd.Description = &v
+		if desc, hasDesc := hasRawMapString(m, "description", "body"); hasDesc {
+			trimmed := strings.TrimSpace(desc)
+			upd.Description = &trimmed
 		}
 		if rawExt, hasExt := m["externalId"]; hasExt {
 			v := strings.TrimSpace(fmt.Sprint(rawExt))
@@ -1185,10 +1335,10 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			p := parseJSTaskPriority(rawP)
 			upd.Priority = &p
 		}
-		if tags := strSliceField(m, "tags", "labels"); len(tags) > 0 {
+		if tags, hasTags := optStrSliceField(m, "tags", "labels"); hasTags {
 			upd.Tags = tags
 		}
-		if acc := strSliceField(m, "acceptance", "acceptanceCriteria"); len(acc) > 0 {
+		if acc, hasAcc := optStrSliceField(m, "acceptance", "acceptanceCriteria"); hasAcc {
 			upd.AcceptanceCriteria = acc
 		}
 		if objRef, hasObj := hasRawMapString(m, "objective", "goal"); hasObj {
@@ -1201,6 +1351,26 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 					s.throwErr(vm, oErr)
 				}
 				upd.ObjectiveID = &o.ID
+			}
+		}
+		if parRef, hasPar := hasRawMapString(m, "parent"); hasPar {
+			if strings.TrimSpace(parRef) == "" {
+				nilUUID := uuid.Nil
+				upd.ParentTaskID = &nilUUID
+			} else {
+				pt, pErr := s.resolveTaskQuiet(parRef)
+				if pErr != nil {
+					s.throwErr(vm, pErr)
+				}
+				upd.ParentTaskID = &pt.ID
+			}
+		}
+		if assRef, hasAss := hasRawMapString(m, "assignee", "assigneeActorId"); hasAss {
+			if strings.TrimSpace(assRef) == "" {
+				nilUUID := uuid.Nil
+				upd.AssigneeActorID = &nilUUID
+			} else if aid := s.resolveAssigneeInput(assRef); aid != nil {
+				upd.AssigneeActorID = aid
 			}
 		}
 		updated, err := s.taskSvc.UpdateTask(s.ctx, upd)
@@ -1219,9 +1389,9 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 		}
 		s.mutations++
 		return vm.ToValue(s.fullTaskMap(updated))
-	})
-	_ = tasksObj.Set("getDoc", func(call goja.FunctionCall) goja.Value {
-		t, err := s.resolveTask(optArgString(call, 0))
+	}))
+	_ = tasksObj.Set("getDoc", s.hostFn(func(call goja.FunctionCall) goja.Value {
+		t, err := s.resolveTaskQuiet(optArgString(call, 0))
 		if err != nil {
 			s.throwErr(vm, err)
 		}
@@ -1235,9 +1405,9 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			"markdown":       md,
 			"hasMarkdownDoc": hasDoc,
 		})
-	})
-	_ = tasksObj.Set("setDoc", func(call goja.FunctionCall) goja.Value {
-		t, err := s.resolveTask(optArgString(call, 0))
+	}))
+	_ = tasksObj.Set("setDoc", s.hostFn(func(call goja.FunctionCall) goja.Value {
+		t, err := s.resolveTaskQuiet(optArgString(call, 0))
 		if err != nil {
 			s.throwErr(vm, err)
 		}
@@ -1253,9 +1423,9 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 		}
 		s.mutations++
 		return vm.ToValue(s.fullTaskMap(updated))
-	})
-	_ = tasksObj.Set("deleteDoc", func(call goja.FunctionCall) goja.Value {
-		t, err := s.resolveTask(optArgString(call, 0))
+	}))
+	_ = tasksObj.Set("deleteDoc", s.hostFn(func(call goja.FunctionCall) goja.Value {
+		t, err := s.resolveTaskQuiet(optArgString(call, 0))
 		if err != nil {
 			s.throwErr(vm, err)
 		}
@@ -1265,9 +1435,9 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 		}
 		s.mutations++
 		return vm.ToValue(s.fullTaskMap(updated))
-	})
-	_ = tasksObj.Set("move", func(call goja.FunctionCall) goja.Value {
-		t, err := s.resolveTask(optArgString(call, 0))
+	}))
+	_ = tasksObj.Set("move", s.hostFn(func(call goja.FunctionCall) goja.Value {
+		t, err := s.resolveTaskQuiet(optArgString(call, 0))
 		if err != nil {
 			s.throwErr(vm, err)
 		}
@@ -1289,9 +1459,9 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 		}
 		s.mutations++
 		return vm.ToValue(s.fullTaskMap(updated))
-	})
-	_ = tasksObj.Set("done", func(call goja.FunctionCall) goja.Value {
-		t, err := s.resolveTask(optArgString(call, 0))
+	}))
+	_ = tasksObj.Set("done", s.hostFn(func(call goja.FunctionCall) goja.Value {
+		t, err := s.resolveTaskQuiet(optArgString(call, 0))
 		if err != nil {
 			s.throwErr(vm, err)
 		}
@@ -1308,9 +1478,9 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 		}
 		s.mutations++
 		return vm.ToValue(s.fullTaskMap(updated))
-	})
-	_ = tasksObj.Set("claim", func(call goja.FunctionCall) goja.Value {
-		t, err := s.resolveTask(optArgString(call, 0))
+	}))
+	_ = tasksObj.Set("claim", s.hostFn(func(call goja.FunctionCall) goja.Value {
+		t, err := s.resolveTaskQuiet(optArgString(call, 0))
 		if err != nil {
 			s.throwErr(vm, err)
 		}
@@ -1328,18 +1498,23 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			s.throwErr(vm, err)
 		}
 		if t.Status == task.StatusBacklog || t.Status == task.StatusReady {
-			_, _ = s.taskSvc.TransitionTask(s.ctx, task.TransitionTaskInput{
+			if _, err := s.taskSvc.TransitionTask(s.ctx, task.TransitionTaskInput{
 				WorkspaceID:  s.wsID,
 				TaskID:       t.ID,
 				TargetStatus: task.StatusInProgress,
-			})
+			}); err != nil {
+				s.throwErr(vm, err)
+			}
 		}
 		s.mutations++
-		reloaded, _ := s.taskSvc.GetTask(s.ctx, s.wsID, t.ID)
+		reloaded, err := s.taskSvc.GetTask(authctx.WithSuppressTaskSignal(s.ctx), s.wsID, t.ID)
+		if err != nil {
+			s.throwErr(vm, err)
+		}
 		return vm.ToValue(s.fullTaskMap(reloaded))
-	})
-	_ = tasksObj.Set("release", func(call goja.FunctionCall) goja.Value {
-		t, err := s.resolveTask(optArgString(call, 0))
+	}))
+	_ = tasksObj.Set("release", s.hostFn(func(call goja.FunctionCall) goja.Value {
+		t, err := s.resolveTaskQuiet(optArgString(call, 0))
 		if err != nil {
 			s.throwErr(vm, err)
 		}
@@ -1368,17 +1543,37 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			}
 		}
 		s.mutations++
-		reloaded, _ := s.taskSvc.GetTask(s.ctx, s.wsID, t.ID)
-		return vm.ToValue(s.fullTaskMap(reloaded))
-	})
-	_ = tasksObj.Set("block", func(call goja.FunctionCall) goja.Value {
-		t, err := s.resolveTask(optArgString(call, 0))
+		reloaded, err := s.taskSvc.GetTask(authctx.WithSuppressTaskSignal(s.ctx), s.wsID, t.ID)
 		if err != nil {
 			s.throwErr(vm, err)
 		}
-		m := argMap(vm, call, 1)
-		for _, upRef := range strSliceField(m, "by", "blockedBy", "dependsOn") {
-			up, uErr := s.resolveTask(upRef)
+		return vm.ToValue(s.fullTaskMap(reloaded))
+	}))
+	_ = tasksObj.Set("block", s.hostFn(func(call goja.FunctionCall) goja.Value {
+		t, err := s.resolveTaskQuiet(optArgString(call, 0))
+		if err != nil {
+			s.throwErr(vm, err)
+		}
+		var (
+			reason string
+			byRefs []string
+		)
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) && !goja.IsNull(call.Arguments[1]) {
+			switch v := exportJSValue(call.Arguments[1]).(type) {
+			case map[string]any:
+				reason = strField(v, "reason", "note")
+				byRefs = strSliceField(v, "by", "blockedBy", "dependsOn")
+			case string:
+				reason = strings.TrimSpace(v)
+				if len(call.Arguments) > 2 && !goja.IsUndefined(call.Arguments[2]) && !goja.IsNull(call.Arguments[2]) {
+					byRefs = valueToStringSlice(exportJSValue(call.Arguments[2]))
+				}
+			default:
+				panic(vm.NewTypeError("expected blocker reason string or options object"))
+			}
+		}
+		for _, upRef := range byRefs {
+			up, uErr := s.resolveTaskQuiet(upRef)
 			if uErr != nil {
 				s.throwErr(vm, uErr)
 			}
@@ -1391,53 +1586,102 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 				s.throwErr(vm, rErr)
 			}
 		}
-		reason := strField(m, "reason", "note")
-		if len(strSliceField(m, "by", "blockedBy", "dependsOn")) == 0 {
-			_, err = s.taskSvc.TransitionTask(s.ctx, task.TransitionTaskInput{
+		if len(byRefs) == 0 {
+			if _, err := s.taskSvc.TransitionTask(s.ctx, task.TransitionTaskInput{
 				WorkspaceID:       s.wsID,
 				TaskID:            t.ID,
 				TargetStatus:      task.StatusBlocked,
 				ResolutionComment: reason,
-			})
-			if err != nil {
+			}); err != nil {
 				s.throwErr(vm, err)
 			}
-		} else if reason != "" {
-			_, _ = s.taskSvc.AddComment(s.ctx, task.AddCommentInput{
-				WorkspaceID: s.wsID,
-				TaskID:      t.ID,
-				Kind:        task.CommentKindBlocker,
-				Body:        reason,
-			})
+		} else {
+			if t.Status != task.StatusBlocked && !t.Status.IsTerminal() {
+				if _, err := s.taskSvc.TransitionTask(s.ctx, task.TransitionTaskInput{
+					WorkspaceID:  s.wsID,
+					TaskID:       t.ID,
+					TargetStatus: task.StatusBlocked,
+				}); err != nil {
+					s.throwErr(vm, err)
+				}
+			}
+			if reason != "" {
+				if _, err := s.taskSvc.AddComment(authctx.WithSuppressTaskSignal(s.ctx), task.AddCommentInput{
+					WorkspaceID: s.wsID,
+					TaskID:      t.ID,
+					Kind:        task.CommentKindBlocker,
+					Body:        reason,
+				}); err != nil {
+					s.throwErr(vm, err)
+				}
+			}
 		}
 		s.mutations++
-		reloaded, _ := s.taskSvc.GetTask(s.ctx, s.wsID, t.ID)
-		return vm.ToValue(s.fullTaskMap(reloaded))
-	})
-	_ = tasksObj.Set("unblock", func(call goja.FunctionCall) goja.Value {
-		t, err := s.resolveTask(optArgString(call, 0))
+		reloaded, err := s.taskSvc.GetTask(authctx.WithSuppressTaskSignal(s.ctx), s.wsID, t.ID)
 		if err != nil {
 			s.throwErr(vm, err)
 		}
-		rels, _ := s.taskSvc.ListRelations(s.ctx, s.wsID, t.ID)
-		for _, r := range rels {
-			if r.TargetTaskID == t.ID && r.Type == task.RelationBlocks {
-				_ = s.taskSvc.RemoveRelation(s.ctx, s.wsID, r.ID)
+		return vm.ToValue(s.fullTaskMap(reloaded))
+	}))
+	_ = tasksObj.Set("unblock", s.hostFn(func(call goja.FunctionCall) goja.Value {
+		t, err := s.resolveTaskQuiet(optArgString(call, 0))
+		if err != nil {
+			s.throwErr(vm, err)
+		}
+		var (
+			filterSourceIDs map[uuid.UUID]bool
+			hasClearedArg   bool
+		)
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) && !goja.IsNull(call.Arguments[1]) {
+			hasClearedArg = true
+			var clearedRefs []string
+			if m, ok := exportJSValue(call.Arguments[1]).(map[string]any); ok {
+				clearedRefs = strSliceField(m, "clearedBy", "by")
+			} else {
+				clearedRefs = valueToStringSlice(exportJSValue(call.Arguments[1]))
+			}
+			filterSourceIDs = make(map[uuid.UUID]bool, len(clearedRefs))
+			for _, ref := range clearedRefs {
+				up, uErr := s.resolveTaskQuiet(ref)
+				if uErr != nil {
+					s.throwErr(vm, uErr)
+				}
+				filterSourceIDs[up.ID] = true
 			}
 		}
-		reloaded, _ := s.taskSvc.GetTask(s.ctx, s.wsID, t.ID)
+		rels, err := s.taskSvc.ListRelations(s.ctx, s.wsID, t.ID)
+		if err != nil {
+			s.throwErr(vm, err)
+		}
+		for _, r := range rels {
+			if r.TargetTaskID == t.ID && r.Type == task.RelationBlocks {
+				if hasClearedArg && !filterSourceIDs[r.SourceTaskID] {
+					continue
+				}
+				if rmErr := s.taskSvc.RemoveRelation(s.ctx, s.wsID, r.ID); rmErr != nil {
+					s.throwErr(vm, rmErr)
+				}
+			}
+		}
+		reloaded, err := s.taskSvc.GetTask(authctx.WithSuppressTaskSignal(s.ctx), s.wsID, t.ID)
+		if err != nil {
+			s.throwErr(vm, err)
+		}
 		if reloaded.Status == task.StatusBlocked && reloaded.UnresolvedBlockerCount == 0 {
-			reloaded, _ = s.taskSvc.TransitionTask(s.ctx, task.TransitionTaskInput{
+			reloaded, err = s.taskSvc.TransitionTask(s.ctx, task.TransitionTaskInput{
 				WorkspaceID:  s.wsID,
 				TaskID:       t.ID,
 				TargetStatus: task.StatusReady,
 			})
+			if err != nil {
+				s.throwErr(vm, err)
+			}
 		}
 		s.mutations++
 		return vm.ToValue(s.fullTaskMap(reloaded))
-	})
-	_ = tasksObj.Set("comment", func(call goja.FunctionCall) goja.Value {
-		t, err := s.resolveTask(optArgString(call, 0))
+	}))
+	_ = tasksObj.Set("comment", s.hostFn(func(call goja.FunctionCall) goja.Value {
+		t, err := s.resolveTaskQuiet(optArgString(call, 0))
 		if err != nil {
 			s.throwErr(vm, err)
 		}
@@ -1471,14 +1715,14 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			"author": firstNonEmpty(cm.AuthorHandle, s.ident.Handle),
 			"body":   cm.Body,
 		})
-	})
+	}))
 
 	root := vm.NewObject()
 	_ = root.Set("projects", projectsObj)
 	_ = root.Set("goals", goalsObj)
 	_ = root.Set("objectives", goalsObj)
 	_ = root.Set("tasks", tasksObj)
-	_ = root.Set("search", func(call goja.FunctionCall) goja.Value {
+	_ = root.Set("search", s.hostFn(func(call goja.FunctionCall) goja.Value {
 		raw := optArgString(call, 0)
 		q := language.ParseSearchQuery(raw)
 		if q.Scope == language.SearchScopeSDK {
@@ -1497,12 +1741,18 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			res["tasks"] = tasks
 		}
 		if q.Scope == language.SearchScopeAll || q.Scope == language.SearchScopeGoals {
-			objs, _ := s.objSvc.ListObjectives(s.ctx, objective.ListObjectivesFilter{
+			objs, oErr := s.objSvc.ListObjectives(s.ctx, objective.ListObjectivesFilter{
 				WorkspaceID: s.wsID,
 				ProjectID:   p.ID,
-				Limit:       100,
+				Limit:       500,
 			})
-			allTasks, _ := s.listAllProjectTasks(p.ID)
+			if oErr != nil {
+				s.throwErr(vm, oErr)
+			}
+			allTasks, tErr := s.listAllProjectTasks(p.ID)
+			if tErr != nil {
+				s.throwErr(vm, tErr)
+			}
 			var matchedGoals []map[string]any
 			for _, o := range objs {
 				if q.MatchesText(o.Slug, o.Title, o.Summary, string(o.Status)) {
@@ -1512,20 +1762,60 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			res["goals"] = matchedGoals
 		}
 		return vm.ToValue(res)
-	})
-	_ = root.Set("board", func(_ goja.FunctionCall) goja.Value {
-		p, err := s.resolveProject("")
+	}))
+	_ = root.Set("board", s.hostFn(func(call goja.FunctionCall) goja.Value {
+		var (
+			projRef          string
+			objRef           string
+			includeCompleted bool
+		)
+		if len(call.Arguments) > 0 && !goja.IsUndefined(call.Arguments[0]) && !goja.IsNull(call.Arguments[0]) {
+			if m, ok := exportJSValue(call.Arguments[0]).(map[string]any); ok {
+				projRef = strField(m, "project")
+				objRef = strField(m, "objective", "goal")
+				if inc, okInc := m["includeCompleted"].(bool); okInc {
+					includeCompleted = inc
+				}
+			}
+		}
+		p, err := s.resolveProject(projRef)
 		if err != nil {
 			s.throwErr(vm, err)
 		}
-		objs, _ := s.objSvc.ListObjectives(s.ctx, objective.ListObjectivesFilter{WorkspaceID: s.wsID, ProjectID: p.ID, Limit: 100})
-		tasks, _ := s.listAllProjectTasks(p.ID)
+		var targetObj *objective.Objective
+		if objRef != "" {
+			resolvedObj, oErr := s.resolveObjective(p.ID, objRef)
+			if oErr != nil {
+				s.throwErr(vm, oErr)
+			}
+			targetObj = &resolvedObj
+		}
+		objs, err := s.objSvc.ListObjectives(s.ctx, objective.ListObjectivesFilter{WorkspaceID: s.wsID, ProjectID: p.ID, Limit: 500})
+		if err != nil {
+			s.throwErr(vm, err)
+		}
+		allTasks, err := s.listAllProjectTasks(p.ID)
+		if err != nil {
+			s.throwErr(vm, err)
+		}
 		goals := make([]map[string]any, 0, len(objs))
 		for _, o := range objs {
-			goals = append(goals, objectiveMap(o, tasks))
+			if targetObj != nil && o.ID != targetObj.ID {
+				continue
+			}
+			if targetObj == nil && !includeCompleted && (o.Status == objective.StatusAchieved || o.Status == objective.StatusDropped) {
+				continue
+			}
+			goals = append(goals, objectiveMap(o, allTasks))
 		}
-		rows := make([]map[string]any, 0, len(tasks))
-		for _, t := range tasks {
+		rows := make([]map[string]any, 0, len(allTasks))
+		for _, t := range allTasks {
+			if targetObj != nil && !strings.EqualFold(t.ObjectiveSlug, targetObj.Slug) {
+				continue
+			}
+			if !includeCompleted && t.Status.IsTerminal() {
+				continue
+			}
 			rows = append(rows, summaryMap(t))
 		}
 		return vm.ToValue(map[string]any{
@@ -1533,7 +1823,7 @@ func (s *scriptSession) bindGlobals(vm *goja.Runtime) error {
 			"goals":   goals,
 			"tasks":   rows,
 		})
-	})
+	}))
 
 	if err := vm.Set("flowsk", root); err != nil {
 		return err
@@ -1580,7 +1870,7 @@ func (s *scriptSession) resolveObjective(projID uuid.UUID, ref string) (objectiv
 	if o, err := s.objSvc.GetObjectiveBySlug(s.ctx, s.wsID, projID, strings.ToLower(trimmed)); err == nil {
 		return o, nil
 	}
-	items, err := s.objSvc.ListObjectives(s.ctx, objective.ListObjectivesFilter{WorkspaceID: s.wsID, ProjectID: projID, Limit: 100})
+	items, err := s.objSvc.ListObjectives(s.ctx, objective.ListObjectivesFilter{WorkspaceID: s.wsID, ProjectID: projID, Limit: 500})
 	if err != nil {
 		return objective.Objective{}, err
 	}
@@ -1593,47 +1883,204 @@ func (s *scriptSession) resolveObjective(projID uuid.UUID, ref string) (objectiv
 }
 
 func (s *scriptSession) resolveTask(ref string) (task.Task, error) {
+	return s.resolveTaskWithContext(s.ctx, ref)
+}
+
+func (s *scriptSession) resolveTaskQuiet(ref string) (task.Task, error) {
+	return s.resolveTaskWithContext(authctx.WithSuppressTaskSignal(s.ctx), ref)
+}
+
+func (s *scriptSession) resolveTaskWithContext(ctx context.Context, ref string) (task.Task, error) {
 	trimmed := strings.TrimSpace(ref)
 	if tid, err := uuid.Parse(trimmed); err == nil {
-		return s.taskSvc.GetTask(s.ctx, s.wsID, tid)
+		return s.taskSvc.GetTask(ctx, s.wsID, tid)
 	}
-	if t, err := s.taskSvc.GetTaskByKey(s.ctx, s.wsID, strings.ToUpper(trimmed)); err == nil {
+	if t, err := s.taskSvc.GetTaskByKey(ctx, s.wsID, strings.ToUpper(trimmed)); err == nil {
 		return t, nil
 	}
 	if p, pErr := s.resolveProject(""); pErr == nil && p.ID != uuid.Nil {
-		if t, extErr := s.taskSvc.GetTaskByExternalID(s.ctx, s.wsID, p.ID, trimmed); extErr == nil {
+		if t, extErr := s.taskSvc.GetTaskByExternalID(ctx, s.wsID, p.ID, trimmed); extErr == nil {
 			return t, nil
 		}
 	}
-	return s.taskSvc.GetTaskByKey(s.ctx, s.wsID, strings.ToUpper(trimmed))
+	return s.taskSvc.GetTaskByKey(ctx, s.wsID, strings.ToUpper(trimmed))
+}
+
+func (s *scriptSession) resolveAssigneeInput(raw string) *uuid.UUID {
+	trimmed := strings.TrimPrefix(strings.TrimSpace(raw), "@")
+	if trimmed == "" {
+		return nil
+	}
+	if aid, err := uuid.Parse(trimmed); err == nil && aid != uuid.Nil {
+		return &aid
+	}
+	if strings.EqualFold(trimmed, "me") || (s.ident.Handle != "" && strings.EqualFold(trimmed, s.ident.Handle)) {
+		if s.ident.ActorID != uuid.Nil {
+			idCopy := s.ident.ActorID
+			return &idCopy
+		}
+	}
+	return nil
+}
+
+func (s *scriptSession) syncTaskBlockers(taskID uuid.UUID, depRefs []string) error {
+	wantSourceIDs := make([]uuid.UUID, 0, len(depRefs))
+	wantSet := make(map[uuid.UUID]bool, len(depRefs))
+	for _, depRef := range depRefs {
+		up, err := s.resolveTaskQuiet(depRef)
+		if err != nil {
+			return err
+		}
+		if !wantSet[up.ID] {
+			wantSet[up.ID] = true
+			wantSourceIDs = append(wantSourceIDs, up.ID)
+		}
+	}
+	rels, err := s.taskSvc.ListRelations(s.ctx, s.wsID, taskID)
+	if err != nil {
+		return err
+	}
+	existingSources := make(map[uuid.UUID]uuid.UUID)
+	for _, r := range rels {
+		if r.TargetTaskID == taskID && r.Type == task.RelationBlocks {
+			existingSources[r.SourceTaskID] = r.ID
+			if !wantSet[r.SourceTaskID] {
+				if rmErr := s.taskSvc.RemoveRelation(s.ctx, s.wsID, r.ID); rmErr != nil {
+					return rmErr
+				}
+			}
+		}
+	}
+	for _, upID := range wantSourceIDs {
+		if _, exists := existingSources[upID]; !exists {
+			if _, addErr := s.taskSvc.AddRelation(s.ctx, task.AddRelationInput{
+				WorkspaceID:  s.wsID,
+				SourceTaskID: upID,
+				TargetTaskID: taskID,
+				Type:         task.RelationBlocks,
+			}); addErr != nil {
+				return addErr
+			}
+		}
+	}
+	return nil
+}
+
+func defaultNonArchivedStatuses() []task.Status {
+	return []task.Status{
+		task.StatusBacklog, task.StatusReady, task.StatusInProgress,
+		task.StatusInReview, task.StatusBlocked, task.StatusDone, task.StatusCancelled,
+	}
 }
 
 func (s *scriptSession) listAllProjectTasks(projID uuid.UUID) ([]task.CompactTaskSummary, error) {
 	return s.taskSvc.PollWorkQueue(s.ctx, task.AgentWorkQueueFilter{
 		WorkspaceID: s.wsID,
 		ProjectID:   projID,
-		Statuses: []task.Status{
-			task.StatusBacklog, task.StatusReady, task.StatusInProgress,
-			task.StatusInReview, task.StatusBlocked, task.StatusDone, task.StatusCancelled,
-		},
-		Limit: 100,
+		Statuses:    defaultNonArchivedStatuses(),
+		Limit:       1000,
 	})
 }
 
+func (s *scriptSession) lookupFullTask(id uuid.UUID, prefetched map[uuid.UUID]task.Task) (task.Task, bool) {
+	if prefetched != nil {
+		if t, ok := prefetched[id]; ok {
+			return t, true
+		}
+	}
+	full, err := s.taskSvc.GetTask(authctx.WithSuppressTaskSignal(s.ctx), s.wsID, id)
+	if err != nil {
+		return task.Task{}, false
+	}
+	return full, true
+}
+
+func (s *scriptSession) matchesTaskActor(it task.CompactTaskSummary, actorQuery string, prefetched map[uuid.UUID]task.Task) bool {
+	want := strings.TrimPrefix(strings.TrimSpace(actorQuery), "@")
+	if want == "" {
+		return true
+	}
+	if strings.EqualFold(it.HolderHandle, want) {
+		return true
+	}
+	full, ok := s.lookupFullTask(it.ID, prefetched)
+	if !ok {
+		return false
+	}
+	if full.ActiveLease != nil {
+		if strings.EqualFold(full.ActiveLease.HolderHandle, want) ||
+			strings.EqualFold(full.ActiveLease.HolderActorID.String(), want) ||
+			(strings.EqualFold(want, "me") && full.ActiveLease.HolderActorID == s.ident.ActorID) {
+			return true
+		}
+	}
+	if full.AssigneeActorID != nil && *full.AssigneeActorID != uuid.Nil {
+		assigneeID := *full.AssigneeActorID
+		if strings.EqualFold(assigneeID.String(), want) {
+			return true
+		}
+		if (strings.EqualFold(want, "me") || (s.ident.Handle != "" && strings.EqualFold(s.ident.Handle, want))) && assigneeID == s.ident.ActorID {
+			return true
+		}
+		if cms, cErr := s.taskSvc.ListComments(s.ctx, s.wsID, it.ID, 50); cErr == nil {
+			for _, cm := range cms {
+				if cm.AuthorActorID == assigneeID && strings.EqualFold(cm.AuthorHandle, want) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (s *scriptSession) searchProjectTasks(projID uuid.UUID, q language.SearchQuery) ([]map[string]any, error) {
-	all, err := s.listAllProjectTasks(projID)
+	statuses := defaultNonArchivedStatuses()
+	if len(q.Statuses) > 0 {
+		statuses = append([]task.Status(nil), q.Statuses...)
+	}
+	filter := task.AgentWorkQueueFilter{
+		WorkspaceID: s.wsID,
+		ProjectID:   projID,
+		Statuses:    statuses,
+		ExternalID:  q.ExternalID,
+		Limit:       1000,
+	}
+	if len(q.Tags) > 0 {
+		filter.RequiredTags = append([]string(nil), q.Tags...)
+	}
+	if q.Claimed != nil && !*q.Claimed {
+		filter.OnlyUnclaimed = true
+	}
+	if q.Objective != "" {
+		o, oErr := s.resolveObjective(projID, q.Objective)
+		if oErr != nil {
+			if errors.Is(oErr, errs.ErrNotFound) {
+				return []map[string]any{}, nil
+			}
+			return nil, oErr
+		}
+		filter.ObjectiveID = &o.ID
+	}
+
+	all, err := s.taskSvc.PollWorkQueue(s.ctx, filter)
 	if err != nil {
 		return nil, err
 	}
-	var out []map[string]any
+	var prefetched map[uuid.UUID]task.Task
+	if len(all) > 1 && (q.Actor != "" || len(q.Terms) > 0) && s.taskRepo != nil {
+		if wsTasks, lErr := s.taskRepo.ListByWorkspace(s.ctx, s.wsID); lErr == nil {
+			prefetched = make(map[uuid.UUID]task.Task, len(wsTasks))
+			for _, wt := range wsTasks {
+				prefetched[wt.ID] = wt
+			}
+		}
+	}
+	out := make([]map[string]any, 0, len(all))
 	for _, it := range all {
 		if len(q.Statuses) > 0 && !slices.Contains(q.Statuses, it.Status) {
 			continue
 		}
 		if q.Priority != nil && it.Priority != *q.Priority {
-			continue
-		}
-		if q.Objective != "" && !strings.EqualFold(it.ObjectiveSlug, q.Objective) {
 			continue
 		}
 		if q.Parent != "" && !strings.EqualFold(it.ParentKey, q.Parent) {
@@ -1642,7 +2089,7 @@ func (s *scriptSession) searchProjectTasks(projID uuid.UUID, q language.SearchQu
 		if q.ExternalID != "" && it.ExternalID != q.ExternalID {
 			continue
 		}
-		if q.Actor != "" && !strings.EqualFold(it.HolderHandle, q.Actor) {
+		if q.Actor != "" && !s.matchesTaskActor(it, q.Actor, prefetched) {
 			continue
 		}
 		isBlocked := it.UnresolvedBlockerCount > 0 || it.Status == task.StatusBlocked
@@ -1676,7 +2123,7 @@ func (s *scriptSession) searchProjectTasks(projID uuid.UUID, q language.SearchQu
 			}
 		}
 		if len(q.Terms) > 0 {
-			full, gErr := s.taskSvc.GetTask(s.ctx, s.wsID, it.ID)
+			full, hasFull := s.lookupFullTask(it.ID, prefetched)
 			var commentText string
 			if cms, cErr := s.taskSvc.ListComments(s.ctx, s.wsID, it.ID, 20); cErr == nil {
 				var cb strings.Builder
@@ -1686,7 +2133,7 @@ func (s *scriptSession) searchProjectTasks(projID uuid.UUID, q language.SearchQu
 				}
 				commentText = cb.String()
 			}
-			if gErr == nil {
+			if hasFull {
 				if !q.MatchesText(it.Key, it.ExternalID, it.Title, full.Description, strings.Join(full.AcceptanceCriteriaCopy(), " "), strings.Join(it.Tags, " "), commentText) {
 					continue
 				}
@@ -1706,25 +2153,51 @@ func (s *scriptSession) fullTaskMap(t task.Task) map[string]any {
 			objKey = o.Slug
 		}
 	}
+	parentKey := ""
+	if t.ParentTaskID != nil {
+		if pt, err := s.taskSvc.GetTask(authctx.WithSuppressTaskSignal(s.ctx), s.wsID, *t.ParentTaskID); err == nil {
+			parentKey = pt.Key
+		}
+	}
 	holder := ""
 	if t.ActiveLease != nil {
 		holder = firstNonEmpty(t.ActiveLease.HolderHandle, t.ActiveLease.HolderActorID.String())
 	}
+	assignee := ""
+	if t.AssigneeActorID != nil && *t.AssigneeActorID != uuid.Nil {
+		assignee = t.AssigneeActorID.String()
+	}
+	tags := t.TagsCopy()
+	if tags == nil {
+		tags = []string{}
+	}
+	acc := t.AcceptanceCriteriaCopy()
+	if acc == nil {
+		acc = []string{}
+	}
+	var lastSignalAt any
+	if t.LastSignalAt != nil && !t.LastSignalAt.IsZero() {
+		lastSignalAt = t.LastSignalAt.UTC().Format(time.RFC3339Nano)
+	}
 	return map[string]any{
 		"id":             t.ID.String(),
 		"key":            t.Key,
+		"kind":           string(t.Kind),
 		"externalId":     t.ExternalID,
 		"title":          t.Title,
 		"description":    t.Description,
 		"status":         string(t.Status),
 		"state":          string(t.Status),
 		"priority":       int(t.Priority),
-		"tags":           t.TagsCopy(),
+		"tags":           tags,
 		"objective":      objKey,
+		"parent":         parentKey,
+		"assignee":       assignee,
 		"holder":         holder,
 		"blocked":        t.UnresolvedBlockerCount > 0 || t.Status == task.StatusBlocked,
 		"hasMarkdownDoc": t.HasMarkdownDoc,
-		"acceptance":     t.AcceptanceCriteriaCopy(),
+		"lastSignalAt":   lastSignalAt,
+		"acceptance":     acc,
 	}
 }
 
@@ -1754,24 +2227,41 @@ func objectiveMap(o objective.Objective, tasks []task.CompactTaskSummary) map[st
 	if kind == "" {
 		kind = string(objective.KindGoal)
 	}
+	criteria := o.SuccessCriteriaCopy()
+	if criteria == nil {
+		criteria = []string{}
+	}
+	var targetDate any
+	if o.TargetDate != nil && !o.TargetDate.IsZero() {
+		targetDate = o.TargetDate.UTC().Format("2006-01-02")
+	}
 	return map[string]any{
-		"id":             o.ID.String(),
-		"key":            o.Slug,
-		"slug":           o.Slug,
-		"kind":           kind,
-		"title":          o.Title,
-		"summary":        o.Summary,
-		"status":         string(o.Status),
-		"priority":       int(o.PriorityRank),
-		"totalTasks":     total,
-		"completedTasks": done,
+		"id":              o.ID.String(),
+		"key":             o.Slug,
+		"slug":            o.Slug,
+		"kind":            kind,
+		"title":           o.Title,
+		"summary":         o.Summary,
+		"status":          string(o.Status),
+		"priority":        int(o.PriorityRank),
+		"targetDate":      targetDate,
+		"successCriteria": criteria,
+		"totalTasks":      total,
+		"completedTasks":  done,
 	}
 }
 
 func summaryMap(s task.CompactTaskSummary) map[string]any {
+	tags := make([]string, len(s.Tags))
+	copy(tags, s.Tags)
+	var lastSignalAt any
+	if s.LastSignalAt != nil && !s.LastSignalAt.IsZero() {
+		lastSignalAt = s.LastSignalAt.UTC().Format(time.RFC3339Nano)
+	}
 	return map[string]any{
 		"id":             s.ID.String(),
 		"key":            s.Key,
+		"kind":           string(s.Kind),
 		"externalId":     s.ExternalID,
 		"title":          s.Title,
 		"status":         string(s.Status),
@@ -1780,33 +2270,50 @@ func summaryMap(s task.CompactTaskSummary) map[string]any {
 		"objective":      s.ObjectiveSlug,
 		"parent":         s.ParentKey,
 		"holder":         s.HolderHandle,
-		"tags":           append([]string(nil), s.Tags...),
+		"tags":           tags,
 		"blocked":        s.UnresolvedBlockerCount > 0 || s.Status == task.StatusBlocked,
 		"hasMarkdownDoc": s.HasMarkdownDoc,
+		"lastSignalAt":   lastSignalAt,
 	}
 }
 
 func mapToSearchQuery(m map[string]any) language.SearchQuery {
 	q := language.ParseSearchQuery(strField(m, "q", "query"))
 	if stRaw := strField(m, "state", "status"); stRaw != "" {
-		if st, ok := language.NormalizeStatusToken(stRaw); ok {
-			q.Statuses = append(q.Statuses, st)
+		for _, part := range strings.Split(stRaw, ",") {
+			if st, ok := language.NormalizeStatusToken(part); ok && !slices.Contains(q.Statuses, st) {
+				q.Statuses = append(q.Statuses, st)
+			}
 		}
 	}
 	if tag := strField(m, "tag", "label"); tag != "" {
 		q.Tags = append(q.Tags, strings.ToLower(tag))
 	}
+	if tags, hasTags := optStrSliceField(m, "tags", "labels"); hasTags {
+		for _, t := range tags {
+			q.Tags = append(q.Tags, strings.ToLower(t))
+		}
+	}
 	if obj := strField(m, "objective", "goal"); obj != "" {
 		q.Objective = obj
+	}
+	if par := strField(m, "parent"); par != "" {
+		q.Parent = par
 	}
 	if ext := strField(m, "externalId", "external_id", "ext"); ext != "" {
 		q.ExternalID = ext
 	}
-	if act := strField(m, "actor", "assignee"); act != "" {
-		q.Actor = act
+	if act := strField(m, "actor", "assignee", "holder"); act != "" {
+		q.Actor = strings.TrimPrefix(act, "@")
 	}
 	if b, ok := m["blocked"].(bool); ok {
 		q.Blocked = &b
+	}
+	if c, ok := m["claimed"].(bool); ok {
+		q.Claimed = &c
+	}
+	if md, ok := m["hasMarkdownDoc"].(bool); ok {
+		q.HasMarkdownDoc = &md
 	}
 	return q
 }
@@ -1943,29 +2450,119 @@ func intField(m map[string]any, keys ...string) int {
 }
 
 func strSliceField(m map[string]any, keys ...string) []string {
+	vals, _ := optStrSliceField(m, keys...)
+	return vals
+}
+
+func optStrSliceField(m map[string]any, keys ...string) ([]string, bool) {
 	for _, k := range keys {
 		raw, ok := m[k]
-		if !ok || raw == nil {
+		if !ok {
 			continue
 		}
+		if raw == nil {
+			return []string{}, true
+		}
+		return valueToStringSlice(raw), true
+	}
+	return nil, false
+}
+
+func valueToStringSlice(raw any) []string {
+	switch v := raw.(type) {
+	case string:
+		if strings.TrimSpace(v) != "" {
+			return []string{strings.TrimSpace(v)}
+		}
+		return []string{}
+	case []string:
+		out := make([]string, 0, len(v))
+		for _, el := range v {
+			if s := strings.TrimSpace(el); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, el := range v {
+			if el == nil {
+				continue
+			}
+			if s := strings.TrimSpace(fmt.Sprint(el)); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return []string{}
+	}
+}
+
+func parseJSTaskKind(raw string) (task.Kind, bool) {
+	k := task.Kind(strings.ToLower(strings.TrimSpace(raw)))
+	switch k {
+	case task.KindEpic, task.KindFeature, task.KindBug, task.KindChore, task.KindResearch:
+		return k, true
+	default:
+		return "", false
+	}
+}
+
+func parseOptionalTargetDate(op string, m map[string]any, keys ...string) (*time.Time, bool, error) {
+	for _, k := range keys {
+		raw, ok := m[k]
+		if !ok {
+			continue
+		}
+		if raw == nil {
+			zero := time.Time{}
+			return &zero, true, nil
+		}
 		switch v := raw.(type) {
+		case time.Time:
+			utc := v.UTC()
+			return &utc, true, nil
 		case string:
-			if strings.TrimSpace(v) != "" {
-				return []string{strings.TrimSpace(v)}
+			trimmed := strings.TrimSpace(v)
+			if trimmed == "" {
+				zero := time.Time{}
+				return &zero, true, nil
 			}
-		case []string:
-			return append([]string(nil), v...)
-		case []any:
-			out := make([]string, 0, len(v))
-			for _, el := range v {
-				if s := strings.TrimSpace(fmt.Sprint(el)); s != "" {
-					out = append(out, s)
-				}
+			if parsed, err := time.Parse("2006-01-02", trimmed); err == nil {
+				utc := parsed.UTC()
+				return &utc, true, nil
 			}
-			return out
+			if parsed, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
+				utc := parsed.UTC()
+				return &utc, true, nil
+			}
+			return nil, true, errs.Validation(op, fmt.Sprintf("invalid targetDate %q: expected YYYY-MM-DD or RFC3339 timestamp", trimmed), errs.FieldViolation{
+				Field:       "targetDate",
+				Description: "must be a valid YYYY-MM-DD date or RFC3339 timestamp",
+			})
+		default:
+			return nil, true, errs.Validation(op, "invalid targetDate type: expected string or null", errs.FieldViolation{
+				Field:       "targetDate",
+				Description: "must be a YYYY-MM-DD or RFC3339 string, or null/empty to clear",
+			})
 		}
 	}
-	return nil
+	return nil, false, nil
+}
+
+func deriveProjectKeyPrefix(raw string) string {
+	cleaned := nonUpperAlnum.ReplaceAllString(strings.ToUpper(strings.TrimSpace(raw)), "")
+	if cleaned != "" && cleaned[0] >= '0' && cleaned[0] <= '9' {
+		cleaned = "P" + cleaned
+	}
+	if len(cleaned) < 2 {
+		return "PRJ"
+	}
+	if len(cleaned) > 10 {
+		cleaned = cleaned[:10]
+	}
+	return cleaned
 }
 
 func parseJSTaskPriority(raw any) task.Priority {

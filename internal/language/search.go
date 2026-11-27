@@ -210,41 +210,44 @@ func CodeModeTypeScriptSpec() string {
 	return `// Flowsk Code Mode SDK (ES6 JavaScript — runs inside a single ACID transaction)
 declare const flowsk: {
   search(query: string): { tasks: Task[]; goals: Goal[] };
-  board(opts?: { includeCompleted?: boolean; objective?: string }): Board;
+  board(opts?: { includeCompleted?: boolean; objective?: string; project?: string }): Board;
   projects: {
     list(): Project[];
     get(slugOrKey?: string): Project;
-    create(in: { key: string; name: string; slug?: string; description?: string }): Project;
+    create(in: { key?: string; name: string; slug?: string; description?: string }): Project;
+    bind(parentKey: string, childKey: string, scopeSubpath?: string): ProjectBinding;
+    unbind(parentKey: string, childKey: string): { parentKey: string; childKey: string; removed: boolean };
+    bindings(): ProjectBinding[];
     getDoc(slugOrKey?: string): { id: string; key: string; slug: string; markdown: string; hasMarkdownDoc: boolean };
     setDoc(slugOrKey: string, markdown: string): Project;
     deleteDoc(slugOrKey?: string): Project;
   };
   goals: { // alias: flowsk.objectives
     list(filter?: string): Goal[];
-    create(in: { title: string; kind?: "goal" | "milestone" | "cycle"; status?: "planned" | "active" | "at_risk"; slug?: string; summary?: string; priority?: number | "urgent" | "high" | "medium" | "low"; targetDate?: string; successCriteria?: string[] }): Goal;
-    update(slugOrId: string, patch: { title?: string; kind?: "goal" | "milestone" | "cycle"; status?: "planned" | "active" | "at_risk" | "achieved" | "dropped"; summary?: string; priority?: number | string; targetDate?: string; successCriteria?: string[] }): Goal;
+    create(in: { title: string; project?: string; kind?: "goal" | "milestone" | "cycle"; status?: "planned" | "active" | "at_risk"; slug?: string; summary?: string; priority?: number | "urgent" | "high" | "medium" | "low"; targetDate?: string; successCriteria?: string[] }): Goal;
+    update(slugOrId: string, patch: { title?: string; kind?: "goal" | "milestone" | "cycle"; status?: "planned" | "active" | "at_risk" | "achieved" | "dropped"; summary?: string; priority?: number | string; targetDate?: string | null; successCriteria?: string[] }): Goal;
     close(slugOrId: string, note?: string): Goal;
   };
   tasks: {
     list(filter?: string | { state?: string; tag?: string; objective?: string; externalId?: string; actor?: string; blocked?: boolean; limit?: number }): Task[];
     search(query: string): Task[]; // e.g. "state:done #storage ext:CU-123" or "is:open is:unclaimed is:md"
     ready(limit?: number): Task[];
+    next(opts?: { claim?: boolean; ttlSeconds?: number }): TaskDetail | null;
     get(keyOrId: string): TaskDetail;
     getByExternal(externalId: string, project?: string): TaskDetail | null;
-    next(opts?: { claim?: boolean; ttlSeconds?: number }): Task | null;
-    create(in: { title: string; externalId?: string; description?: string; markdown?: string; priority?: number | "urgent" | "high" | "medium" | "low"; state?: string; objective?: string; parent?: string; tags?: string[]; dependsOn?: string[]; acceptance?: string | string[] }): Task;
-    upsertExternal(in: { externalId: string; project?: string; title: string; description?: string; markdown?: string; priority?: number | "urgent" | "high" | "medium" | "low"; state?: string; objective?: string; parent?: string; tags?: string[]; dependsOn?: string[]; acceptance?: string | string[] }): TaskDetail;
-    update(keyOrId: string, patch: { title?: string; externalId?: string; description?: string; markdown?: string; priority?: number | string; tags?: string[]; acceptance?: string | string[]; objective?: string }): Task;
+    create(in: { title: string; project?: string; kind?: "epic" | "feature" | "bug" | "chore" | "research"; externalId?: string; description?: string; markdown?: string; priority?: number | "urgent" | "high" | "medium" | "low"; state?: string; objective?: string; parent?: string; tags?: string[]; dependsOn?: string[]; acceptance?: string | string[] }): TaskDetail;
+    upsertExternal(in: { externalId: string; project?: string; kind?: "epic" | "feature" | "bug" | "chore" | "research"; title: string; description?: string; markdown?: string; priority?: number | "urgent" | "high" | "medium" | "low"; state?: string; objective?: string; parent?: string; tags?: string[]; dependsOn?: string[]; acceptance?: string | string[] }): TaskDetail;
+    update(keyOrId: string, patch: { title?: string; kind?: string; externalId?: string; description?: string; markdown?: string; priority?: number | string; tags?: string[]; acceptance?: string | string[]; objective?: string; parent?: string }): TaskDetail;
+    claim(keyOrId: string, ttlSeconds?: number): TaskDetail;
+    release(keyOrId: string, opts?: { state?: string; note?: string }): TaskDetail;
+    move(keyOrId: string, state: string, note?: string): TaskDetail;
+    done(keyOrId: string, note?: string): TaskDetail;
+    block(keyOrId: string, reasonOrOpts: string | { by?: string[]; reason?: string }, by?: string[]): TaskDetail;
+    unblock(keyOrId: string, clearedBy?: string[]): TaskDetail;
+    comment(keyOrId: string, body: string, kind?: "note" | "progress" | "decision" | "handoff" | "blocker"): Comment;
     getDoc(keyOrId: string): { id: string; key: string; markdown: string; hasMarkdownDoc: boolean };
     setDoc(keyOrId: string, markdown: string): TaskDetail;
     deleteDoc(keyOrId: string): TaskDetail;
-    move(keyOrId: string, state: string, note?: string): Task;
-    done(keyOrId: string, note?: string): Task;
-    claim(keyOrId: string, ttlSeconds?: number): Task;
-    release(keyOrId: string, opts?: { state?: string; note?: string }): Task;
-    block(keyOrId: string, opts: { by?: string[]; reason?: string }): Task;
-    unblock(keyOrId: string, clearedBy?: string[]): Task;
-    comment(keyOrId: string, body: string, kind?: "note" | "progress" | "decision" | "handoff" | "blocker"): Comment;
   };
 };`
 }
@@ -252,7 +255,7 @@ declare const flowsk: {
 // CodeModeSDKCatalog returns defensive copies of all JavaScript methods exposed
 // on `flowsk` inside the Code Mode sandbox.
 func CodeModeSDKCatalog() []SDKMethodDoc {
-	catalog := []SDKMethodDoc{
+	return []SDKMethodDoc{
 		{
 			Name:      "flowsk.search",
 			Category:  "search",
@@ -261,74 +264,207 @@ func CodeModeSDKCatalog() []SDKMethodDoc {
 			Example:   `return flowsk.search("state:done #storage sqlite");`,
 		},
 		{
+			Name:      "flowsk.board",
+			Category:  "board",
+			Signature: "flowsk.board(opts?: { includeCompleted?: boolean, objective?: string, project?: string }): Board",
+			Summary:   "Returns the active project board snapshot with goals, completion progress, and filtered open/completed tasks.",
+			Example:   `return flowsk.board({ includeCompleted: false, objective: "launch-v1" });`,
+		},
+		{
+			Name:      "flowsk.projects.list",
+			Category:  "projects",
+			Signature: "flowsk.projects.list(): Project[]",
+			Summary:   "Lists all non-deleted logical projects in the active workspace.",
+			Example:   `return flowsk.projects.list();`,
+		},
+		{
+			Name:      "flowsk.projects.get",
+			Category:  "projects",
+			Signature: "flowsk.projects.get(slugOrKey?: string): Project",
+			Summary:   "Resolves a logical project by key prefix, slug, or UUID (defaulting to the active project when omitted).",
+			Example:   `return flowsk.projects.get("CORE");`,
+		},
+		{
+			Name:      "flowsk.projects.create",
+			Category:  "projects",
+			Signature: "flowsk.projects.create({ key?, name, slug?, description? }): Project",
+			Summary:   "Creates a logical multi-tenant project inside the active workspace.",
+			Example:   `const p = flowsk.projects.create({ key: "API", name: "API Gateway" });`,
+		},
+		{
+			Name:      "flowsk.projects.bind",
+			Category:  "projects",
+			Signature: "flowsk.projects.bind(parentKey: string, childKey: string, scopeSubpath?: string): ProjectBinding",
+			Summary:   "Binds a sub-project under a parent project in the workspace hierarchy DAG with an optional relative scope subpath.",
+			Example:   `flowsk.projects.bind("CORE", "WEB", "apps/web");`,
+		},
+		{
+			Name:      "flowsk.projects.unbind",
+			Category:  "projects",
+			Signature: "flowsk.projects.unbind(parentKey: string, childKey: string): { parentKey: string, childKey: string, removed: boolean }",
+			Summary:   "Removes a parent-to-child sub-project binding without deleting either project.",
+			Example:   `flowsk.projects.unbind("CORE", "WEB");`,
+		},
+		{
+			Name:      "flowsk.projects.bindings",
+			Category:  "projects",
+			Signature: "flowsk.projects.bindings(): ProjectBinding[]",
+			Summary:   "Lists all parent-child sub-project DAG bindings in the active workspace.",
+			Example:   `return flowsk.projects.bindings();`,
+		},
+		{
+			Name:      "flowsk.projects.getDoc",
+			Category:  "projects",
+			Signature: "flowsk.projects.getDoc(slugOrKey?: string): { id: string, key: string, slug: string, markdown: string, hasMarkdownDoc: boolean }",
+			Summary:   "Reads the extended Markdown charter (<project_id>.md) attached to a project inside ~/.flowsk/projects.",
+			Example:   `return flowsk.projects.getDoc("CORE");`,
+		},
+		{
+			Name:      "flowsk.projects.setDoc",
+			Category:  "projects",
+			Signature: "flowsk.projects.setDoc(slugOrKey: string, markdown: string): Project",
+			Summary:   "Creates or updates the extended Markdown charter (<project_id>.md) inside ~/.flowsk/projects.",
+			Example:   `flowsk.projects.setDoc("CORE", "# Core Platform Charter\n\nStrict 3-layer architecture.");`,
+		},
+		{
+			Name:      "flowsk.projects.deleteDoc",
+			Category:  "projects",
+			Signature: "flowsk.projects.deleteDoc(slugOrKey?: string): Project",
+			Summary:   "Deletes the extended Markdown charter (<project_id>.md) attached to a project.",
+			Example:   `flowsk.projects.deleteDoc("CORE");`,
+		},
+		{
+			Name:      "flowsk.goals.list",
+			Category:  "goals",
+			Signature: "flowsk.goals.list(filter?: string): Goal[]",
+			Summary:   "Lists strategic goals/objectives with live task completion progress counts.",
+			Example:   `return flowsk.goals.list();`,
+		},
+		{
+			Name:      "flowsk.goals.create",
+			Category:  "goals",
+			Signature: "flowsk.goals.create({ title, project?, kind?, status?, slug?, summary?, priority?, targetDate?, successCriteria? }): Goal",
+			Summary:   "Creates a strategic goal, milestone, or cycle within the active project.",
+			Example:   `const g = flowsk.goals.create({ title: "Launch v1.0", priority: "urgent", targetDate: "2026-12-31" });`,
+		},
+		{
+			Name:      "flowsk.goals.update",
+			Category:  "goals",
+			Signature: "flowsk.goals.update(slugOrId: string, { title?, kind?, status?, summary?, priority?, targetDate?, successCriteria? }): Goal",
+			Summary:   "Updates metadata, status (planned, active, at_risk, achieved, dropped), targetDate, or success criteria of a goal/milestone.",
+			Example:   `flowsk.goals.update("launch-v1", { status: "at_risk", summary: "Waiting on security review" });`,
+		},
+		{
+			Name:      "flowsk.goals.close",
+			Category:  "goals",
+			Signature: "flowsk.goals.close(slugOrId: string, note?: string): Goal",
+			Summary:   "Transitions a goal/objective to achieved status and optionally records a completion note.",
+			Example:   `flowsk.goals.close("launch-v1", "All release milestones verified");`,
+		},
+		{
+			Name:      "flowsk.tasks.list",
+			Category:  "tasks",
+			Signature: "flowsk.tasks.list(filter?: string | { state?, tag?, objective?, externalId?, actor?, blocked?, limit? }): Task[]",
+			Summary:   "Lists tasks in the project matching a structured filter object or GitHub-style search string.",
+			Example:   `return flowsk.tasks.list({ state: "ready", limit: 20 });`,
+		},
+		{
 			Name:      "flowsk.tasks.search",
 			Category:  "tasks",
 			Signature: "flowsk.tasks.search(query: string): Task[]",
-			Summary:   "Filters tasks by state (state:done, state:in_progress, is:open, is:unclaimed), #label, @actor, obj:slug, and keywords.",
+			Summary:   "Filters tasks by state (state:done, state:in_progress, state:archived, is:open, is:unclaimed), #label, @actor, obj:slug, and keywords.",
 			Example:   `return flowsk.tasks.search("state:in_progress @claude");`,
 		},
 		{
-			Name:      "flowsk.tasks.create",
+			Name:      "flowsk.tasks.ready",
 			Category:  "tasks",
-			Signature: "flowsk.tasks.create({ title, externalId?, description?, priority?, state?, objective?, parent?, tags?, dependsOn?, acceptance? }): Task",
-			Summary:   "Creates a task (with optional project-unique externalId and upstream dependsOn blocker edges) inside the active ACID transaction.",
-			Example:   `const t = flowsk.tasks.create({ title: "Add search index", externalId: "CU-42", priority: "high", tags: ["db"] });`,
-		},
-		{
-			Name:      "flowsk.tasks.getByExternal",
-			Category:  "tasks",
-			Signature: "flowsk.tasks.getByExternal(externalId: string, project?: string): Task | null",
-			Summary:   "Resolves a task in the project by its external tracker ID (ClickUp/Linear/GitHub), returning null when absent.",
-			Example:   `const existing = flowsk.tasks.getByExternal("CU-42");`,
-		},
-		{
-			Name:      "flowsk.tasks.upsertExternal",
-			Category:  "tasks",
-			Signature: "flowsk.tasks.upsertExternal({ externalId, project?, title, description?, priority?, state?, tags?, dependsOn? }): Task",
-			Summary:   "Idempotently creates or updates an external tracker task scoped to (projectId, externalId).",
-			Example:   `const t = flowsk.tasks.upsertExternal({ externalId: "CU-42", title: "Sync billing webhook", priority: "high" });`,
+			Signature: "flowsk.tasks.ready(limit?: number): Task[]",
+			Summary:   "Lists unclaimed, unblocked actionable tasks ordered by priority.",
+			Example:   `return flowsk.tasks.ready(10);`,
 		},
 		{
 			Name:      "flowsk.tasks.next",
 			Category:  "tasks",
-			Signature: "flowsk.tasks.next({ claim?: boolean, ttlSeconds?: number }): Task | null",
+			Signature: "flowsk.tasks.next({ claim?: boolean, ttlSeconds?: number }?): TaskDetail | null",
 			Summary:   "Returns (and optionally claims with an exclusive lease) the highest-priority unblocked ready task.",
 			Example:   `const next = flowsk.tasks.next({ claim: true, ttlSeconds: 1800 });`,
 		},
 		{
+			Name:      "flowsk.tasks.get",
+			Category:  "tasks",
+			Signature: "flowsk.tasks.get(keyOrId: string): TaskDetail",
+			Summary:   "Fetches full task details including description, acceptance criteria, lease holder, and blocker status.",
+			Example:   `return flowsk.tasks.get("FLW-1");`,
+		},
+		{
+			Name:      "flowsk.tasks.getByExternal",
+			Category:  "tasks",
+			Signature: "flowsk.tasks.getByExternal(externalId: string, project?: string): TaskDetail | null",
+			Summary:   "Resolves a task in the project by its external tracker ID (ClickUp/Linear/GitHub), returning null when absent.",
+			Example:   `const existing = flowsk.tasks.getByExternal("CU-42");`,
+		},
+		{
+			Name:      "flowsk.tasks.create",
+			Category:  "tasks",
+			Signature: "flowsk.tasks.create({ title, project?, kind?, externalId?, description?, markdown?, priority?, state?, objective?, parent?, tags?, dependsOn?, acceptance? }): TaskDetail",
+			Summary:   "Creates a task (with optional project-unique externalId, markdown doc, and upstream dependsOn blocker edges) inside the active ACID transaction.",
+			Example:   `const t = flowsk.tasks.create({ title: "Add search index", externalId: "CU-42", priority: "high", tags: ["db"] });`,
+		},
+		{
+			Name:      "flowsk.tasks.upsertExternal",
+			Category:  "tasks",
+			Signature: "flowsk.tasks.upsertExternal({ externalId, project?, kind?, title, description?, markdown?, priority?, state?, objective?, parent?, tags?, dependsOn?, acceptance? }): TaskDetail",
+			Summary:   "Idempotently creates or updates an external tracker task scoped to (projectId, externalId).",
+			Example:   `const t = flowsk.tasks.upsertExternal({ externalId: "CU-42", kind: "bug", title: "Sync billing webhook", priority: "high" });`,
+		},
+		{
+			Name:      "flowsk.tasks.update",
+			Category:  "tasks",
+			Signature: "flowsk.tasks.update(keyOrId: string, { title?, kind?, externalId?, description?, markdown?, objective?, parent?, priority?, tags?, acceptance? }): TaskDetail",
+			Summary:   "Applies partial metadata, objective/parent linkage, tag/acceptance slice updates, or Markdown doc changes to a task.",
+			Example:   `flowsk.tasks.update("FLW-1", { priority: "urgent", tags: ["db", "wal"] });`,
+		},
+		{
 			Name:      "flowsk.tasks.claim",
 			Category:  "tasks",
-			Signature: "flowsk.tasks.claim(keyOrId: string, ttlSeconds?: number): Task",
+			Signature: "flowsk.tasks.claim(keyOrId: string, ttlSeconds?: number): TaskDetail",
 			Summary:   "Acquires or renews an exclusive time-bounded agent ClaimLease on a task.",
 			Example:   `flowsk.tasks.claim("FLW-1", 1800);`,
 		},
 		{
-			Name:      "flowsk.tasks.done",
-			Category:  "tasks",
-			Signature: "flowsk.tasks.done(keyOrId: string, note?: string): Task",
-			Summary:   "Marks a task Done, records an optional completion note, and releases any active claim lease.",
-			Example:   `flowsk.tasks.done("FLW-1", "All tests passing");`,
-		},
-		{
-			Name:      "flowsk.tasks.move",
-			Category:  "tasks",
-			Signature: "flowsk.tasks.move(keyOrId: string, state: string, note?: string): Task",
-			Summary:   "Transitions a task to backlog, todo/ready, in_progress, in_review, blocked, done, or cancelled.",
-			Example:   `flowsk.tasks.move("FLW-2", "in_progress", "Starting implementation");`,
-		},
-		{
 			Name:      "flowsk.tasks.release",
 			Category:  "tasks",
-			Signature: "flowsk.tasks.release(keyOrId: string, { state?, note? }?): Task",
+			Signature: "flowsk.tasks.release(keyOrId: string, { state?, note? }?): TaskDetail",
 			Summary:   "Releases an active ClaimLease and optionally transitions task state.",
 			Example:   `flowsk.tasks.release("FLW-2", { state: "in_review", note: "Ready for review" });`,
 		},
 		{
+			Name:      "flowsk.tasks.move",
+			Category:  "tasks",
+			Signature: "flowsk.tasks.move(keyOrId: string, state: string, note?: string): TaskDetail",
+			Summary:   "Transitions a task to backlog, todo/ready, in_progress, in_review, blocked, done, cancelled, or archived.",
+			Example:   `flowsk.tasks.move("FLW-2", "in_progress", "Starting implementation");`,
+		},
+		{
+			Name:      "flowsk.tasks.done",
+			Category:  "tasks",
+			Signature: "flowsk.tasks.done(keyOrId: string, note?: string): TaskDetail",
+			Summary:   "Marks a task Done, records an optional completion note, and releases any active claim lease.",
+			Example:   `flowsk.tasks.done("FLW-1", "All tests passing");`,
+		},
+		{
 			Name:      "flowsk.tasks.block",
 			Category:  "tasks",
-			Signature: "flowsk.tasks.block(keyOrId: string, { by?: string[], reason?: string }): Task",
-			Summary:   "Adds DAG-validated upstream blocker dependencies and marks the task blocked.",
+			Signature: "flowsk.tasks.block(keyOrId: string, reasonOrOpts: string | { by?: string[], reason?: string }, by?: string[]): TaskDetail",
+			Summary:   "Adds DAG-validated upstream blocker dependencies, records a blocker reason, and transitions the task to blocked.",
 			Example:   `flowsk.tasks.block("FLW-3", { by: ["FLW-2"], reason: "Needs RPC handler" });`,
+		},
+		{
+			Name:      "flowsk.tasks.unblock",
+			Category:  "tasks",
+			Signature: "flowsk.tasks.unblock(keyOrId: string, clearedBy?: string[]): TaskDetail",
+			Summary:   "Removes specified (or all) upstream blocker dependencies and transitions the task back to ready once unblocked.",
+			Example:   `flowsk.tasks.unblock("FLW-3", ["FLW-2"]);`,
 		},
 		{
 			Name:      "flowsk.tasks.comment",
@@ -347,47 +483,18 @@ func CodeModeSDKCatalog() []SDKMethodDoc {
 		{
 			Name:      "flowsk.tasks.setDoc",
 			Category:  "tasks",
-			Signature: "flowsk.tasks.setDoc(keyOrId: string, markdown: string): Task",
+			Signature: "flowsk.tasks.setDoc(keyOrId: string, markdown: string): TaskDetail",
 			Summary:   "Creates or updates the extended Markdown specification file (<task_id>.md) attached to a task atomically.",
 			Example:   `flowsk.tasks.setDoc("FLW-1", "# Design Spec\n\n- Zero host paths");`,
 		},
 		{
-			Name:      "flowsk.goals.update",
-			Category:  "goals",
-			Signature: "flowsk.goals.update(slugOrId: string, { title?, kind?, status?, summary?, priority?, targetDate?, successCriteria? }): Goal",
-			Summary:   "Updates metadata, status (planned, active, at_risk, achieved, dropped), or success criteria of a goal/milestone.",
-			Example:   `flowsk.goals.update("launch-v1", { status: "at_risk", summary: "Waiting on security review" });`,
-		},
-		{
-			Name:      "flowsk.projects.setDoc",
-			Category:  "projects",
-			Signature: "flowsk.projects.setDoc(slugOrKey: string, markdown: string): Project",
-			Summary:   "Creates or updates the extended Markdown charter (<project_id>.md) inside ~/.flowsk/projects.",
-			Example:   `flowsk.projects.setDoc("CORE", "# Core Platform Charter\n\nStrict 3-layer architecture.");`,
-		},
-		{
-			Name:      "flowsk.goals.create",
-			Category:  "goals",
-			Signature: "flowsk.goals.create({ title, slug?, summary?, priority?, targetDate? }): Goal",
-			Summary:   "Creates a strategic goal/milestone within the active project.",
-			Example:   `const g = flowsk.goals.create({ title: "Launch v1.0", priority: "urgent", targetDate: "2026-12-31" });`,
-		},
-		{
-			Name:      "flowsk.goals.list",
-			Category:  "goals",
-			Signature: "flowsk.goals.list(filter?: string): Goal[]",
-			Summary:   "Lists strategic goals/objectives with live task completion progress counts.",
-			Example:   `return flowsk.goals.list();`,
-		},
-		{
-			Name:      "flowsk.projects.create",
-			Category:  "projects",
-			Signature: "flowsk.projects.create({ key, name, slug?, description? }): Project",
-			Summary:   "Creates a logical multi-tenant project inside the active workspace.",
-			Example:   `const p = flowsk.projects.create({ key: "API", name: "API Gateway" });`,
+			Name:      "flowsk.tasks.deleteDoc",
+			Category:  "tasks",
+			Signature: "flowsk.tasks.deleteDoc(keyOrId: string): TaskDetail",
+			Summary:   "Deletes the extended Markdown specification file (<task_id>.md) attached to a task atomically.",
+			Example:   `flowsk.tasks.deleteDoc("FLW-1");`,
 		},
 	}
-	return catalog
 }
 
 // SearchCodeModeSDK searches the Flowsk JavaScript SDK method catalog by

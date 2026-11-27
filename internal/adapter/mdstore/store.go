@@ -119,9 +119,8 @@ func (s *FileStore) HasTaskMarkdown(ctx context.Context, workspaceID, taskID uui
 	return s.hasEntityMarkdown(ctx, "mdstore.HasTaskMarkdown", s.tasksDir, workspaceID, taskID)
 }
 
-// ScanTaskMarkdown inspects `<rootDir>/tasks/<workspaceID>` (plus any stray top-level
-// `.md` files dropped directly under `<rootDir>/tasks`) and returns discovered UUIDs
-// and malformed relative filenames.
+// ScanTaskMarkdown inspects `<rootDir>/tasks/<workspaceID>` and returns
+// discovered UUIDs and malformed relative filenames strictly scoped to workspaceID.
 func (s *FileStore) ScanTaskMarkdown(ctx context.Context, workspaceID uuid.UUID) (WorkspaceScan, error) {
 	return s.scanWorkspaceCollection(ctx, "mdstore.ScanTaskMarkdown", s.tasksDir, workspaceID)
 }
@@ -154,9 +153,8 @@ func (s *FileStore) HasProjectMarkdown(ctx context.Context, workspaceID, project
 	return s.hasEntityMarkdown(ctx, "mdstore.HasProjectMarkdown", s.projectsDir, workspaceID, projectID)
 }
 
-// ScanProjectMarkdown inspects `<rootDir>/projects/<workspaceID>` (plus stray top-level
-// `.md` files directly under `<rootDir>/projects`) and returns discovered UUIDs and
-// malformed relative filenames.
+// ScanProjectMarkdown inspects `<rootDir>/projects/<workspaceID>` and returns
+// discovered UUIDs and malformed relative filenames strictly scoped to workspaceID.
 func (s *FileStore) ScanProjectMarkdown(ctx context.Context, workspaceID uuid.UUID) (WorkspaceScan, error) {
 	return s.scanWorkspaceCollection(ctx, "mdstore.ScanProjectMarkdown", s.projectsDir, workspaceID)
 }
@@ -323,27 +321,13 @@ func (s *FileStore) scanWorkspaceCollection(ctx context.Context, op, baseDir str
 
 	var out WorkspaceScan
 
-	// 1. Check stray top-level `.md` files placed directly under `<rootDir>/{tasks,projects}/`
-	// (outside any workspace UUID directory).
-	if topEntries, topErr := os.ReadDir(baseDir); topErr == nil {
-		for _, entry := range topEntries {
-			if entry.IsDir() {
-				continue
-			}
-			name := entry.Name()
-			if strings.HasSuffix(strings.ToLower(name), markdownExt) && !strings.HasPrefix(name, ".flowsk-") {
-				out.MalformedRelKeys = append(out.MalformedRelKeys, name)
-			}
-		}
-	}
-
-	// 2. Scan `<rootDir>/{tasks,projects}/<workspaceID>/*.md`.
+	// Scan strictly within `<rootDir>/{tasks,projects}/<workspaceID>/*.md`
+	// so shared parent directories are never scanned or deleted across tenants.
 	wsSubdir := workspaceID.String()
 	wsDir := filepath.Join(baseDir, wsSubdir)
 	entries, err := os.ReadDir(wsDir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			slices.Sort(out.MalformedRelKeys)
 			return out, nil
 		}
 		return WorkspaceScan{}, fmt.Errorf("%s: read workspace markdown dir: %w", op, err)
@@ -387,9 +371,18 @@ func (s *FileStore) removeConfinedRelativeFile(ctx context.Context, op, baseDir,
 	if filepath.IsAbs(trimmed) || strings.Contains(trimmed, `\`) || strings.Contains(trimmed, "..") {
 		return errs.Validation(op, "relative markdown key must not contain path traversal segments")
 	}
-	target := filepath.Join(baseDir, filepath.FromSlash(trimmed))
-	if !isStrictDescendant(baseDir, target) {
-		return errs.Validation(op, "relative markdown key escaped collection directory")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
+		return errs.Validation(op, "relative markdown key must be scoped to <workspace_id>/<file>.md")
+	}
+	wsID, parseErr := uuid.Parse(parts[0])
+	if parseErr != nil || wsID == uuid.Nil {
+		return errs.Validation(op, "relative markdown key must begin with a valid workspace UUID")
+	}
+	wsDir := filepath.Join(baseDir, wsID.String())
+	target := filepath.Join(wsDir, parts[1])
+	if !isStrictDescendant(wsDir, target) {
+		return errs.Validation(op, "relative markdown key escaped workspace collection directory")
 	}
 	if err := os.Remove(target); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("%s: remove orphan markdown file: %w", op, err)

@@ -503,3 +503,65 @@ func TestOutputFormatter_ValidationAndCanceledContext(t *testing.T) {
 		t.Fatal("expected error for canceled context")
 	}
 }
+
+// TestOutputFormatter_ExternalIDMarkdownDocAndEmptyJSONL verifies that external_id
+// and has_markdown_doc render across JSON, JSONL, Compact, TSV, Human, and Markdown,
+// and that empty JSONL slices emit an empty string instead of "{}\n".
+func TestOutputFormatter_ExternalIDMarkdownDocAndEmptyJSONL(t *testing.T) {
+	t.Parallel()
+
+	fx := buildFixtures()
+	fx.proj.HasMarkdownDoc = true
+	fx.fullTask.ExternalID = "CU-869abc"
+	fx.fullTask.HasMarkdownDoc = true
+	fx.queue[0].ExternalID = "CU-869abc"
+	fx.queue[0].HasMarkdownDoc = true
+
+	outFmt := formatter.NewOutputFormatter()
+	ctx := context.Background()
+
+	// 1. Empty JSONL must emit "" (0 bytes), never "{}\n".
+	var emptyBuf bytes.Buffer
+	if err := outFmt.FormatTaskQueue(ctx, &emptyBuf, nil, formatter.TokenBudgetOptions{Format: formatter.FormatJSONL}); err != nil {
+		t.Fatalf("FormatTaskQueue(empty jsonl): %v", err)
+	}
+	if emptyBuf.String() != "" {
+		t.Fatalf("expected empty JSONL output \"\", got %q", emptyBuf.String())
+	}
+
+	// 2. Verify external_id & has_markdown_doc across all formats for FormatTask & FormatTaskQueue & FormatProject.
+	for _, f := range []formatter.Format{
+		formatter.FormatJSON,
+		formatter.FormatJSONL,
+		formatter.FormatCompact,
+		formatter.FormatTSV,
+		formatter.FormatHuman,
+		formatter.FormatMarkdown,
+	} {
+		var taskBuf, queueBuf, projBuf bytes.Buffer
+		if err := outFmt.FormatTask(ctx, &taskBuf, fx.fullTask, formatter.TokenBudgetOptions{Format: f, OmitUUIDs: true}); err != nil {
+			t.Fatalf("FormatTask(%s): %v", f, err)
+		}
+		if err := outFmt.FormatTaskQueue(ctx, &queueBuf, fx.queue[:1], formatter.TokenBudgetOptions{Format: f, OmitUUIDs: true}); err != nil {
+			t.Fatalf("FormatTaskQueue(%s): %v", f, err)
+		}
+		if err := outFmt.FormatProject(ctx, &projBuf, fx.proj, formatter.TokenBudgetOptions{Format: f, OmitUUIDs: true}); err != nil {
+			t.Fatalf("FormatProject(%s): %v", f, err)
+		}
+		for label, rendered := range map[string]string{"task": taskBuf.String(), "queue": queueBuf.String()} {
+			if !strings.Contains(rendered, "CU-869abc") {
+				t.Fatalf("%s(%s) missing ExternalID CU-869abc:\n%s", label, f, rendered)
+			}
+			lower := strings.ToLower(rendered)
+			if !strings.Contains(lower, "md") && !strings.Contains(lower, "has_markdown_doc") && !strings.Contains(lower, "true") {
+				t.Fatalf("%s(%s) missing markdown doc indicator:\n%s", label, f, rendered)
+			}
+		}
+		projLower := strings.ToLower(projBuf.String())
+		if f == formatter.FormatJSON || f == formatter.FormatJSONL {
+			if !strings.Contains(projLower, `"has_markdown_doc": true`) && !strings.Contains(projLower, `"has_markdown_doc":true`) {
+				t.Fatalf("FormatProject(%s) missing has_markdown_doc:\n%s", f, projBuf.String())
+			}
+		}
+	}
+}

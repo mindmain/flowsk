@@ -411,6 +411,8 @@ func sanitizeSnapshotLabel(raw string) string {
 	return cleaned
 }
 
+const snapshotLockName = "snapshots"
+
 // computeFileSHA256AndSync calculates the SHA-256 hex digest and byte length of path after fsync.
 func computeFileSHA256AndSync(path string) (checksum string, size int64, err error) {
 	f, err := os.OpenFile(filepath.Clean(path), os.O_RDWR, 0o600)
@@ -430,6 +432,22 @@ func computeFileSHA256AndSync(path string) (checksum string, size int64, err err
 	return hex.EncodeToString(hasher.Sum(nil)), written, nil
 }
 
+// computeFileSHA256ReadOnly calculates the SHA-256 hex digest of path using a
+// strictly read-only descriptor (`O_RDONLY`) without mutating or fsyncing the file.
+func computeFileSHA256ReadOnly(path string) (string, error) {
+	f, err := os.Open(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
 // syncDirectory fsyncs a directory descriptor so atomic renames become crash-durable.
 func syncDirectory(dirPath string) error {
 	dirFile, err := os.Open(filepath.Clean(dirPath))
@@ -446,12 +464,18 @@ func syncDirectory(dirPath string) error {
 
 // CreateSnapshot exports a consistent online backup of the volume's SQLite database
 // using `VACUUM INTO` into TempDir, computes its SHA-256 digest, fsyncs, and atomically
-// renames it into SnapshotsDir.
+// renames it into SnapshotsDir while holding the exclusive snapshots advisory lock.
 func (a *Adapter) CreateSnapshot(ctx context.Context, label string) (SnapshotMetadata, error) {
 	const op = "volume.SnapshotExporter.CreateSnapshot"
 	if err := ctx.Err(); err != nil {
 		return SnapshotMetadata{}, fmt.Errorf("%s: %w", op, err)
 	}
+
+	release, err := a.Locker().AcquireExclusive(ctx, snapshotLockName)
+	if err != nil {
+		return SnapshotMetadata{}, fmt.Errorf("%s: acquire snapshot lock: %w", op, err)
+	}
+	defer func() { _ = release() }()
 
 	if err := os.MkdirAll(a.layout.SnapshotsDir, 0o750); err != nil {
 		return SnapshotMetadata{}, fmt.Errorf("%s: create snapshots dir: %w", op, err)
@@ -582,7 +606,7 @@ func (a *Adapter) ListSnapshots(ctx context.Context) ([]SnapshotMetadata, error)
 			}
 		}
 		if meta.ChecksumSHA256 == "" {
-			if sum, _, sumErr := computeFileSHA256AndSync(dbPath); sumErr == nil {
+			if sum, sumErr := computeFileSHA256ReadOnly(dbPath); sumErr == nil {
 				meta.ChecksumSHA256 = sum
 			}
 		}
@@ -610,6 +634,12 @@ func (a *Adapter) PruneSnapshots(ctx context.Context, keepLatest int) (int, erro
 			Description: "keepLatest retention threshold must be >= 0",
 		})
 	}
+
+	release, err := a.Locker().AcquireExclusive(ctx, snapshotLockName)
+	if err != nil {
+		return 0, fmt.Errorf("%s: acquire snapshot lock: %w", op, err)
+	}
+	defer func() { _ = release() }()
 
 	snapshots, err := a.ListSnapshots(ctx)
 	if err != nil {

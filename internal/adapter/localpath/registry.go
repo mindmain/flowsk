@@ -5,11 +5,10 @@
 //  1. Client-Machine Exclusive Execution: This adapter executes EXCLUSIVELY inside
 //     client-side binaries (`flowsk` CLI commands and local client-side MCP stdio bridges).
 //     It is NEVER imported, mounted, or invoked by the Flowsk server or domain layer.
-//  2. Zero Git Repository Pollution: Bindings are stored in a single user-level config
-//     registry file inside the OS user configuration directory (for example,
-//     `~/.config/flowsk/local_paths.json` on Linux/macOS or `%AppData%\flowsk\local_paths.json`
-//     on Windows). Flowsk NEVER creates `.flowsk/` dotfiles, `.gitignore` entries, or
-//     metadata files inside the target project's git working tree.
+//  2. Zero Git Repository Pollution: Bindings are stored in a single user-level
+//     registry file inside the Flowsk home directory (`$FLOWSK_HOME`, defaulting to
+//     `~/.flowsk/local_paths.json`). Flowsk NEVER creates `.flowsk/` dotfiles,
+//     `.gitignore` entries, or metadata files inside the target project's git working tree.
 //  3. Zero Server Transmission of Host Paths: `LocalAbsPath` NEVER leaves the local
 //     machine over ConnectRPC or HTTP. Once `ResolveByWorkingDir` resolves `/Users/.../repo`
 //     (or any subdirectory inside it) to `(WorkspaceSlug, ProjectID, ProjectSlug)`, only
@@ -87,12 +86,12 @@ type LinkProjectInput struct {
 }
 
 // LocalPathRegistry manages client-side directory-to-project bindings stored in
-// the user's OS configuration directory (`~/.config/flowsk/local_paths.json`)
+// the user's Flowsk home directory (`~/.flowsk/local_paths.json`)
 // without ever writing inside the target project directory or leaking host paths
 // to the server.
 type LocalPathRegistry interface {
 	// LinkProject records or updates the local binding between in.LocalPath and
-	// `(in.WorkspaceSlug, in.ProjectID, in.ProjectSlug)` in `~/.config/flowsk/local_paths.json`.
+	// `(in.WorkspaceSlug, in.ProjectID, in.ProjectSlug)` in `~/.flowsk/local_paths.json`.
 	LinkProject(ctx context.Context, in LinkProjectInput) (LocalBinding, error)
 
 	// UnlinkProject removes the binding associated with localPath from the user's local registry file.
@@ -120,7 +119,7 @@ type persistedRegistry struct {
 }
 
 // FileRegistry implements LocalPathRegistry backed by an atomic `0600` JSON file
-// in the user's OS configuration directory.
+// in the user's Flowsk home directory (`~/.flowsk/local_paths.json`).
 type FileRegistry struct {
 	registryFilePath string
 	mu               *sync.RWMutex
@@ -134,7 +133,7 @@ type FileRegistrySkeleton = FileRegistry
 var _ LocalPathRegistry = (*FileRegistry)(nil)
 
 // NewFileRegistry constructs a thread-safe FileRegistry persisting bindings at
-// registryFilePath in the user's OS configuration directory.
+// registryFilePath (typically `~/.flowsk/local_paths.json`).
 func NewFileRegistry(registryFilePath string) (*FileRegistrySkeleton, error) {
 	trimmed := strings.TrimSpace(registryFilePath)
 	if trimmed == "" {
@@ -299,6 +298,9 @@ func (r *FileRegistry) ResolveByWorkingDir(ctx context.Context, workingDir strin
 	if err != nil {
 		return LocalBinding{}, err
 	}
+	if len(bindings) == 0 {
+		return LocalBinding{}, errs.New(errs.ErrNotFound, op, "no project bound to working directory or its ancestors")
+	}
 
 	var (
 		bestMatch LocalBinding
@@ -314,6 +316,13 @@ func (r *FileRegistry) ResolveByWorkingDir(ctx context.Context, workingDir strin
 		}
 	}
 
+	// Fast path: when workingDir itself has an exact registered LocalAbsPath binding,
+	// no ancestor or sibling Git worktree inheritance can out-specify it, so return
+	// immediately without spawning any `git` subprocesses.
+	if found && bestMatch.LocalAbsPath == normDir {
+		return bestMatch, nil
+	}
+
 	// Also check sibling Git worktree inheritance: if normDir resides inside a Git
 	// worktree sharing GitCommonDir with bound repo/sub-projects, inherit the most
 	// specific relative subpath binding (so both unlinked sibling worktrees AND
@@ -326,7 +335,11 @@ func (r *FileRegistry) ResolveByWorkingDir(ctx context.Context, workingDir strin
 		}
 		curBestRelLen := -1
 		if found {
-			if foundGit := InspectDirectoryGit(ctx, bestMatch.LocalAbsPath); foundGit.GitCommonDir == gitMeta.GitCommonDir && foundGit.GitTopLevel != "" {
+			if bestMatch.GitCommonDir != "" {
+				if bestMatch.GitCommonDir == gitMeta.GitCommonDir {
+					curBestRelLen = len(bestMatch.GitRelPath)
+				}
+			} else if foundGit := InspectDirectoryGit(ctx, bestMatch.LocalAbsPath); foundGit.GitCommonDir == gitMeta.GitCommonDir && foundGit.GitTopLevel != "" {
 				if fRel, rErr := filepath.Rel(foundGit.GitTopLevel, bestMatch.LocalAbsPath); rErr == nil && fRel != "." {
 					curBestRelLen = len(filepath.ToSlash(fRel))
 				} else {

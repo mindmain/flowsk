@@ -239,4 +239,43 @@ func TestSnapshotsCreateListAndPrune(t *testing.T) {
 	if customMeta, err := customAdapter.Snapshots().CreateSnapshot(ctx, "custom-db"); err != nil || customMeta.SizeBytes <= 0 {
 		t.Fatalf("customAdapter.CreateSnapshot = %+v, err=%v", customMeta, err)
 	}
+
+	// Verify ListSnapshots computes fallback SHA-256 read-only (0400 file without .meta.json)
+	// and CreateSnapshot serializes via the volume "snapshots" advisory lock.
+	onlySnap := remaining[0]
+	metaSidecar := filepath.Join(layout.SnapshotsDir, onlySnap.ID+".meta.json")
+	if err := os.Remove(metaSidecar); err != nil {
+		t.Fatalf("remove sidecar: %v", err)
+	}
+	if err := os.Chmod(onlySnap.FilePath, 0o400); err != nil {
+		t.Fatalf("chmod 0400 snapshot: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(onlySnap.FilePath, 0o600) })
+
+	roListed, err := adapter.Snapshots().ListSnapshots(ctx)
+	if err != nil {
+		t.Fatalf("ListSnapshots read-only fallback: %v", err)
+	}
+	if len(roListed) != 1 || roListed[0].ChecksumSHA256 != onlySnap.ChecksumSHA256 {
+		t.Fatalf("expected read-only fallback SHA-256 %s, got %+v", onlySnap.ChecksumSHA256, roListed)
+	}
+
+	// Holding the "snapshots" advisory lock on another adapter must block CreateSnapshot until released.
+	otherAdapter, err := volume.NewSharedVolumeAdapter(rootDir)
+	if err != nil {
+		t.Fatalf("NewSharedVolumeAdapter other: %v", err)
+	}
+	heldRel, err := otherAdapter.Locker().AcquireExclusive(ctx, "snapshots")
+	if err != nil {
+		t.Fatalf("AcquireExclusive(snapshots): %v", err)
+	}
+	shortSnapCtx, cancelSnap := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancelSnap()
+	if _, err := adapter.Snapshots().CreateSnapshot(shortSnapCtx, "contended"); !errors.Is(err, context.DeadlineExceeded) {
+		_ = heldRel()
+		t.Fatalf("expected CreateSnapshot to block on advisory lock until DeadlineExceeded, got %v", err)
+	}
+	if err := heldRel(); err != nil {
+		t.Fatalf("release held snapshots lock: %v", err)
+	}
 }
